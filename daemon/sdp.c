@@ -2976,7 +2976,7 @@ static struct packet_stream *print_sdp_media_section(GString *s, struct call_med
 		ps_rtcp = print_rtcp(s, media, rtp_ps_link, flags, sdp_media);
 
 		if (proto_is_rtp(media->protocol)) {
-			insert_crypto(s, media, flags);
+/*			insert_crypto(s, media, flags);    commented this line for webrtc sasmita */
 			insert_dtls(s, media, dtls_ptr(rtp_ps->selected_sfd), flags);
 
 			if (media->ptime)
