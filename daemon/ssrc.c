@@ -322,7 +322,7 @@ found:;
 	mutex_unlock(&e->h.lock);
 
 	rtt -= (long long) delay * 1000000LL / 65536LL;
-	ilog(LOG_DEBUG, "Calculated round-trip time for %s%x%s is %lli us", FMT_M(ssrc), rtt);
+	ilog(LOG_INFO, "Calculated round-trip time for %s%x%s is %lli us", FMT_M(ssrc), rtt);
 
 	if (rtt <= 0 || rtt > 10000000) {
 		ilog(LOG_DEBUG, "Invalid RTT - discarding");
@@ -348,7 +348,7 @@ void ssrc_sender_report(struct call_media *m, const struct ssrc_sender_report *s
 
 	seri->report = *sr;
 
-	ilog(LOG_DEBUG, "SR from %s%x%s: RTP TS %u PC %u OC %u NTP TS %u/%u=%f",
+	ilog(LOG_INFO, "SR from %s%x%s: RTP TS %u PC %u OC %u NTP TS %u/%u=%f",
 			FMT_M(sr->ssrc), sr->timestamp, sr->packet_count, sr->octet_count,
 			sr->ntp_msw, sr->ntp_lsw, seri->time_item.ntp_ts);
 
@@ -358,7 +358,7 @@ void ssrc_sender_report(struct call_media *m, const struct ssrc_sender_report *s
 void ssrc_receiver_report(struct call_media *m, struct stream_fd *sfd, const struct ssrc_receiver_report *rr,
 		const struct timeval *tv)
 {
-	ilog(LOG_DEBUG, "RR from %s%x%s about %s%x%s: FL %u TL %u HSR %u J %u LSR %u DLSR %u",
+	ilog(LOG_INFO, "RR from %s%x%s about %s%x%s: FL %u TL %u HSR %u J %u LSR %u DLSR %u",
 			FMT_M(rr->from), FMT_M(rr->ssrc), rr->fraction_lost, rr->packets_lost,
 			rr->high_seq_received, rr->jitter, rr->lsr, rr->dlsr);
 
@@ -383,7 +383,7 @@ void ssrc_receiver_report(struct call_media *m, struct stream_fd *sfd, const str
 		goto out_nl_put;
 	}
 	unsigned int jitter = rpt->clock_rate ? (rr->jitter * 1000 / rpt->clock_rate) : rr->jitter;
-	ilog(LOG_DEBUG, "Calculated jitter for %s%x%s is %u ms", FMT_M(rr->ssrc), jitter);
+	ilog(LOG_INFO, "Calculated jitter for %s%x%s is %u ms", FMT_M(rr->ssrc), jitter);
 
 	ilog(LOG_DEBUG, "Adding opposide side RTT of %u us", other_e->last_rtt);
 
@@ -408,7 +408,7 @@ void ssrc_receiver_report(struct call_media *m, struct stream_fd *sfd, const str
 	other_e->packets_lost = rr->packets_lost;
 	mos_calc(ssb);
 	if (ssb->mos) {
-		ilog(LOG_DEBUG, "Calculated MOS from RR for %s%x%s is %.1f", FMT_M(rr->from),
+		ilog(LOG_INFO, "Calculated MOS from RR for %s%x%s is %.1f", FMT_M(rr->from),
 				(double) ssb->mos / 10.0);
 		RTPE_SAMPLE_SFD(mos, ssb->mos, sfd);
 	}
