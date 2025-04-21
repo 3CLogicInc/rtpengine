@@ -59,40 +59,7 @@ enum message_type {
 	SIP_REPLY,
 };
 
-enum call_opmode {
-	OP_OFFER = 0,
-	OP_ANSWER = 1,
-	OP_REQUEST,
-	OP_REQ_ANSWER,
-	OP_PUBLISH,
-	OP_DELETE,
-	OP_QUERY,
-	OP_LIST,
-	OP_PING,
-	OP_STATISTICS,
-	OP_PLAY_DTMF,
-	OP_BLOCK_DTMF,
-	OP_UNBLOCK_DTMF,
-	OP_BLOCK_MEDIA,
-	OP_UNBLOCK_MEDIA,
-	OP_SILENCE_MEDIA,
-	OP_UNSILENCE_MEDIA,
-	OP_BLOCK_SILENCE_MEDIA,
-	OP_UNBLOCK_SILENCE_MEDIA,
-	OP_PLAY_MEDIA,
-	OP_STOP_MEDIA,
-	OP_START_FORWARDING,
-	OP_STOP_FORWARDING,
-	OP_SUBSCRIBER_REQ,
-	OP_SUBSCRIBER_ANS,
-	OP_UNSUBSCRIBE,
-	OP_START_RECORDING,
-	OP_STOP_RECORDING,
-	OP_PAUSE_RECORDING,
-	OP_OTHER,
-};
-
-#define IS_OP_OTHER(opmode)                                                              \
+#define IS_OP_OTHER(opmode)                                                                      \
 		 ((opmode == OP_DELETE || opmode == OP_QUERY)                                    \
 		 || (opmode == OP_LIST || opmode == OP_PING)                                     \
 		 || (opmode == OP_STATISTICS || opmode == OP_PLAY_DTMF)                          \
@@ -102,15 +69,23 @@ enum call_opmode {
 		 || (opmode == OP_BLOCK_SILENCE_MEDIA || opmode == OP_UNBLOCK_SILENCE_MEDIA)     \
 		 || (opmode == OP_PLAY_MEDIA || opmode == OP_STOP_MEDIA)                         \
 		 || (opmode == OP_START_FORWARDING || opmode == OP_STOP_FORWARDING)              \
-		 || (opmode == OP_SUBSCRIBER_REQ || opmode == OP_SUBSCRIBER_ANS)                 \
 		 || (opmode == OP_UNSUBSCRIBE || opmode == OP_START_RECORDING)                   \
 		 || (opmode == OP_STOP_RECORDING || opmode == OP_PAUSE_RECORDING)                \
 		 || (opmode == OP_OTHER))
 
-#define IS_OP_DIRECTIONAL(opmode)                                                        \
+#define IS_OP_DIRECTIONAL(opmode)                                                                \
 		 ((opmode == OP_BLOCK_DTMF || opmode == OP_BLOCK_MEDIA)                          \
 		 || (opmode == OP_UNBLOCK_DTMF || opmode == OP_UNBLOCK_MEDIA)                    \
 		 || (opmode == OP_START_FORWARDING || opmode == OP_STOP_FORWARDING))
+
+#define RESET_BANDWIDTH(union_var, value) \
+	do { \
+		union_var.as = value; \
+		union_var.rr = value; \
+		union_var.rs = value; \
+		union_var.ct = value; \
+		union_var.tias = value; \
+	} while(0)
 
 enum call_media_counted {
 	CMC_INCREMENT = 0,
@@ -163,6 +138,8 @@ enum {
 #define SHARED_FLAG_RTCP_FB			0x00002000
 #define SHARED_FLAG_LEGACY_OSRTP		0x00004000
 #define SHARED_FLAG_LEGACY_OSRTP_REV		0x00008000
+/* empty range in-between */
+#define SHARED_FLAG_END_OF_CANDIDATES		0x40000000LL
 
 /* struct stream_params */
 #define SP_FLAG_NO_RTCP				0x00010000
@@ -182,6 +159,7 @@ enum {
 #define SP_FLAG_RTCP_FB				SHARED_FLAG_RTCP_FB
 #define SP_FLAG_LEGACY_OSRTP			SHARED_FLAG_LEGACY_OSRTP
 #define SP_FLAG_LEGACY_OSRTP_REV		SHARED_FLAG_LEGACY_OSRTP_REV
+#define SP_FLAG_END_OF_CANDIDATES		SHARED_FLAG_END_OF_CANDIDATES
 
 /* struct packet_stream */
 #define PS_FLAG_RTP				0x00010000
@@ -201,13 +179,6 @@ enum {
 #define PS_FLAG_ZERO_ADDR			0x04000000
 #define PS_FLAG_PIERCE_NAT			0x08000000
 #define PS_FLAG_NAT_WAIT			0x10000000
-
-// packet_stream stats_flags
-#define PS_STATS_USERSPACE			0x00000001
-#define PS_STATS_KERNEL				0x00000002
-#define PS_STATS_USERSPACE_COUNTED		0x00000004
-#define PS_STATS_KERNEL_COUNTED			0x00000008
-#define PS_STATS_MIXED_COUNTED			0x00000010
 
 /* struct call_media */
 #define MEDIA_FLAG_INITIALIZED			0x00010000
@@ -240,6 +211,7 @@ enum {
 #define MEDIA_FLAG_LEGACY_OSRTP_REV		SHARED_FLAG_LEGACY_OSRTP_REV
 #define MEDIA_FLAG_TRANSCODING			0x100000000LL
 #define MEDIA_FLAG_BLOCK_EGRESS			0x200000000LL
+#define MEDIA_FLAG_END_OF_CANDIDATES		SHARED_FLAG_END_OF_CANDIDATES
 
 /* struct call_monologue */
 #define ML_FLAG_REC_FORWARDING			0x00010000
@@ -247,10 +219,12 @@ enum {
 #define ML_FLAG_DTMF_INJECTION_ACTIVE		0x00040000
 #define ML_FLAG_DETECT_DTMF			0x00080000
 #define ML_FLAG_NO_RECORDING			0x00100000
-/* unused					0x00200000 */
+#define ML_FLAG_FINAL_RESPONSE			0x00200000
 #define ML_FLAG_BLOCK_SHORT			0x00400000
 #define ML_FLAG_BLOCK_MEDIA			0x00800000
 #define ML_FLAG_SILENCE_MEDIA			0x01000000
+#define ML_FLAG_MOH_SENDRECV			0x02000000
+#define ML_FLAG_MOH_ZEROCONN			0x04000000
 
 /* call_t */
 #define CALL_FLAG_IPV4_OFFER			0x00010000
@@ -318,8 +292,8 @@ enum block_dtmf_mode {
 #include "bencode.h"
 #include "crypto.h"
 #include "dtls.h"
-#include "sdp.h"
 #include "dtmf.h"
+#include "arena.h"
 
 
 struct control_stream;
@@ -343,20 +317,20 @@ struct audio_player;
 struct media_subscription;
 
 
-typedef bencode_buffer_t call_buffer_t;
-#define call_buffer_alloc bencode_buffer_alloc
-#define call_buffer_init bencode_buffer_init
-#define call_buffer_free bencode_buffer_free
-
-
 
 
 TYPED_GHASHTABLE(codecs_ht, void, rtp_payload_type, g_direct_hash, g_direct_equal, NULL, NULL)
 TYPED_GHASHTABLE(codec_names_ht, str, GQueue, str_case_hash, str_case_equal, str_free, g_queue_free)
 TYPED_GHASHTABLE_LOOKUP_INSERT(codec_names_ht, str_free, g_queue_new)
 TYPED_GQUEUE(subscription, struct media_subscription)
-TYPED_GHASHTABLE(subscription_ht, struct call_media, subscription_list, g_direct_hash, g_direct_equal, NULL, NULL)
+TYPED_DIRECT_FUNCS(media_direct_hash, media_direct_eq, struct call_media)
+TYPED_GHASHTABLE(subscription_ht, struct call_media, subscription_list, media_direct_hash, media_direct_eq,
+		NULL, NULL)
+TYPED_GHASHTABLE(media_id_ht, str, struct call_media, str_hash, str_equal, NULL, NULL)
 
+struct session_bandwidth {
+	long as, rr, rs, ct, tias;
+};
 
 struct codec_store {
 	codecs_ht		codecs; // int payload type -> rtp_payload_type
@@ -383,7 +357,8 @@ struct stream_params {
 	const struct transport_protocol *protocol;
 	str			format_str;
 	sdes_q			sdes_params; // slice-alloc'd
-	sdp_attr_q		attributes;	/* just some other attributes */
+	sdp_attr_q		generic_attributes;	/* just some other attributes */
+	sdp_attr_q		all_attributes;		/* all attributes */
 	str			direction[2];
 	sockfamily_t		*desired_family;
 	struct dtls_fingerprint fingerprint;
@@ -392,18 +367,19 @@ struct stream_params {
 	candidate_q		ice_candidates; /* slice-alloc'd */
 	str			ice_ufrag;
 	str			ice_pwd;
-	int			ptime;
+	int			ptime, maxptime;
 	str			media_id;
 	struct t38_options	t38_options;
 	str			tls_id;
 	int			media_sdp_id;
+	struct session_bandwidth media_session_bandiwdth;
 };
 
 struct endpoint_map {
 	unsigned int		unique_id;
 	struct endpoint		endpoint;
 	unsigned int		num_ports;
-	const struct logical_intf *logical_intf;
+	struct logical_intf	*logical_intf;
 	sfd_intf_list_q		intf_sfds; /* list of struct sfd_intf_list - contains stream_fd list */
 	unsigned int		wildcard:1;
 };
@@ -465,15 +441,11 @@ struct packet_stream {
 	struct jitter_buffer	*jb;					/* RO */
 	time_t kernel_time;
 
-	struct stream_stats	stats_in;
-	struct stream_stats	stats_out;
-	struct stream_stats	kernel_stats_in;
-	struct stream_stats	kernel_stats_out;
-	unsigned char		in_tos_tclass;
-	atomic64		last_packet;
+	struct stream_stats	*stats_in;
+	struct stream_stats	*stats_out;
+	atomic64		last_packet;				// userspace only
 	GHashTable		*rtp_stats;				/* LOCK: call->master_lock */
 	struct rtp_stats	*rtp_stats_cache;
-	atomic64		stats_flags;
 	enum endpoint_learning		el_flags;
 
 #if RTP_LOOP_PROTECT
@@ -488,6 +460,12 @@ struct packet_stream {
 	/* in_lock must be held for SETTING these: */
 	atomic64		ps_flags;
 };
+
+INLINE uint64_t packet_stream_last_packet(const struct packet_stream *ps) {
+	uint64_t lp1 = atomic64_get_na(&ps->last_packet);
+	uint64_t lp2 = atomic64_get_na(&ps->stats_in->last_packet);
+	return MAX(lp1, lp2);
+}
 
 /**
  * Protected by call->master_lock, except the RO elements.
@@ -507,7 +485,7 @@ struct call_media {
 	const struct transport_protocol *protocol;
 	str			format_str;
 	sockfamily_t		*desired_family;
-	const struct logical_intf *logical_intf;
+	struct logical_intf	*logical_intf;
 
 	struct ice_agent	*ice_agent;
 
@@ -517,12 +495,16 @@ struct call_media {
 	struct dtls_fingerprint fingerprint;			/* as received */
 	const struct dtls_hash_func *fp_hash_func;		/* outgoing */
 	str			tls_id;
+	candidate_q		ice_candidates; 		/* slice-alloc'd, as received */
+	unsigned int			media_rec_slot;
 
 	packet_stream_q		streams;			/* normally RTP + RTCP */
 	endpoint_map_q		endpoint_maps;
 
 	struct codec_store	codecs;
-	sdp_attr_q		sdp_attributes;			/* sdp_attr_new() */
+	struct codec_store	offered_codecs;
+	sdp_attr_q		generic_attributes;			/* sdp_attr_new() */
+	sdp_attr_q		all_attributes;			/* sdp_attr_new() */
 	sdp_attr_print_f	*sdp_attr_print;
 	codec_handlers_ht	codec_handlers;			/* int payload type -> struct codec_handler
 														XXX combine this with 'codecs' hash table? */
@@ -552,17 +534,22 @@ struct call_media {
 	dtmf_event_q		dtmf_send;
 	int					media_sdp_id;
 
+	/* bandwidth */
+	struct session_bandwidth sdp_media_bandwidth;
+
 #ifdef WITH_TRANSCODING
 	encoder_callback_t	encoder_callback;
 #endif
 
 	int			ptime;				/* either from SDP or overridden */
+	int			maxptime;			/* from SDP */
 
 	atomic64		media_flags;
 };
 
 TYPED_GPTRARRAY(medias_arr, struct call_media)
 TYPED_GQUEUE(medias, struct call_media)
+G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(medias_q, medias_q_clear)
 
 
 struct media_subscription {
@@ -588,6 +575,7 @@ struct call_monologue {
 
 	str			tag;
 	str			viabranch;
+	str_q			tag_aliases;
 	enum tag_type		tagtype;
 	str			label;
 	time_t			created;		/* RO */
@@ -596,21 +584,23 @@ struct call_monologue {
 	struct timeval		terminated;		/* for CDR */
 	enum termination_reason	term_reason;
 	sockfamily_t		*desired_family;
-	const struct logical_intf *logical_intf;
+	struct logical_intf	*logical_intf;
 	GHashTable 		*associated_tags;
 	GHashTable		*subscribers_ht;	/* for quick lookup */
 	medias_arr		*medias;
-	GHashTable		*media_ids;
+	media_id_ht		media_ids;
 	struct media_player	*player;
 	struct media_player	*rec_player;
-	unsigned long long	sdp_session_id;
-	unsigned long long	sdp_version;
-	str			last_in_sdp;
-	sdp_sessions_q		last_in_sdp_parsed;	/* last parsed `sdp_session` */
+	struct session_bandwidth sdp_session_bandwidth;
 	sdp_streams_q		last_in_sdp_streams;	/* last parsed `stream_params` */
 	GString			*last_out_sdp;
-	char			*sdp_username;
-	char			*sdp_session_name;
+
+	sdp_origin * session_sdp_orig;	/* actual origin belonging to this monologue */
+	sdp_origin * session_last_sdp_orig;	/* previously used origin by other other side */
+
+	str			sdp_session_name;
+	str			sdp_session_timing;
+	str			sdp_session_group;	/* a=group: e.g. BUNDLE */
 	struct ssrc_hash	*ssrc_hash;
 	str			metadata;
 	struct janus_session	*janus_session;
@@ -632,8 +622,13 @@ struct call_monologue {
 	unsigned int		block_dtmf_trigger_end_ms; // unblock after this many ms
 
 	/* carry `sdp_session` attributes into resulting call monologue SDP */
-	sdp_attr_q		sdp_attributes;
+	sdp_attr_q		generic_attributes;
+	sdp_attr_q		all_attributes;
 	sdp_attr_print_f	*sdp_attr_print;
+
+	long long moh_db_id;
+	str moh_blob;
+	str moh_file;
 
 	atomic64		ml_flags;
 };
@@ -641,6 +636,11 @@ struct call_monologue {
 TYPED_GQUEUE(monologues, struct call_monologue)
 G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(monologues_q, monologues_q_clear)
 TYPED_GHASHTABLE(tags_ht, str, struct call_monologue, str_hash, str_equal, NULL, NULL)
+
+struct sdp_fragment;
+TYPED_GQUEUE(fragment, struct sdp_fragment)
+TYPED_GHASHTABLE(fragments_ht, str, fragment_q, str_hash, str_equal, NULL, NULL)
+
 
 struct call_iterator_list {
 	call_list *first;
@@ -724,8 +724,7 @@ struct call {
 	 */
 	struct obj		obj;
 
-	mutex_t			buffer_lock;
-	call_buffer_t		buffer;
+	memory_arena_t		buffer;
 
 	// use a single poller for all sockets within the call
 	struct poller		*poller;
@@ -747,6 +746,7 @@ struct call {
 	tags_ht			tags;
 	tags_ht			viabranches;
 	labels_ht		labels;
+	fragments_ht		sdp_fragments;
 	packet_stream_q		streams;
 	stream_fd_q		stream_fds;	/* stream_fd */
 	endpoint_map_q		endpoint_maps;
@@ -754,6 +754,7 @@ struct call {
 	struct mqtt_timer	*mqtt_timer;
 
 	str			callid;
+	str_q			callid_aliases;
 	struct timeval		created;
 	struct timeval		destroyed;
 	time_t			last_signal;
@@ -765,7 +766,8 @@ struct call {
 	sockaddr_t		xmlrpc_callback;
 	endpoint_t		dtmf_log_dest;
 
-	unsigned int		redis_hosted_db;
+	int			redis_hosted_db;
+	atomic64		last_redis_update;
 
 	struct recording 	*recording;
 	str			metadata;
@@ -780,6 +782,7 @@ struct call {
 	enum block_dtmf_mode	block_dtmf;
 
 	atomic64		call_flags;
+	unsigned int media_rec_slots;
 };
 
 
@@ -794,6 +797,7 @@ TYPED_GHASHTABLE(rtpe_calls_ht, str, struct call, str_hash, str_equal, NULL, NUL
 extern rwlock_t rtpe_callhash_lock;
 extern rtpe_calls_ht rtpe_callhash;
 extern struct call_iterator_list rtpe_call_iterators[NUM_CALL_ITERATORS];
+extern __thread call_t *call_memory_arena;
 
 
 
@@ -807,6 +811,9 @@ void __monologue_viabranch(struct call_monologue *ml, const str *viabranch);
 struct packet_stream *__packet_stream_new(call_t *call);
 void __add_media_subscription(struct call_media * which, struct call_media * to,
 		const struct sink_attrs *attrs);
+struct media_subscription *call_ml_get_top_ms(struct call_monologue *ml);
+bool call_ml_sendonly_inactive(struct call_monologue *ml);
+struct media_subscription *call_media_get_top_ms(struct call_media * cm);
 struct media_subscription *call_get_media_subscription(subscription_ht ht, struct call_media * cm);
 struct call_monologue * ml_medias_subscribed_to_single_ml(struct call_monologue *ml);
 
@@ -818,15 +825,22 @@ void media_subscriptions_clear(subscription_q *q);
 G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(subscription_q, media_subscriptions_clear)
 
 call_t *call_get_or_create(const str *callid, bool exclusive);
-call_t *call_get_opmode(const str *callid, enum call_opmode opmode);
+call_t *call_get_opmode(const str *callid, enum ng_opmode opmode);
 void call_make_own_foreign(call_t *c, bool foreign);
 int call_get_mono_dialogue(struct call_monologue *monologues[2], call_t *call,
 		const str *fromtag,
 		const str *totag,
-		const str *viabranch);
+		const str *viabranch,
+		sdp_ng_flags *);
 struct call_monologue *call_get_monologue(call_t *call, const str *fromtag);
 struct call_monologue *call_get_or_create_monologue(call_t *call, const str *fromtag);
+__attribute__((nonnull(1)))
 call_t *call_get(const str *callid);
+typedef enum { CG2_OK, CG2_NF1, CG2_NF2, CG2_SAME } call_get2_ret_t;
+__attribute__((nonnull(1, 2, 3, 4)))
+call_get2_ret_t call_get2(call_t **, call_t **, const str *, const str *);
+__attribute__((nonnull(1, 2)))
+bool call_merge(call_t *, call_t **);
 __attribute__((nonnull(2, 3)))
 int monologue_offer_answer(struct call_monologue *monologues[2], sdp_streams_q *streams, sdp_ng_flags *flags);
 __attribute__((nonnull(1, 2, 3, 4)))
@@ -837,11 +851,12 @@ int monologue_subscribe_request(const subscription_q *srms, struct call_monologu
 int monologue_subscribe_answer(struct call_monologue *dst, sdp_ng_flags *flags,
 		sdp_streams_q *streams);
 int monologue_unsubscribe(struct call_monologue *dst, sdp_ng_flags *);
+void dialogue_connect(struct call_monologue *, struct call_monologue *, sdp_ng_flags *);
 void monologue_destroy(struct call_monologue *ml);
 int call_delete_branch_by_id(const str *callid, const str *branch,
-	const str *fromtag, const str *totag, bencode_item_t *output, int delete_delay);
+	const str *fromtag, const str *totag, ng_command_ctx_t *, int delete_delay);
 int call_delete_branch(call_t *, const str *branch,
-	const str *fromtag, const str *totag, bencode_item_t *output, int delete_delay);
+	const str *fromtag, const str *totag, ng_command_ctx_t *, int delete_delay);
 void call_destroy(call_t *);
 struct call_media *call_media_new(call_t *call);
 void call_media_free(struct call_media **mdp);
@@ -851,10 +866,10 @@ void call_media_unkernelize(struct call_media *media, const char *reason);
 void dialogue_unconfirm(struct call_monologue *ml, const char *);
 void __monologue_unconfirm(struct call_monologue *monologue, const char *);
 void __media_unconfirm(struct call_media *media, const char *);
-void update_init_subscribers(struct call_monologue *ml, enum call_opmode opmode);
+void update_init_subscribers(struct call_monologue *ml, enum ng_opmode opmode);
 
-int call_stream_address46(char *o, struct packet_stream *ps, enum stream_address_format format,
-		int *len, const struct local_intf *ifa, bool keep_unspec);
+int call_stream_address(GString *, struct packet_stream *ps, enum stream_address_format format,
+		const struct local_intf *ifa, bool keep_unspec);
 
 void add_total_calls_duration_in_interval(struct timeval *interval_tv);
 enum thread_looper_action call_timer(void);
@@ -868,55 +883,17 @@ const rtp_payload_type *__rtp_stats_codec(struct call_media *m);
 #include "str.h"
 #include "rtp.h"
 
-INLINE void *call_malloc(call_t *c, size_t l) {
-	void *ret;
-	mutex_lock(&c->buffer_lock);
-	ret = call_buffer_alloc(&c->buffer, l);
-	mutex_unlock(&c->buffer_lock);
-	return ret;
-}
+#define call_malloc memory_arena_alloc
+#define call_dup memory_arena_dup
+#define call_ref memory_arena_ref
 
-INLINE char *call_strdup_len(call_t *c, const char *s, unsigned int len) {
-	char *r;
-	if (!s)
-		return NULL;
-	r = call_malloc(c, len + 1);
-	memcpy(r, s, len);
-	r[len] = 0;
-	return r;
-}
+#define call_strdup memory_arena_strdup
+#define call_strdup_str memory_arena_strdup_str
+#define call_str_cpy_len memory_arena_str_cpy_len
+#define call_str_cpy memory_arena_str_cpy
+#define call_str_cpy_c memory_arena_str_cpy_c
+#define call_str_dup memory_arena_str_dup
 
-INLINE char *call_strdup(call_t *c, const char *s) {
-	if (!s)
-		return NULL;
-	return call_strdup_len(c, s, strlen(s));
-}
-INLINE str *call_str_cpy_len(call_t *c, str *out, const char *in, int len) {
-	if (!in) {
-		*out = STR_NULL;
-		return out;
-	}
-	out->s = call_strdup_len(c, in, len);
-	out->len = len;
-	return out;
-}
-INLINE str *call_str_cpy(call_t *c, str *out, const str *in) {
-	return call_str_cpy_len(c, out, in ? in->s : NULL, in ? in->len : 0);
-}
-INLINE str *call_str_cpy_c(call_t *c, str *out, const char *in) {
-	return call_str_cpy_len(c, out, in, in ? strlen(in) : 0);
-}
-INLINE str *call_str_dup(call_t *c, const str *in) {
-	str *out;
-	out = call_malloc(c, sizeof(*out));
-	call_str_cpy_len(c, out, in->s, in->len);
-	return out;
-}
-INLINE str *call_str_init_dup(call_t *c, char *s) {
-	str t;
-	str_init(&t, s);
-	return call_str_dup(c, &t);
-}
 INLINE void __call_unkernelize(call_t *call, const char *reason) {
 	for (__auto_type l = call->monologues.head; l; l = l->next) {
 		struct call_monologue *ml = l->data;
@@ -938,6 +915,19 @@ INLINE endpoint_t *packet_stream_local_addr(struct packet_stream *ps) {
 	if (!dummy.address.family)
 		dummy.address.family = get_socket_family_enum(SF_IP4);
 	return &dummy;
+}
+
+INLINE void call_memory_arena_release(void) {
+	if (!call_memory_arena)
+		return;
+	obj_put(call_memory_arena);
+	call_memory_arena = NULL;
+	memory_arena = NULL;
+}
+INLINE void call_memory_arena_set(call_t *c) {
+	call_memory_arena_release();
+	call_memory_arena = obj_get(c);
+	memory_arena = &c->buffer;
 }
 
 #endif

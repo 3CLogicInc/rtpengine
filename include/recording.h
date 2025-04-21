@@ -19,7 +19,7 @@
 
 struct packet_stream;
 struct media_packet;
-enum call_opmode;
+enum ng_opmode;
 struct rtpengine_target_info;
 struct call_monologue;
 struct call_media;
@@ -62,15 +62,15 @@ struct recording_method {
 	int (*create_spool_dir)(const char *);
 	void (*init_struct)(call_t *);
 
-	void (*sdp_before)(struct recording *, const str *, struct call_monologue *, enum call_opmode);
-	void (*sdp_after)(struct recording *, GString *, struct call_monologue *,
-			enum call_opmode);
+	void (*sdp_before)(struct recording *, const str *, struct call_monologue *, enum ng_opmode);
+	void (*sdp_after)(struct recording *, const str *, struct call_monologue *,
+			enum ng_opmode);
 	void (*meta_chunk)(struct recording *, const char *, const str *);
 	void (*update_flags)(call_t *call, bool streams);
 
 	void (*dump_packet)(struct media_packet *, const str *s);
 	void (*finish)(call_t *, bool discard);
-	void (*response)(struct recording *, bencode_item_t *);
+	void (*response)(struct recording *, const ng_parser_t *, parser_arg);
 
 	void (*init_stream_struct)(struct packet_stream *);
 	void (*setup_stream)(struct packet_stream *);

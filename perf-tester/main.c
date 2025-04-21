@@ -365,7 +365,7 @@ static void readable(int fd, void *o) {
 				s->fixture_idx = 0;
 
 			str frame;
-			str_init_len(&frame, (char *) data->data, data->size);
+			frame = STR_LEN(data->data, data->size);
 
 			if (!s->chain)
 				decoder_input_data(s->decoder, &frame, s->input_ts, got_frame, s, NULL);
@@ -432,8 +432,7 @@ static void kill_threads(uint num) {
 }
 
 
-static void stream_free(void *p) {
-	struct stream *s = p;
+static void stream_free(struct stream *s) {
 	close(s->output_fd);
 	dump_close(s);
 	if (s->encoder)
@@ -467,7 +466,7 @@ static void new_stream_params(
 		const codec_def_t *out_def,
 		const struct testparams *outprm
 ) {
-	struct stream *s = obj_alloc0("stream", sizeof(*s), stream_free);
+	__auto_type s = obj_alloc0(struct stream, stream_free);
 
 	// create timerfd
 	s->timer_fd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
@@ -653,10 +652,10 @@ static void show_popup(const char *fmt, ...) {
 
 	// split into lines and get max line length
 	GQueue lines = G_QUEUE_INIT;
-	str st = STR_INIT(s);
+	str st = STR(s);
 	str token;
 	uint llen = 0;
-	while (str_token_sep(&token, &st, '\n') == 0) {
+	while (str_token_sep(&token, &st, '\n')) {
 		g_queue_push_tail(&lines, str_dup(&token));
 		llen = MAX(token.len, llen);
 	}
@@ -1929,10 +1928,10 @@ int main(int argc, char **argv) {
 	if (!rtpe_poller)
 		die("Failed to create poller");
 
-	decoder_def = codec_find(&STR_INIT(source_codec), MT_AUDIO);
+	decoder_def = codec_find(STR_PTR(source_codec), MT_AUDIO);
 	if (!decoder_def)
 		die("Codec definition for source codec not found");
-	encoder_def = codec_find(&STR_INIT(dest_codec), MT_AUDIO);
+	encoder_def = codec_find(STR_PTR(dest_codec), MT_AUDIO);
 	if (!encoder_def)
 		die("Codec definition for destination codec not found");
 

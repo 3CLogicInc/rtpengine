@@ -9,6 +9,7 @@
 #include "codec.h"
 #include "main.h"
 #include "rtcplib.h"
+#include "bufferpool.h"
 
 #define INITIAL_PACKETS 0x1E
 #define CONT_SEQ_COUNT 0x1F4
@@ -105,7 +106,7 @@ static struct jb_packet* get_jb_packet(struct media_packet *mp, const str *s) {
 	if (rtp_payload(&mp->rtp, &mp->payload, s))
 		return NULL;
 
-	char *buf = malloc(s->len + RTP_BUFFER_HEAD_ROOM + RTP_BUFFER_TAIL_ROOM);
+	char *buf = bufferpool_alloc(media_bufferpool, s->len + RTP_BUFFER_HEAD_ROOM + RTP_BUFFER_TAIL_ROOM);
 	if (!buf) {
 		ilog(LOG_ERROR, "Failed to allocate memory: %s", strerror(errno));
 		return NULL;
@@ -116,7 +117,7 @@ static struct jb_packet* get_jb_packet(struct media_packet *mp, const str *s) {
 	p->buf = buf;
 	media_packet_copy(&p->mp, mp);
 
-	str_init_len(&p->mp.raw, buf + RTP_BUFFER_HEAD_ROOM, s->len);
+	p->mp.raw = STR_LEN(buf + RTP_BUFFER_HEAD_ROOM, s->len);
 	memcpy(p->mp.raw.s, s->s, s->len);
 
 	return p;
@@ -354,8 +355,8 @@ static void set_jitter_values(struct media_packet *mp) {
 		if(rtp_pt->codec_def && rtp_pt->codec_def->dtmf)
 			dtmf = 1;
 	}
+	mutex_lock(&jb->lock);
 	if(jb->next_exp_seq && !dtmf) {
-		mutex_lock(&jb->lock);
 		if(curr_seq > jb->next_exp_seq) {
 			int marker = (mp->rtp->m_pt & 0x80) ? 1 : 0;
 			if(!marker) {
@@ -381,10 +382,10 @@ static void set_jitter_values(struct media_packet *mp) {
 
 		if(jb->cont_miss >= CONT_MISS_COUNT)
 			reset_jitter_buffer(jb);
-		mutex_unlock(&jb->lock);
 	}
 	if(curr_seq >= jb->next_exp_seq)
 		jb->next_exp_seq = curr_seq + 1;
+	mutex_unlock(&jb->lock);
 }
 
 static void __jb_send_later(struct timerthread_queue *ttq, void *p) {
@@ -445,7 +446,7 @@ void jb_packet_free(struct jb_packet **jbp) {
 	if (!jbp || !*jbp)
 		return;
 
-	free((*jbp)->buf);
+	bufferpool_unref((*jbp)->buf);
 	media_packet_release(&(*jbp)->mp);
 	g_slice_free1(sizeof(**jbp), *jbp);
 	*jbp = NULL;

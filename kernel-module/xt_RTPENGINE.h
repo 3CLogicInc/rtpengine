@@ -2,6 +2,8 @@
 #define XT_RTPPROXY_H
 
 
+#include "common_stats.h"
+
 
 #define RTPE_NUM_PAYLOAD_TYPES 32
 #define RTPE_MAX_FORWARD_DESTINATIONS 32
@@ -9,28 +11,10 @@
 
 
 
+struct global_stats_counter;
+
 struct xt_rtpengine_info {
 	unsigned int			id;
-};
-
-struct rtpengine_stats {
-	uint64_t			packets;
-	uint64_t			bytes;
-	uint64_t			errors;
-	uint8_t            		tos;
-};
-struct rtpengine_rtp_stats {
-	uint64_t			packets;
-	uint64_t			bytes;
-};
-struct rtpengine_ssrc_stats {
-	struct rtpengine_rtp_stats	basic_stats;
-	uint32_t			timestamp;
-	uint32_t			ext_seq;
-	uint32_t			lost_bits; // sliding bitfield, [0] = ext_seq
-	uint32_t			total_lost;
-	uint32_t			transit;
-	uint32_t			jitter;
 };
 
 struct re_address {
@@ -78,8 +62,6 @@ struct rtpengine_srtp {
 	unsigned int			session_key_len;
 	unsigned int			session_salt_len;
 	unsigned char			mki[256]; /* XXX uses too much memory? */
-	uint64_t			last_rtp_index[RTPE_NUM_SSRC_TRACKING];
-	uint64_t			last_rtcp_index[RTPE_NUM_SSRC_TRACKING];
 	unsigned int			rtp_auth_tag_len; /* in bytes */
 	unsigned int			rtcp_auth_tag_len; /* in bytes */
 	unsigned int			mki_len;
@@ -92,10 +74,6 @@ enum rtpengine_src_mismatch {
 	MSM_PROPAGATE,		/* propagate to userspace daemon */
 };
 
-struct rtpengine_pt_input {
-	unsigned char pt_num;
-	uint32_t clock_rate;
-};
 struct rtpengine_pt_output {
 	unsigned int min_payload_len;
 	char replace_pattern[16];
@@ -112,14 +90,19 @@ struct rtpengine_target_info {
 
 	struct rtpengine_srtp		decrypt;
 	uint32_t			ssrc[RTPE_NUM_SSRC_TRACKING]; // Expose the SSRC to userspace when we resync.
+	struct ssrc_stats		*ssrc_stats[RTPE_NUM_SSRC_TRACKING];
 
-	struct rtpengine_pt_input	pt_input[RTPE_NUM_PAYLOAD_TYPES]; /* must be sorted */
+	struct rtp_stats		*pt_stats[RTPE_NUM_PAYLOAD_TYPES]; // must be sorted by PT
 	unsigned int			num_payload_types;
+
+	struct interface_stats_block	*iface_stats; // for ingress stats
+	struct stream_stats		*stats; // for ingress stats
 
 	unsigned int			rtcp_mux:1,
 					dtls:1,
 					stun:1,
 					rtp:1,
+					ssrc_req:1,
 					rtp_only:1,
 					track_ssrc:1,
 					rtcp:1,
@@ -140,6 +123,10 @@ struct rtpengine_output_info {
 	uint32_t			ssrc_out[RTPE_NUM_SSRC_TRACKING]; // Rewrite SSRC
 	uint32_t			seq_offset[RTPE_NUM_SSRC_TRACKING]; // Rewrite output seq
 	struct rtpengine_pt_output	pt_output[RTPE_NUM_PAYLOAD_TYPES]; // same indexes as pt_input
+
+	struct interface_stats_block	*iface_stats; // for egress stats
+	struct stream_stats		*stats; // for egress stats
+	struct ssrc_stats		*ssrc_stats[RTPE_NUM_SSRC_TRACKING];
 
 	unsigned char			tos;
 	unsigned int			ssrc_subst:1;
@@ -173,14 +160,8 @@ struct rtpengine_packet_info {
 	unsigned char			data[];
 };
 
-struct rtpengine_stats_info {
-	uint32_t			ssrc[RTPE_NUM_SSRC_TRACKING];
-	struct rtpengine_ssrc_stats	ssrc_stats[RTPE_NUM_SSRC_TRACKING];
-	uint64_t			last_rtcp_index[RTPE_MAX_FORWARD_DESTINATIONS][RTPE_NUM_SSRC_TRACKING];
-};
-
 enum rtpengine_command {
-	REMG_NOOP = 1,
+	REMG_INIT = 1,
 	REMG_ADD_TARGET,
 	REMG_ADD_DESTINATION,
 	REMG_ADD_CALL,
@@ -188,29 +169,50 @@ enum rtpengine_command {
 	REMG_ADD_STREAM,
 	REMG_DEL_STREAM,
 	REMG_PACKET,
-	REMG_GET_RESET_STATS,
-	REMG_DEL_TARGET_STATS,
-	REMG_SEND_RTCP,
+	REMG_DEL_TARGET,
+	REMG_INIT_PLAY_STREAMS,
+	REMG_GET_PACKET_STREAM,
+	REMG_PLAY_STREAM_PACKET,
+	REMG_PLAY_STREAM,
+	REMG_STOP_STREAM,
+	REMG_FREE_PACKET_STREAM,
 
 	__REMG_LAST
 };
 
-struct rtpengine_noop_info {
+struct rtpengine_init_info {
 	int				last_cmd;
 	size_t				msg_size[__REMG_LAST];
+	struct global_stats_counter	*rtpe_stats;
 };
 
-struct rtpengine_send_packet_info {
-	struct re_address		local;
-	unsigned int			destination_idx;
+struct rtpengine_command_init {
+	enum rtpengine_command		cmd;
+	struct rtpengine_init_info	init;
+};
+
+struct rtpengine_play_stream_info {
 	struct re_address		src_addr;
 	struct re_address		dst_addr;
-	unsigned char			data[];
+	unsigned char			pt;
+	uint32_t			ssrc;
+	uint32_t			ts; // start TS
+	uint16_t			seq; // start seq
+	struct rtpengine_srtp		encrypt;
+	unsigned int			packet_stream_idx;
+	struct interface_stats_block	*iface_stats; // for egress stats
+	struct stream_stats		*stats; // for egress stats
+	struct ssrc_stats		*ssrc_stats;
+	int				repeat;
+	int				remove_at_end;
 };
 
-struct rtpengine_command_noop {
-	enum rtpengine_command		cmd;
-	struct rtpengine_noop_info	noop;
+struct rtpengine_play_stream_packet_info {
+	unsigned int			packet_stream_idx;
+	unsigned long			delay_ms; // first packet = 0
+	uint32_t			delay_ts; // first packet = 0
+	uint32_t			duration_ts;
+	unsigned char			data[];
 };
 
 struct rtpengine_command_add_target {
@@ -218,10 +220,9 @@ struct rtpengine_command_add_target {
 	struct rtpengine_target_info	target;
 };
 
-struct rtpengine_command_del_target_stats {
+struct rtpengine_command_del_target {
 	enum rtpengine_command		cmd;
-	struct re_address		local;		// input
-	struct rtpengine_stats_info	stats;		// output
+	struct re_address		local;
 };
 
 struct rtpengine_command_destination {
@@ -254,23 +255,36 @@ struct rtpengine_command_packet {
 	struct rtpengine_packet_info	packet;
 };
 
-struct rtpengine_command_stats {
+struct rtpengine_command_init_play_streams {
 	enum rtpengine_command		cmd;
-	struct re_address		local;		// input
-	struct rtpengine_stats_info	stats;		// output
+	unsigned int			num_packet_streams;
+	unsigned int			num_play_streams;
 };
 
-struct rtpengine_command_send_packet {
+struct rtpengine_command_get_packet_stream {
 	enum rtpengine_command		cmd;
-	struct rtpengine_send_packet_info send_packet;
+	unsigned int			packet_stream_idx;	// output
 };
 
-struct rtpengine_list_entry {
-	struct rtpengine_target_info	target;
-	struct rtpengine_stats		stats_in;
-	struct rtpengine_rtp_stats	rtp_stats[RTPE_NUM_PAYLOAD_TYPES]; // same index as pt_input
-	struct rtpengine_output_info	outputs[RTPE_MAX_FORWARD_DESTINATIONS];
-	struct rtpengine_stats		stats_out[RTPE_MAX_FORWARD_DESTINATIONS];
+struct rtpengine_command_play_stream_packet {
+	enum rtpengine_command		cmd;
+	struct rtpengine_play_stream_packet_info play_stream_packet;
+};
+
+struct rtpengine_command_play_stream {
+	enum rtpengine_command		cmd;
+	struct rtpengine_play_stream_info info;		// input
+	unsigned int			play_idx;	// output
+};
+
+struct rtpengine_command_stop_stream {
+	enum rtpengine_command		cmd;
+	unsigned int			play_idx;
+};
+
+struct rtpengine_command_free_packet_stream {
+	enum rtpengine_command		cmd;
+	unsigned int			packet_stream_idx;
 };
 
 

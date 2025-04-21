@@ -31,168 +31,254 @@
 #include "rtplib.h"
 #include "ssrc.h"
 #include "codec.h"
+#include "media_player.h"
 
-typedef void (*cli_handler_func)(str *, struct cli_writer *);
-typedef struct {
+typedef struct cli_handler_t cli_handler_t;
+typedef struct cli_command_t cli_command_t;
+typedef void (*cli_handler_func)(str *, struct cli_writer *, const cli_handler_t *);
+
+struct cli_command_t {
 	const char *cmd;
 	cli_handler_func handler;
-} cli_handler_t;
+	const cli_handler_t *next;
+	const char *params;
+	const char *help;
+};
+struct cli_handler_t {
+	unsigned int section;
+	const cli_command_t *commands;
+	unsigned int num_commands;
+};
 
-static void cli_incoming_list(str *instr, struct cli_writer *cw);
-static void cli_incoming_set(str *instr, struct cli_writer *cw);
-static void cli_incoming_params(str *instr, struct cli_writer *cw);
-static void cli_incoming_terminate(str *instr, struct cli_writer *cw);
-static void cli_incoming_ksadd(str *instr, struct cli_writer *cw);
-static void cli_incoming_ksrm(str *instr, struct cli_writer *cw);
-static void cli_incoming_kslist(str *instr, struct cli_writer *cw);
-static void cli_incoming_active(str *instr, struct cli_writer *cw);
-static void cli_incoming_standby(str *instr, struct cli_writer *cw);
-static void cli_incoming_debug(str *instr, struct cli_writer *cw);
-static void cli_incoming_call(str *instr, struct cli_writer *cw);
+static void cli_generic_handler(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_terminate(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_ksadd(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_ksrm(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_kslist(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_active(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_standby(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_debug(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_call(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_usage(str *instr, struct cli_writer *cw, const cli_handler_t *);
 
-static void cli_incoming_set_maxopenfiles(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_maxsessions(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_maxcpu(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_maxload(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_maxbw(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_timeout(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_silenttimeout(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_offertimeout(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_finaltimeout(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_loglevel(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_redisallowederrors(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_redisdisabletime(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_redisdisable(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_redisconnecttimeout(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_rediscmdtimeout(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_controltos(str *instr, struct cli_writer *cw);
-static void cli_incoming_set_deletedelay(str *instr, struct cli_writer *cw);
+static void cli_incoming_set_maxopenfiles(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_maxsessions(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_maxcpu(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_maxload(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_maxbw(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_timeout(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_silenttimeout(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_offertimeout(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_finaltimeout(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_loglevel(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_redisallowederrors(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_redisdisabletime(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_redisdisable(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_redisconnecttimeout(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_rediscmdtimeout(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_controltos(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_set_deletedelay(str *instr, struct cli_writer *cw, const cli_handler_t *);
 
-static void cli_incoming_params_start(str *instr, struct cli_writer *cw);
-static void cli_incoming_params_current(str *instr, struct cli_writer *cw);
-static void cli_incoming_params_diff(str *instr, struct cli_writer *cw);
-static void cli_incoming_params_revert(str *instr, struct cli_writer *cw);
+static void cli_incoming_params_start(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_params_current(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_params_diff(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_params_revert(str *instr, struct cli_writer *cw, const cli_handler_t *);
 
-static void cli_incoming_list_numsessions(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_maxsessions(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_maxcpu(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_maxload(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_maxbw(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_maxopenfiles(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_totals(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_counters(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_sessions(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_timeout(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_silenttimeout(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_offertimeout(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_finaltimeout(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_loglevel(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_loglevels(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_redisallowederrors(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_redisdisabletime(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_redisconnecttimeout(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_rediscmdtimeout(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_controltos(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_deletedelay(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_interfaces(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_jsonstats(str *instr, struct cli_writer *cw);
-static void cli_incoming_list_transcoders(str *instr, struct cli_writer *cw);
+static void cli_incoming_list_numsessions(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_maxsessions(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_maxcpu(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_maxload(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_maxbw(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_maxopenfiles(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_totals(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_counters(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_sessions(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_timeout(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_silenttimeout(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_offertimeout(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_finaltimeout(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_loglevel(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_loglevels(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_redisallowederrors(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_redisdisabletime(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_redisconnecttimeout(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_rediscmdtimeout(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_controltos(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_deletedelay(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_interfaces(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_jsonstats(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_list_transcoders(str *instr, struct cli_writer *cw, const cli_handler_t *);
 
-static void cli_incoming_call_info(str *instr, struct cli_writer *cw);
-static void cli_incoming_call_terminate(str *instr, struct cli_writer *cw);
-static void cli_incoming_call_debug(str *instr, struct cli_writer *cw);
-static void cli_incoming_call_tag(str *instr, struct cli_writer *cw);
+static void cli_incoming_call_info(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_call_terminate(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_call_debug(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_call_tag(str *instr, struct cli_writer *cw, const cli_handler_t *);
 
-static void cli_incoming_tag_info(str *instr, struct cli_writer *cw);
+static void cli_incoming_tag_info(str *instr, struct cli_writer *cw, const cli_handler_t *);
 #ifdef WITH_TRANSCODING
-static void cli_incoming_tag_delay(str *instr, struct cli_writer *cw);
-static void cli_incoming_tag_detdtmf(str *instr, struct cli_writer *cw);
+static void cli_incoming_tag_delay(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_tag_detdtmf(str *instr, struct cli_writer *cw, const cli_handler_t *);
+
+static void cli_incoming_media_list_files(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_list_dbs(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_list_caches(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_list_players(str *instr, struct cli_writer *cw, const cli_handler_t *);
+
+static void cli_incoming_media_reload_file(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_reload_files(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_reload_db(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_reload_dbs(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_reload_cache(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_reload_caches(str *instr, struct cli_writer *cw, const cli_handler_t *);
+
+static void cli_incoming_media_add_file(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_add_db(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_add_cache(str *instr, struct cli_writer *cw, const cli_handler_t *);
+
+static void cli_incoming_media_evict_file(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_evict_files(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_evict_db(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_evict_dbs(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_evict_cache(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_evict_caches(str *instr, struct cli_writer *cw, const cli_handler_t *);
+static void cli_incoming_media_evict_players(str *instr, struct cli_writer *cw, const cli_handler_t *);
 #endif
 
-static const cli_handler_t cli_top_handlers[] = {
-	{ "list",		cli_incoming_list		},
-	{ "terminate",		cli_incoming_terminate		},
-	{ "set",		cli_incoming_set		},
-	{ "get",		cli_incoming_list		},
-	{ "params",		cli_incoming_params		},
-	{ "ksadd",		cli_incoming_ksadd		},
-	{ "ksrm",		cli_incoming_ksrm		},
-	{ "kslist",		cli_incoming_kslist		},
-	{ "active",		cli_incoming_active		},
-	{ "standby",		cli_incoming_standby		},
-	{ "debug",		cli_incoming_debug		},
-	{ "call",		cli_incoming_call 		},
-	{ NULL, },
-};
-static const cli_handler_t cli_set_handlers[] = {
-	{ "maxopenfiles",		cli_incoming_set_maxopenfiles		},
-	{ "maxsessions",		cli_incoming_set_maxsessions		},
-	{ "maxcpu",			cli_incoming_set_maxcpu			},
-	{ "maxload",			cli_incoming_set_maxload		},
-	{ "maxbw",			cli_incoming_set_maxbw			},
-	{ "timeout",			cli_incoming_set_timeout		},
-	{ "silenttimeout",		cli_incoming_set_silenttimeout		},
-	{ "offertimeout",		cli_incoming_set_offertimeout		},
-	{ "finaltimeout",		cli_incoming_set_finaltimeout		},
-	{ "loglevel",			cli_incoming_set_loglevel		},
-	{ "redisallowederrors",		cli_incoming_set_redisallowederrors	},
-	{ "redisdisabletime",		cli_incoming_set_redisdisabletime	},
-	{ "redisdisable",		cli_incoming_set_redisdisable		},
-	{ "redisconnecttimeout",	cli_incoming_set_redisconnecttimeout	},
-	{ "rediscmdtimeout",		cli_incoming_set_rediscmdtimeout	},
-	{ "controltos",			cli_incoming_set_controltos		},
-	{ "deletedelay",		cli_incoming_set_deletedelay 		},
-	{ NULL, },
-};
-static const cli_handler_t cli_list_handlers[] = {
-	{ "numsessions",		cli_incoming_list_numsessions		},
-	{ "sessions",			cli_incoming_list_sessions		},
-	{ "totals",			cli_incoming_list_totals		},
-	{ "counters",			cli_incoming_list_counters		},
-	{ "maxopenfiles",		cli_incoming_list_maxopenfiles		},
-	{ "maxsessions",		cli_incoming_list_maxsessions		},
-	{ "maxcpu",			cli_incoming_list_maxcpu		},
-	{ "maxload",			cli_incoming_list_maxload		},
-	{ "maxbw",			cli_incoming_list_maxbw			},
-	{ "timeout",			cli_incoming_list_timeout		},
-	{ "silenttimeout",		cli_incoming_list_silenttimeout		},
-	{ "offertimeout",		cli_incoming_list_offertimeout		},
-	{ "finaltimeout",		cli_incoming_list_finaltimeout		},
-	{ "loglevels",			cli_incoming_list_loglevels		},
-	{ "loglevel",			cli_incoming_list_loglevel		},
-	{ "redisallowederrors",		cli_incoming_list_redisallowederrors	},
-	{ "redisdisabletime",		cli_incoming_list_redisdisabletime	},
-	{ "redisconnecttimeout",	cli_incoming_list_redisconnecttimeout	},
-	{ "rediscmdtimeout",		cli_incoming_list_rediscmdtimeout	},
-	{ "controltos",			cli_incoming_list_controltos		},
-	{ "deletedelay", 		cli_incoming_list_deletedelay 		},
-	{ "interfaces",			cli_incoming_list_interfaces		},
-	{ "jsonstats",			cli_incoming_list_jsonstats		},
-	{ "transcoders",		cli_incoming_list_transcoders		},
-	{ NULL, },
-};
-static const cli_handler_t cli_call_handlers[] = {
-	{ "info",			cli_incoming_call_info			},
-	{ "terminate",			cli_incoming_call_terminate		},
-	{ "debug",			cli_incoming_call_debug			},
-	{ "tag",			cli_incoming_call_tag			},
-	{ NULL, },
-};
-static const cli_handler_t cli_tag_handlers[] = {
-	{ "info",			cli_incoming_tag_info			},
+
+#define HANDLER_START(n)	static const cli_handler_t n = { .section = CSH_SECTION, .commands = (const struct cli_command_t []) {
+#define HANDLER_CMD(c, f, p, s)		[CSH_LOOKUP(c)] = { .cmd = c, .handler = f, .params = p, .help = s },
+#define HANDLER_GENERIC(c, h)		[CSH_LOOKUP(c)] = { .cmd = c, .handler = cli_generic_handler, .next = &h, .params = "<option>" },
+#define HANDLER_FOLLOW(c, f, p, h)	[CSH_LOOKUP(c)] = { .cmd = c, .handler = f, .next = &h, .params = p },
+#define HANDLER_END 		}, .num_commands = CSH_NUM_LOOKUPS };
+
+HANDLER_START(cli_set_handlers)
+	HANDLER_CMD("maxopenfiles",		cli_incoming_set_maxopenfiles,		"<uint>",				"set the max number of allowed open files")
+	HANDLER_CMD("maxsessions",		cli_incoming_set_maxsessions,		"<int>",				"set the max number of allowed sessions")
+	HANDLER_CMD("maxcpu",			cli_incoming_set_maxcpu,		"<float>",				"set maxmimum CPU usage allowed")
+	HANDLER_CMD("maxload",			cli_incoming_set_maxload,		"<float>",				"set maxmimum load average allowed")
+	HANDLER_CMD("maxbw",			cli_incoming_set_maxbw,			"<uint>",				"set maxmimum bandwidth usage average allowed")
+	HANDLER_CMD("timeout",			cli_incoming_set_timeout,		"<uint>",				"set the --timeout parameter")
+	HANDLER_CMD("silenttimeout",		cli_incoming_set_silenttimeout,		"<uint>",				"set the --silent-timeout parameter")
+	HANDLER_CMD("offertimeout",		cli_incoming_set_offertimeout,		"<uint>",				"set the --offer-timeout parameter")
+	HANDLER_CMD("finaltimeout",		cli_incoming_set_finaltimeout,		"<uint>",				"set the --final-timeout parameter")
+	HANDLER_CMD("loglevel",			cli_incoming_set_loglevel,		"<uint> | <sys> <uint>",		"set one or all log levels to new value (1-7)")
+	HANDLER_CMD("redisallowederrors",	cli_incoming_set_redisallowederrors,	"<int>",				"set the --redis-allowed-errors parameter")
+	HANDLER_CMD("redisdisabletime",		cli_incoming_set_redisdisabletime,	"<uint>",				"set the --redis-disable-time parameter")
+	HANDLER_CMD("redisdisable",		cli_incoming_set_redisdisable,		"0 | 1",				"toggle disable writing to Redis")
+	HANDLER_CMD("redisconnecttimeout",	cli_incoming_set_redisconnecttimeout,	"<uint>",				"set the --redis-connect-timeout parameter")
+	HANDLER_CMD("rediscmdtimeout",		cli_incoming_set_rediscmdtimeout,	"<uint>",				"set the --redis-cmd-timeout parameter")
+	HANDLER_CMD("controltos",		cli_incoming_set_controltos,		"<uint>",				"set the --control-tos parameter")
+	HANDLER_CMD("deletedelay",		cli_incoming_set_deletedelay,		"<uint>",				"set the --delete-delay parameter")
+HANDLER_END
+
+HANDLER_START(cli_list_handlers)
+	HANDLER_CMD("numsessions",		cli_incoming_list_numsessions,		"",					"print the number of sessions")
+	HANDLER_CMD("sessions",			cli_incoming_list_sessions,		"<callid> | all | own | foreign",	"list sessions, or print details or one session")
+	HANDLER_CMD("totals",			cli_incoming_list_totals,		NULL,					"print total statistics")
+	HANDLER_CMD("counters",			cli_incoming_list_counters,		NULL,					"print per-second counters")
+	HANDLER_CMD("maxopenfiles",		cli_incoming_list_maxopenfiles,		NULL,					"print the number of allowed open files")
+	HANDLER_CMD("maxsessions",		cli_incoming_list_maxsessions,		NULL,					"print the number of allowed sessions")
+	HANDLER_CMD("maxcpu",			cli_incoming_list_maxcpu,		NULL,					"print maxmimum CPU usage allowed")
+	HANDLER_CMD("maxload",			cli_incoming_list_maxload,		NULL,					"print maxmimum load average allowed")
+	HANDLER_CMD("maxbw",			cli_incoming_list_maxbw	,		NULL,					"print maxmimum bandwidth usage average allowed")
+	HANDLER_CMD("timeout",			cli_incoming_list_timeout,		NULL,					"print timeout parameter")
+	HANDLER_CMD("silenttimeout",		cli_incoming_list_silenttimeout,	NULL,					"print silent-timeout parameter")
+	HANDLER_CMD("offertimeout",		cli_incoming_list_offertimeout,		NULL,					"print offer-timeout parameter")
+	HANDLER_CMD("finaltimeout",		cli_incoming_list_finaltimeout,		NULL,					"print final-timeout parameter")
+	HANDLER_CMD("loglevels",		cli_incoming_list_loglevels,		NULL,					"list available log levels")
+	HANDLER_CMD("loglevel",			cli_incoming_list_loglevel,		"[<system>]",				"print all current log levels, or one log level")
+	HANDLER_CMD("redisallowederrors",	cli_incoming_list_redisallowederrors,	NULL,					"print redis-allowed-errors parameter")
+	HANDLER_CMD("redisdisabletime",		cli_incoming_list_redisdisabletime,	NULL,					"print redis-disable-time parameter")
+	HANDLER_CMD("redisconnecttimeout",	cli_incoming_list_redisconnecttimeout,	NULL,					"print redis-connect-timeout parameter")
+	HANDLER_CMD("rediscmdtimeout",		cli_incoming_list_rediscmdtimeout,	NULL,					"print redis-cmd-timeout parameter")
+	HANDLER_CMD("controltos",		cli_incoming_list_controltos,		NULL,					"print control-tos parameter")
+	HANDLER_CMD("deletedelay", 		cli_incoming_list_deletedelay,		NULL,					"print delete-delay parameter")
+	HANDLER_CMD("interfaces",		cli_incoming_list_interfaces,		NULL,					"print local interface/port statistics")
+	HANDLER_CMD("jsonstats",		cli_incoming_list_jsonstats,		NULL,					"print total statistics in JSON format")
+	HANDLER_CMD("transcoders",		cli_incoming_list_transcoders,		NULL,					"print transcoding statistics")
+HANDLER_END
+
+HANDLER_START(cli_tag_handlers)
+	HANDLER_CMD("info",			cli_incoming_tag_info,			NULL,					"print details of given call party")
 #ifdef WITH_TRANSCODING
-	{ "delay",			cli_incoming_tag_delay			},
-	{ "detect-dtmf",		cli_incoming_tag_detdtmf		},
+	HANDLER_CMD("delay",			cli_incoming_tag_delay,			"<uint>",				"set audio buffer delay for given call party")
+	HANDLER_CMD("detect-dtmf",		cli_incoming_tag_detdtmf,		"0 | 1",				"toggle DTMF detection for given call party")
 #endif
-	{ NULL, },
-};
-static const cli_handler_t cli_params_handlers[] = {
-	{ "start",	cli_incoming_params_start	},
-	{ "current",	cli_incoming_params_current	},
-	{ "diff",	cli_incoming_params_diff	},
-	{ "revert",	cli_incoming_params_revert	},
-	{ NULL, },
-};
+HANDLER_END
+
+HANDLER_START(cli_call_handlers)
+	HANDLER_CMD("info",			cli_incoming_call_info,			NULL,					"print details of given call")
+	HANDLER_CMD("terminate",		cli_incoming_call_terminate,		NULL,					"terminate given call")
+	HANDLER_CMD("debug",			cli_incoming_call_debug,		"on | off",				"toggle debugging for given call")
+	HANDLER_FOLLOW("tag",			cli_incoming_call_tag,			"<tag> <option>",			cli_tag_handlers)
+HANDLER_END
+
+HANDLER_START(cli_params_handlers)
+	HANDLER_CMD("start",			cli_incoming_params_start,		NULL,					"print initial startup configuration values")
+	HANDLER_CMD("current",			cli_incoming_params_current,		NULL,					"print current configuration values")
+	HANDLER_CMD("diff",			cli_incoming_params_diff,		NULL,					"print difference between current and initial config")
+	HANDLER_CMD("revert",			cli_incoming_params_revert,		NULL,					"revert config options to startup values")
+HANDLER_END
+
+#ifdef WITH_TRANSCODING
+HANDLER_START(cli_media_list_handlers)
+	HANDLER_CMD("files",			cli_incoming_media_list_files,		NULL,					"list media files cached in memory")
+	HANDLER_CMD("dbs",			cli_incoming_media_list_dbs,		NULL,					"list media from database cached in memory")
+	HANDLER_CMD("caches",			cli_incoming_media_list_caches,		NULL,					"list media from database cached on file system")
+	HANDLER_CMD("players",			cli_incoming_media_list_players,	NULL,					"list fully encoded media streams cached in memory")
+HANDLER_END
+
+HANDLER_START(cli_media_add_handlers)
+	HANDLER_CMD("file",			cli_incoming_media_add_file,		"<path>",				"load a media file into memory cache")
+	HANDLER_CMD("db",			cli_incoming_media_add_db,		"<index>",				"load media from database into memory cache")
+	HANDLER_CMD("cache",			cli_incoming_media_add_cache,		"<index>",				"load media from database and store in file system cache")
+HANDLER_END
+
+HANDLER_START(cli_media_reload_handlers)
+	HANDLER_CMD("file",			cli_incoming_media_reload_file,		"<path>",				"reload one media file if it already exists in memory cache")
+	HANDLER_CMD("files",			cli_incoming_media_reload_files,	NULL,					"reload all media files currently in memory")
+	HANDLER_CMD("db",			cli_incoming_media_reload_db,		"<index>",				"reload one media from database if it already exists in memory cache")
+	HANDLER_CMD("dbs",			cli_incoming_media_reload_dbs,		NULL,					"reload all media entries from database currently in memory")
+	HANDLER_CMD("cache",			cli_incoming_media_reload_cache,	"<index>",				"reload one media from database if it already exists in file system cache")
+	HANDLER_CMD("caches",			cli_incoming_media_reload_caches,	NULL,					"reload all database media entries currently in file cache")
+HANDLER_END
+
+HANDLER_START(cli_media_evict_handlers)
+	HANDLER_CMD("file",			cli_incoming_media_evict_file,		"<path>",				"remove one media file from memory cache")
+	HANDLER_CMD("files",			cli_incoming_media_evict_files,		NULL,					"remove all media files from memory")
+	HANDLER_CMD("db",			cli_incoming_media_evict_db,		"<index> ...",				"remove one database media entry from memory cache")
+	HANDLER_CMD("dbs",			cli_incoming_media_evict_dbs,		NULL,					"remove all database media entries from memory")
+	HANDLER_CMD("cache",			cli_incoming_media_evict_cache,		"<index> ...",				"remove one database media entry from file system cache")
+	HANDLER_CMD("caches",			cli_incoming_media_evict_caches,	NULL,					"remove all database media entries from file cache")
+	HANDLER_CMD("players",			cli_incoming_media_evict_players,	NULL,					"remove all full encoded media streams from memory cache")
+HANDLER_END
+
+HANDLER_START(cli_media_handlers)
+	HANDLER_GENERIC("list",			cli_media_list_handlers)
+	HANDLER_GENERIC("add",			cli_media_add_handlers)
+	HANDLER_GENERIC("reload",		cli_media_reload_handlers)
+	HANDLER_GENERIC("evict",		cli_media_evict_handlers)
+HANDLER_END
+
+#endif
+HANDLER_START(cli_top_handlers)
+	HANDLER_CMD("usage",			cli_incoming_usage,			NULL,					"print the full list of all available commands")
+	HANDLER_GENERIC("list",			cli_list_handlers)
+	HANDLER_CMD("terminate",		cli_incoming_terminate,			"<callid> | all | own | foreign",	"terminate one particular call, or all (owned/foreign) calls")
+	HANDLER_GENERIC("set",			cli_set_handlers)
+	HANDLER_GENERIC("get",			cli_list_handlers)
+	HANDLER_GENERIC("params",		cli_params_handlers)
+	HANDLER_CMD("ksadd",			cli_incoming_ksadd,			"<uint>",				"subscribe to 'keyspace' database")
+	HANDLER_CMD("ksrm",			cli_incoming_ksrm,			"<uint>",				"unsubscribe to 'keyspace' database and remove all foreign calls for that 'keyspace'")
+	HANDLER_CMD("kslist",			cli_incoming_kslist,			NULL,					"print all currently subscribed keyspaces")
+	HANDLER_CMD("active",			cli_incoming_active,			NULL,					"set all running sessions to 'owned'")
+	HANDLER_CMD("standby",			cli_incoming_standby,			NULL,					"set all running sessions to 'foreign'")
+	HANDLER_CMD("debug",			cli_incoming_debug,			"<callid> on | off",			"set debugging flag for given call")
+	HANDLER_FOLLOW("call",			cli_incoming_call,			"<callid> <option>",			cli_call_handlers)
+#ifdef WITH_TRANSCODING
+	HANDLER_GENERIC("media",		cli_media_handlers)
+#endif
+HANDLER_END
 
 
 static void cli_list_call_info(struct cli_writer *cw, call_t *c);
@@ -200,26 +286,55 @@ static void cli_list_tag_info(struct cli_writer *cw, struct call_monologue *ml);
 
 
 
-static void cli_handler_do(const cli_handler_t *handlers, str *instr,
+static void __cli_handler_print_help(const cli_command_t *cmd, const str *prefix, struct cli_writer *cw) {
+	if (!cmd->help) {
+		if (cmd->params)
+			cw->cw_printf(cw, STR_FORMAT "%s %s\n", STR_FMT(prefix), cmd->cmd, cmd->params);
+		else
+			cw->cw_printf(cw, STR_FORMAT "%s\n", STR_FMT(prefix), cmd->cmd);
+	}
+	else {
+		size_t len = 0;
+		if (cmd->params)
+			len += cw->cw_printf(cw, STR_FORMAT "%s %s", STR_FMT(prefix), cmd->cmd, cmd->params);
+		else
+			len += cw->cw_printf(cw, STR_FORMAT "%s", STR_FMT(prefix), cmd->cmd);
+		if (len < 50)
+			cw->cw_printf(cw, "%.*s: %s\n", 50 - (int) len, "                                                  ", cmd->help);
+		else
+			cw->cw_printf(cw, ": %s\n", cmd->help);
+	}
+}
+
+static void cli_handler_print_help(const cli_command_t *cmd, struct cli_writer *cw) {
+	__cli_handler_print_help(cmd, STR_PTR("\t"), cw);
+}
+
+static void cli_handler_do(const cli_handler_t *handler, str *instr,
 		struct cli_writer *cw)
 {
-	const cli_handler_t *h;
-
-	if (!str_cmp(instr, "help")) {
-		cw->cw_printf(cw, "Available sub-commands at this level:\n");
-		for (h = handlers; h->cmd; h++)
-			cw->cw_printf(cw, "\t%s\n", h->cmd);
+	str cmd;
+	if (!str_token_sep(&cmd, instr, ' ')) {
+		cw->cw_printf(cw, "Incomplete command: " STR_FORMAT "\n", STR_FMT(instr));
 		return;
 	}
 
-	for (h = handlers; h->cmd; h++) {
-		if (str_shift_cmp(instr, h->cmd))
-			continue;
-		h->handler(instr, cw);
+	int val = __csh_lookup_section(handler->section, &cmd);
+	if (val < 0 || val >= handler->num_commands) {
+		if (!str_cmp(&cmd, "help")) {
+			cw->cw_printf(cw, "Available sub-commands at this level:\n");
+			for (unsigned int i = 0; i < handler->num_commands; i++) {
+				__auto_type c = &handler->commands[i];
+				cli_handler_print_help(c, cw);
+			}
+			return;
+		}
+
+		cw->cw_printf(cw, "Unknown command: " STR_FORMAT "\n", STR_FMT(&cmd));
 		return;
 	}
 
-	cw->cw_printf(cw, "%s:" STR_FORMAT "\n", "Unknown or incomplete command:", STR_FMT(instr));
+	handler->commands[val].handler(instr, cw, handler->commands[val].next);
 }
 
 static void destroy_own_foreign_calls(bool foreign_call, unsigned int uint_keyspace_db) {
@@ -281,9 +396,8 @@ static void cli_endpoints_print(struct cli_writer *cw, const GQueue *q, const ch
 	}
 }
 
-static void cli_incoming_params_start(str *instr, struct cli_writer *cw) {
+static void cli_incoming_params_start(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	int count = 0;
-	GList *s;
 	struct intf_config *ifa;
 
 	for (unsigned int i = 0; i < num_log_levels; i++)
@@ -291,56 +405,51 @@ static void cli_incoming_params_start(str *instr, struct cli_writer *cw) {
 				log_level_names[i],
 				g_atomic_int_get(&initial_rtpe_config.common.log_levels[i]));
 
-	cw->cw_printf(cw, "table = %d\nmax-sessions = %d\ntimeout = %d\nsilent-timeout = %d\n"
-			"final-timeout = %d\noffer-timeout = %d\n"
-			"delete-delay = %d\nredis-expires = %d\ntos = %d\ncontrol-tos = %d\ngraphite-interval = %d\nredis-num-threads = %d\n"
-			"homer-protocol = %d\nhomer-id = %d\nno-fallback = %d\nport-min = %d\nport-max = %d\nredis = %s:%d/%d\n"
-			"redis-write = %s:%d/%d\nno-redis-required = %d\nnum-threads = %d\nxmlrpc-format = %d\nlog_format = %d\n"
-			"redis_allowed_errors = %d\nredis_disable_time = %d\nredis_cmd_timeout = %d\nredis_connect_timeout = %d\n"
-			"max-cpu = %.1f\n"
-			"max-load = %.2f\n"
-			"max-bandwidth = %" PRIu64 "\n"
-			"max-recv-iters = %d\n",
-			initial_rtpe_config.kernel_table, initial_rtpe_config.max_sessions,
-			initial_rtpe_config.timeout, initial_rtpe_config.silent_timeout, initial_rtpe_config.final_timeout,
-			initial_rtpe_config.offer_timeout, initial_rtpe_config.delete_delay,
-			initial_rtpe_config.redis_expires_secs, initial_rtpe_config.default_tos, initial_rtpe_config.control_tos,
-			initial_rtpe_config.graphite_interval, initial_rtpe_config.redis_num_threads, initial_rtpe_config.homer_protocol,
-			initial_rtpe_config.homer_id, initial_rtpe_config.no_fallback, initial_rtpe_config.port_min, initial_rtpe_config.port_max,
-			sockaddr_print_buf(&initial_rtpe_config.redis_ep.address), initial_rtpe_config.redis_ep.port, initial_rtpe_config.redis_db,
-			sockaddr_print_buf(&initial_rtpe_config.redis_write_ep.address), initial_rtpe_config.redis_write_ep.port,
-			initial_rtpe_config.redis_write_db, initial_rtpe_config.no_redis_required, initial_rtpe_config.num_threads,
-			initial_rtpe_config.fmt, initial_rtpe_config.log_format, initial_rtpe_config.redis_allowed_errors,
-			initial_rtpe_config.redis_disable_time, initial_rtpe_config.redis_cmd_timeout, initial_rtpe_config.redis_connect_timeout,
-			(double) initial_rtpe_config.cpu_limit / 100,
-			(double) initial_rtpe_config.load_limit / 100,
-			initial_rtpe_config.bw_limit,
-			initial_rtpe_config.max_recv_iters);
+#define X(s) cw->cw_printf(cw, #s " = %d\n", initial_rtpe_config.s);
+RTPE_CONFIG_INT_PARAMS
+RTPE_CONFIG_BOOL_PARAMS
+RTPE_CONFIG_ENUM_PARAMS
+#undef X
 
-	for(s = initial_rtpe_config.interfaces.head; s ; s = s->next) {
+#define X(s) cw->cw_printf(cw, #s " = %" PRIu64"\n", initial_rtpe_config.s);
+RTPE_CONFIG_UINT64_PARAMS
+#undef X
+
+	cw->cw_printf(cw, "[max-cpu = %.1f]\n"
+			"[max-load = %.2f]\n",
+			(double) initial_rtpe_config.cpu_limit / 100,
+			(double) initial_rtpe_config.load_limit / 100);
+
+	for (__auto_type s = initial_rtpe_config.interfaces.head; s ; s = s->next) {
 		ifa = s->data;
-		cw->cw_printf(cw,"interface[%d] = %s\\%s \n", count, ifa->name.s, sockaddr_print_buf(&(ifa->local_address.addr)));
+		cw->cw_printf(cw, "interface[%d] = %s\\%s\n", count, ifa->name.s, sockaddr_print_buf(&(ifa->local_address.addr)));
 		++count;
 	}
 	count=0;
-	for (s = initial_rtpe_config.redis_subscribed_keyspaces.head; s ; s = s->next) {
-		cw->cw_printf(cw,"keyspace[%d] = %d \n", count, GPOINTER_TO_UINT(s->data));
+	for (__auto_type s = initial_rtpe_config.redis_subscribed_keyspaces.head; s ; s = s->next) {
+		cw->cw_printf(cw, "keyspace[%d] = %d\n", count, GPOINTER_TO_INT(s->data));
 		++count;
 	}
-	cw->cw_printf(cw, "b2b_url = %s\nredis-auth = %s\nredis-write-auth = %s\nrecording-dir = %s\nrecording-method = %s\n"
-			"recording-format = %s\niptables-chain = %s\n", initial_rtpe_config.b2b_url, initial_rtpe_config.redis_auth,
-			initial_rtpe_config.redis_write_auth, initial_rtpe_config.spooldir, initial_rtpe_config.rec_method,
-			initial_rtpe_config.rec_format, initial_rtpe_config.iptables_chain);
-	cli_endpoints_print(cw, &initial_rtpe_config.tcp_listen_ep,    "listen-tcp");
-	cli_endpoints_print(cw, &initial_rtpe_config.udp_listen_ep,    "listen-udp");
-	cli_endpoints_print(cw, &initial_rtpe_config.ng_listen_ep,     "listen-ng");
-	cli_endpoints_print(cw, &initial_rtpe_config.cli_listen_ep,    "listen-cli");
-	cli_endpoints_print(cw, &initial_rtpe_config.ng_tcp_listen_ep, "listen-tcp-ng");
+
+#define X(s) cw->cw_printf(cw, #s " = %s\n", initial_rtpe_config.s);
+RTPE_CONFIG_CHARP_PARAMS
+#undef X
+
+#define X(s) cw->cw_printf(cw, #s " = " STR_FORMAT "\n", STR_FMT(&initial_rtpe_config.s));
+RTPE_CONFIG_STR_PARAMS
+#undef X
+
+#define X(s) cw->cw_printf(cw, #s " = %s\n", endpoint_print_buf(&initial_rtpe_config.s));
+RTPE_CONFIG_ENDPOINT_PARAMS
+#undef X
+
+#define X(s) cli_endpoints_print(cw, &initial_rtpe_config.s, #s);
+RTPE_CONFIG_ENDPOINT_QUEUE_PARAMS
+#undef X
 }
 
-static void cli_incoming_params_current(str *instr, struct cli_writer *cw) {
+static void cli_incoming_params_current(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	int count = 0;
-	GList *c;
 	struct intf_config *ifa;
 
 	for (unsigned int i = 0; i < num_log_levels; i++)
@@ -348,119 +457,122 @@ static void cli_incoming_params_current(str *instr, struct cli_writer *cw) {
 				log_level_names[i],
 				g_atomic_int_get(&rtpe_config.common.log_levels[i]));
 
-	cw->cw_printf(cw, "table = %d\nmax-sessions = %d\ntimeout = %d\nsilent-timeout = %d\n"
-			"final-timeout = %d\noffer-timeout = %d\n"
-			"delete-delay = %d\nredis-expires = %d\ntos = %d\ncontrol-tos = %d\ngraphite-interval = %d\nredis-num-threads = %d\n"
-			"homer-protocol = %d\nhomer-id = %d\nno-fallback = %d\nport-min = %d\nport-max = %d\nredis-db = %d\n"
-			"redis-write-db = %d\nno-redis-required = %d\nnum-threads = %d\nxmlrpc-format = %d\nlog_format = %d\n"
-			"redis_allowed_errors = %d\nredis_disable_time = %d\nredis_cmd_timeout = %d\nredis_connect_timeout = %d\n"
-			"max-cpu = %.1f\n"
-			"max-load = %.2f\n"
-			"max-bw = %" PRIu64 "\n"
-			"max-recv-iters = %d\n",
-			rtpe_config.kernel_table, rtpe_config.max_sessions, rtpe_config.timeout,
-			rtpe_config.silent_timeout, rtpe_config.final_timeout, rtpe_config.offer_timeout,
-			rtpe_config.delete_delay, rtpe_config.redis_expires_secs, rtpe_config.default_tos,
-			rtpe_config.control_tos, rtpe_config.graphite_interval, rtpe_config.redis_num_threads, rtpe_config.homer_protocol,
-			rtpe_config.homer_id, rtpe_config.no_fallback, rtpe_config.port_min, rtpe_config.port_max,
-			rtpe_config.redis_db, rtpe_config.redis_write_db, rtpe_config.no_redis_required,
-			rtpe_config.num_threads, rtpe_config.fmt, rtpe_config.log_format, rtpe_config.redis_allowed_errors,
-			rtpe_config.redis_disable_time, rtpe_config.redis_cmd_timeout, rtpe_config.redis_connect_timeout,
-			(double) rtpe_config.cpu_limit / 100,
-			(double) rtpe_config.load_limit / 100,
-			rtpe_config.bw_limit,
-			rtpe_config.max_recv_iters);
+#define X(s) cw->cw_printf(cw, #s " = %d\n", rtpe_config.s);
+RTPE_CONFIG_INT_PARAMS
+RTPE_CONFIG_BOOL_PARAMS
+RTPE_CONFIG_ENUM_PARAMS
+#undef X
 
-	for(c = rtpe_config.interfaces.head; c ; c = c->next) {
+#define X(s) cw->cw_printf(cw, #s " = %" PRIu64"\n", rtpe_config.s);
+RTPE_CONFIG_UINT64_PARAMS
+#undef X
+
+	cw->cw_printf(cw, "[max-cpu = %.1f]\n"
+			"[max-load = %.2f]\n",
+			(double) rtpe_config.cpu_limit / 100,
+			(double) rtpe_config.load_limit / 100);
+
+	for (__auto_type c = rtpe_config.interfaces.head; c ; c = c->next) {
 		ifa = c->data;
-		cw->cw_printf(cw,"interface[%d] = %s\\%s \n", count, ifa->name.s, sockaddr_print_buf(&(ifa->local_address.addr)));
+		cw->cw_printf(cw, "interface[%d] = %s\\%s\n", count, ifa->name.s, sockaddr_print_buf(&(ifa->local_address.addr)));
 		++count;
 	}
 	count=0;
-	for (c = rtpe_config.redis_subscribed_keyspaces.head; c ; c = c->next) {
-		cw->cw_printf(cw,"keyspace[%d] = %d \n", count, GPOINTER_TO_UINT(c->data));
+	for (__auto_type c = rtpe_config.redis_subscribed_keyspaces.head; c ; c = c->next) {
+		cw->cw_printf(cw, "keyspace[%d] = %d\n", count, GPOINTER_TO_INT(c->data));
 		++count;
 	}
-	cw->cw_printf(cw, "b2b_url = %s\nredis-auth = %s\nredis-write-auth = %s\nrecording-dir = %s\nrecording-method = %s\n"
-			"recording-format = %s\niptables-chain = %s\n", rtpe_config.b2b_url, rtpe_config.redis_auth,
-			rtpe_config.redis_write_auth, rtpe_config.spooldir, rtpe_config.rec_method,
-			rtpe_config.rec_format, rtpe_config.iptables_chain);
-	cli_endpoints_print(cw, &rtpe_config.tcp_listen_ep,    "listen-tcp");
-	cli_endpoints_print(cw, &rtpe_config.udp_listen_ep,    "listen-udp");
-	cli_endpoints_print(cw, &rtpe_config.ng_listen_ep,     "listen-ng");
-	cli_endpoints_print(cw, &rtpe_config.cli_listen_ep,    "listen-cli");
-	cli_endpoints_print(cw, &rtpe_config.ng_tcp_listen_ep, "listen-tcp-ng");
+
+#define X(s) cw->cw_printf(cw, #s " = %s\n", rtpe_config.s);
+RTPE_CONFIG_CHARP_PARAMS
+#undef X
+
+#define X(s) cw->cw_printf(cw, #s " = " STR_FORMAT "\n", STR_FMT(&rtpe_config.s));
+RTPE_CONFIG_STR_PARAMS
+#undef X
+
+#define X(s) cw->cw_printf(cw, #s " = %s\n", endpoint_print_buf(&rtpe_config.s));
+RTPE_CONFIG_ENDPOINT_PARAMS
+#undef X
+
+#define X(s) cli_endpoints_print(cw, &rtpe_config.s, #s);
+RTPE_CONFIG_ENDPOINT_QUEUE_PARAMS
+#undef X
 }
 
 #define int_diff_print(struct_member, option_string) \
-	if (initial_rtpe_config.struct_member != rtpe_config.struct_member) { \
-		if (strcmp(option, "diff") == 0) \
-			cw->cw_printf(cw, "%s: %lld => %lld\n", option_string, \
-			              (long long)initial_rtpe_config.struct_member, \
-			              (long long)rtpe_config.struct_member); \
-		else if (strcmp(option, "revert") == 0) \
-			rtpe_config.struct_member = initial_rtpe_config.struct_member; \
-	}
+	if (initial_rtpe_config.struct_member != atomic_get_na(&rtpe_config.struct_member)) \
+		cw->cw_printf(cw, "%s: %lld => %lld\n", option_string, \
+			      (long long)initial_rtpe_config.struct_member, \
+			      (long long)atomic_get_na(&rtpe_config.struct_member));
+#define int_revert(struct_member, option_string) \
+	if (initial_rtpe_config.struct_member != atomic_get_na(&rtpe_config.struct_member)) \
+		atomic_set_na(&rtpe_config.struct_member, initial_rtpe_config.struct_member);
 
-static void cli_incoming_diff_or_revert(struct cli_writer *cw, char* option) {
+#define SETTABLE_OPTIONS \
+	X(max_sessions, "max-sessions") \
+	X(cpu_limit, "max-cpu") \
+	X(load_limit, "max-load") \
+	X(bw_limit, "max-bw") \
+	X(timeout, "timeout") \
+	X(silent_timeout, "silent-timeout") \
+	X(final_timeout, "final-timeout") \
+	X(control_tos, "control-tos") \
+	X(redis_allowed_errors, "redis_allowed_errors") \
+	X(redis_disable_time, "redis_disable_time") \
+	X(redis_cmd_timeout, "redis_cmd_timeout") \
+	X(redis_connect_timeout, "redis_connect_timeout-db") \
+
+static void cli_incoming_params_diff(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 #define ll(system, descr) \
 	int_diff_print(common.log_levels[log_level_index_ ## system], "log-level-" #system);
 #include "loglevels.h"
 #undef ll
 
-	rwlock_lock_w(&rtpe_config.config_lock);
-	int_diff_print(max_sessions, "max-sessions");
-	int_diff_print(cpu_limit, "max-cpu");
-	int_diff_print(load_limit, "max-load");
-	int_diff_print(bw_limit, "max-bw");
-	int_diff_print(timeout, "timeout");
-	int_diff_print(silent_timeout, "silent-timeout");
-	int_diff_print(final_timeout, "final-timeout");
-	int_diff_print(control_tos, "control-tos");
-	int_diff_print(redis_allowed_errors, "redis_allowed_errors");
-	int_diff_print(redis_disable_time, "redis_disable_time");
-	int_diff_print(redis_cmd_timeout, "redis_cmd_timeout");
-	int_diff_print(redis_connect_timeout, "redis_connect_timeout-db");
-	rwlock_unlock_w(&rtpe_config.config_lock);
+#define X(v, n) \
+	int_diff_print(v, n)
+SETTABLE_OPTIONS
+#undef X
 }
+static void cli_incoming_params_revert(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+#define ll(system, descr) \
+	int_revert(common.log_levels[log_level_index_ ## system], "log-level-" #system);
+#include "loglevels.h"
+#undef ll
 
-static void cli_incoming_params_diff(str *instr, struct cli_writer *cw) {
-
-	cli_incoming_diff_or_revert(cw, "diff");
-}
-
-static void cli_incoming_params_revert(str *instr, struct cli_writer *cw) {
-
-	cli_incoming_diff_or_revert(cw, "revert");
+#define X(v, n) \
+	int_revert(v, n)
+SETTABLE_OPTIONS
+#undef X
 }
 
 
-static void cli_incoming_list_counters(str *instr, struct cli_writer *cw) {
+static void cli_incoming_list_counters(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cw->cw_printf(cw, "\nCurrent per-second counters:\n\n");
 	cw->cw_printf(cw, " Packets per second (userspace)                  :%" PRIu64 "\n",
-			atomic64_get(&rtpe_stats_rate.packets_user));
+			atomic64_get_na(&rtpe_stats_rate.packets_user));
 	cw->cw_printf(cw, " Bytes per second (userspace)                    :%" PRIu64 "\n",
-			atomic64_get(&rtpe_stats_rate.bytes_user));
+			atomic64_get_na(&rtpe_stats_rate.bytes_user));
 	cw->cw_printf(cw, " Errors per second (userspace)                   :%" PRIu64 "\n",
-			atomic64_get(&rtpe_stats_rate.errors_user));
+			atomic64_get_na(&rtpe_stats_rate.errors_user));
 	cw->cw_printf(cw, " Packets per second (kernel)                     :%" PRIu64 "\n",
-			atomic64_get(&rtpe_stats_rate.packets_kernel));
+			atomic64_get_na(&rtpe_stats_rate.packets_kernel));
 	cw->cw_printf(cw, " Bytes per second (kernel)                       :%" PRIu64 "\n",
-			atomic64_get(&rtpe_stats_rate.bytes_kernel));
+			atomic64_get_na(&rtpe_stats_rate.bytes_kernel));
 	cw->cw_printf(cw, " Errors per second (kernel)                      :%" PRIu64 "\n",
-			atomic64_get(&rtpe_stats_rate.errors_kernel));
+			atomic64_get_na(&rtpe_stats_rate.errors_kernel));
 	cw->cw_printf(cw, " Packets per second (total)                      :%" PRIu64 "\n",
-			atomic64_get(&rtpe_stats_rate.packets_user) +
-			atomic64_get(&rtpe_stats_rate.packets_kernel));
+			atomic64_get_na(&rtpe_stats_rate.packets_user) +
+			atomic64_get_na(&rtpe_stats_rate.packets_kernel));
 	cw->cw_printf(cw, " Bytes per second (total)                        :%" PRIu64 "\n",
-			atomic64_get(&rtpe_stats_rate.bytes_user) +
-			atomic64_get(&rtpe_stats_rate.bytes_kernel));
+			atomic64_get_na(&rtpe_stats_rate.bytes_user) +
+			atomic64_get_na(&rtpe_stats_rate.bytes_kernel));
 	cw->cw_printf(cw, " Errors per second (total)                       :%" PRIu64 "\n",
-			atomic64_get(&rtpe_stats_rate.errors_user) +
-			atomic64_get(&rtpe_stats_rate.errors_kernel));
+			atomic64_get_na(&rtpe_stats_rate.errors_user) +
+			atomic64_get_na(&rtpe_stats_rate.errors_kernel));
 }
 
-static void cli_incoming_list_totals(str *instr, struct cli_writer *cw) {
+static void cli_incoming_list_totals(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	g_autoptr(stats_metric_q) metrics = statistics_gather_metrics(NULL);
 
 	for (__auto_type l = metrics->head; l; l = l->next) {
@@ -478,41 +590,41 @@ static void cli_incoming_list_totals(str *instr, struct cli_writer *cw) {
 	}
 }
 
-static void cli_incoming_list_numsessions(str *instr, struct cli_writer *cw) {
+static void cli_incoming_list_numsessions(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
        rwlock_lock_r(&rtpe_callhash_lock);
-       cw->cw_printf(cw, "Current sessions own: "UINT64F"\n", t_hash_table_size(rtpe_callhash) - atomic64_get(&rtpe_stats_gauge.foreign_sessions));
-       cw->cw_printf(cw, "Current sessions foreign: "UINT64F"\n", atomic64_get(&rtpe_stats_gauge.foreign_sessions));
+       cw->cw_printf(cw, "Current sessions own: "UINT64F"\n", t_hash_table_size(rtpe_callhash) - atomic64_get_na(&rtpe_stats_gauge.foreign_sessions));
+       cw->cw_printf(cw, "Current sessions foreign: "UINT64F"\n", atomic64_get_na(&rtpe_stats_gauge.foreign_sessions));
        cw->cw_printf(cw, "Current sessions total: %i\n", t_hash_table_size(rtpe_callhash));
        rwlock_unlock_r(&rtpe_callhash_lock);
-       cw->cw_printf(cw, "Current transcoded media: "UINT64F"\n", atomic64_get(&rtpe_stats_gauge.transcoded_media));
+       cw->cw_printf(cw, "Current transcoded media: "UINT64F"\n", atomic64_get_na(&rtpe_stats_gauge.transcoded_media));
        cw->cw_printf(cw, "Current sessions ipv4 only media: " UINT64F "\n",
-		       atomic64_get(&rtpe_stats_gauge.ipv4_sessions));
+		       atomic64_get_na(&rtpe_stats_gauge.ipv4_sessions));
        cw->cw_printf(cw, "Current sessions ipv6 only media: " UINT64F "\n",
-		       atomic64_get(&rtpe_stats_gauge.ipv6_sessions));
+		       atomic64_get_na(&rtpe_stats_gauge.ipv6_sessions));
        cw->cw_printf(cw, "Current sessions ip mixed  media: " UINT64F "\n",
-		       atomic64_get(&rtpe_stats_gauge.mixed_sessions));
+		       atomic64_get_na(&rtpe_stats_gauge.mixed_sessions));
 }
 
-static void cli_incoming_list_maxsessions(str *instr, struct cli_writer *cw) {
+static void cli_incoming_list_maxsessions(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	/* don't lock anything while reading the value */
 	cw->cw_printf(cw, "Maximum sessions configured on rtpengine: %d\n", rtpe_config.max_sessions);
 
 	return ;
 }
-static void cli_incoming_list_maxcpu(str *instr, struct cli_writer *cw) {
+static void cli_incoming_list_maxcpu(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	/* don't lock anything while reading the value */
 	cw->cw_printf(cw, "Maximum CPU usage configured on rtpengine: %.1f\n", (double) rtpe_config.cpu_limit / 100.0);
 
 	return ;
 }
-static void cli_incoming_list_maxload(str *instr, struct cli_writer *cw) {
+static void cli_incoming_list_maxload(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	/* don't lock anything while reading the value */
 	cw->cw_printf(cw, "Maximum load average configured on rtpengine: %.2f\n", (double) rtpe_config.load_limit / 100.0);
 
 	return ;
 }
 
-static void cli_incoming_list_maxbw(str *instr, struct cli_writer *cw) {
+static void cli_incoming_list_maxbw(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	/* don't lock anything while reading the value */
 	cw->cw_printf(cw, "Maximum bandwidth configured on rtpengine: %" PRIu64 "\n",
 			rtpe_config.bw_limit);
@@ -520,7 +632,7 @@ static void cli_incoming_list_maxbw(str *instr, struct cli_writer *cw) {
 	return ;
 }
 
-static void cli_incoming_list_maxopenfiles(str *instr, struct cli_writer *cw) {
+static void cli_incoming_list_maxopenfiles(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	struct rlimit rlim;
 	pid_t pid = getpid();
 
@@ -538,52 +650,24 @@ static void cli_incoming_list_maxopenfiles(str *instr, struct cli_writer *cw) {
 	return ;
 }
 
-static void cli_incoming_list_timeout(str *instr, struct cli_writer *cw) {
-	rwlock_lock_r(&rtpe_config.config_lock);
-
-	/* don't lock anything while reading the value */
+static void cli_incoming_list_timeout(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cw->cw_printf(cw, "TIMEOUT=%u\n", rtpe_config.timeout);
-
-	rwlock_unlock_r(&rtpe_config.config_lock);
-
-	return ;
 }
-static void cli_incoming_list_silenttimeout(str *instr, struct cli_writer *cw) {
-	rwlock_lock_r(&rtpe_config.config_lock);
-
-	/* don't lock anything while reading the value */
+static void cli_incoming_list_silenttimeout(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cw->cw_printf(cw, "SILENT_TIMEOUT=%u\n", rtpe_config.silent_timeout);
-
-	rwlock_unlock_r(&rtpe_config.config_lock);
-
-	return ;
 }
-static void cli_incoming_list_finaltimeout(str *instr, struct cli_writer *cw) {
-	rwlock_lock_r(&rtpe_config.config_lock);
-
-	/* don't lock anything while reading the value */
+static void cli_incoming_list_finaltimeout(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cw->cw_printf(cw, "FINAL_TIMEOUT=%u\n", rtpe_config.final_timeout);
-
-	rwlock_unlock_r(&rtpe_config.config_lock);
-
-	return ;
 }
-static void cli_incoming_list_offertimeout(str *instr, struct cli_writer *cw) {
-	rwlock_lock_r(&rtpe_config.config_lock);
-
-	/* don't lock anything while reading the value */
+static void cli_incoming_list_offertimeout(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cw->cw_printf(cw, "OFFER_TIMEOUT=%u\n", rtpe_config.offer_timeout);
-
-	rwlock_unlock_r(&rtpe_config.config_lock);
-
-	return ;
 }
 
 static void cli_incoming_list_callid(str *instr, struct cli_writer *cw) {
 	call_t *c = 0;
 
 	if (instr->len == 0) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
@@ -613,11 +697,13 @@ static void cli_list_call_info(struct cli_writer *cw, call_t *c) {
 			 "tos: %u\n"
 			 "last_signal: %llu\n"
 			 "redis_keyspace: %i\n"
+			 "last redis update: %llu\n"
 			 "foreign: %s\n"
 			 "recording: %s\n"
 			 "\n",
 			 c->callid.s, c->ml_deleted ? "yes" : "no", (int) c->created.tv_sec, c->created_from,
 			 (unsigned int) c->tos, (unsigned long long) c->last_signal, c->redis_hosted_db,
+			 (unsigned long long) atomic64_get_na(&c->last_redis_update),
 			 IS_FOREIGN_CALL(c) ? "yes" : "no", c->recording ? "yes" : "no");
 
 	for (__auto_type l = c->monologues.head; l; l = l->next) {
@@ -651,6 +737,14 @@ static void cli_list_tag_info(struct cli_writer *cw, struct call_monologue *ml) 
 		STR_FMT(&ml->viabranch),
 		tim_result_duration.tv_sec,
 		tim_result_duration.tv_usec);
+
+	if (ml->tag_aliases.length) {
+		__auto_type alias = ml->tag_aliases.head;
+		cw->cw_printf(cw, "---     Aliases: '" STR_FORMAT "'", STR_FMT(alias->data));
+		for (; alias; alias = alias->next)
+			cw->cw_printf(cw, ", '" STR_FORMAT "'", STR_FMT(alias->data));
+		cw->cw_printf(cw, "\n");
+	}
 
 	for (int i = 0; i < ml->medias->len; i++)
 	{
@@ -707,23 +801,26 @@ static void cli_list_tag_info(struct cli_writer *cw, struct call_monologue *ml) 
 			local_addr = sockaddr_print_buf(&local_endpoint->address);
 
 			cw->cw_printf(cw, "-------- Port %15s:%-5u <> %15s:%-5u%s, SSRC %" PRIx32 ", "
-					 "" UINT64F " p, " UINT64F " b, " UINT64F " e, " UINT64F " ts",
+					 "" UINT64F " p, " UINT64F " b, " UINT64F " e, " UINT64F " uts "
+					 UINT64F " kts",
 					 local_addr,
 					 (unsigned int) local_endpoint->port,
 					 sockaddr_print_buf(&ps->endpoint.address),
 					 ps->endpoint.port,
 					 (!PS_ISSET(ps, RTP) && PS_ISSET(ps, RTCP)) ? " (RTCP)" : "",
 					 ps->ssrc_in[0] ? ps->ssrc_in[0]->parent->h.ssrc : 0,
-					 atomic64_get(&ps->stats_in.packets),
-					 atomic64_get(&ps->stats_in.bytes), atomic64_get(&ps->stats_in.errors),
-					 atomic64_get(&ps->last_packet));
+					 atomic64_get_na(&ps->stats_in->packets),
+					 atomic64_get_na(&ps->stats_in->bytes),
+					 atomic64_get_na(&ps->stats_in->errors),
+					 atomic64_get_na(&ps->last_packet),
+					 atomic64_get_na(&ps->stats_in->last_packet));
 			cw->cw_printf(cw, "\n");
 		}
 	}
 }
 
 
-static void cli_incoming_list_sessions(str *instr, struct cli_writer *cw) {
+static void cli_incoming_list_sessions(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	bool found = false;
 	enum { all, own, foreign, recording } which = -1;
 
@@ -734,8 +831,8 @@ static void cli_incoming_list_sessions(str *instr, struct cli_writer *cw) {
 		[recording] = "recording",
 	};
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
@@ -790,7 +887,7 @@ next:;
 	return;
 }
 
-static void cli_incoming_set_maxopenfiles(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_maxopenfiles(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	unsigned long open_files_num;
 	pid_t pid;
 	char *endptr;
@@ -798,8 +895,8 @@ static void cli_incoming_set_maxopenfiles(str *instr, struct cli_writer *cw) {
 	// limit the minimum number of open files to avoid rtpengine freeze for low open_files_num values
 	unsigned long min_open_files_num = (1 << 16);
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
@@ -810,7 +907,7 @@ static void cli_incoming_set_maxopenfiles(str *instr, struct cli_writer *cw) {
 		cw->cw_printf(cw,  "Fail setting open_files to %s; errno=%d\n", instr->s, errno);
 		return;
 	} else if (endptr == instr->s) {
-		cw->cw_printf(cw,  "Fail setting open_files to %s; no digists found\n", instr->s);
+		cw->cw_printf(cw,  "Fail setting open_files to %s; no digits found\n", instr->s);
 		return;
 	} else if (open_files_num < min_open_files_num) {
 		cw->cw_printf(cw,  "Fail setting open_files to %lu; can't set it under %lu\n", open_files_num, min_open_files_num);
@@ -824,13 +921,13 @@ static void cli_incoming_set_maxopenfiles(str *instr, struct cli_writer *cw) {
 	}
 }
 
-static void cli_incoming_set_maxsessions(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_maxsessions(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	long maxsessions_num;
 	int disabled = -1;
 	char *endptr;
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
@@ -841,19 +938,15 @@ static void cli_incoming_set_maxsessions(str *instr, struct cli_writer *cw) {
 		cw->cw_printf(cw,  "Fail setting maxsessions to %s; errno=%d\n", instr->s, errno);
 		return;
 	} else if (endptr == instr->s) {
-		cw->cw_printf(cw,  "Fail setting maxsessions to %s; no digists found\n", instr->s);
+		cw->cw_printf(cw,  "Fail setting maxsessions to %s; no digits found\n", instr->s);
 		return;
 	} else if (maxsessions_num < disabled) {
 		cw->cw_printf(cw,  "Fail setting maxsessions to %ld; either positive or -1 values allowed\n", maxsessions_num);
 	} else if (maxsessions_num == disabled) {
-		rwlock_lock_w(&rtpe_config.config_lock);
-		rtpe_config.max_sessions = maxsessions_num;
-		rwlock_unlock_w(&rtpe_config.config_lock);
+		atomic_set_na(&rtpe_config.max_sessions, maxsessions_num);
 		cw->cw_printf(cw,  "Success setting maxsessions to %ld; disable feature\n", maxsessions_num);
 	} else {
-		rwlock_lock_w(&rtpe_config.config_lock);
-		rtpe_config.max_sessions = maxsessions_num;
-		rwlock_unlock_w(&rtpe_config.config_lock);
+		atomic_set_na(&rtpe_config.max_sessions, maxsessions_num);
 		cw->cw_printf(cw,  "Success setting maxsessions to %ld\n", maxsessions_num);
 	}
 
@@ -861,11 +954,11 @@ static void cli_incoming_set_maxsessions(str *instr, struct cli_writer *cw) {
 }
 
 // XXX lots of code duplication, unify those set functions
-static void cli_incoming_set_maxcpu(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_maxcpu(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	char *endptr;
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
@@ -876,23 +969,21 @@ static void cli_incoming_set_maxcpu(str *instr, struct cli_writer *cw) {
 		cw->cw_printf(cw,  "Fail setting maxcpu to %s; errno=%d\n", instr->s, errno);
 		return;
 	} else if (endptr == instr->s) {
-		cw->cw_printf(cw,  "Fail setting maxcpu to %s; no digists found\n", instr->s);
+		cw->cw_printf(cw,  "Fail setting maxcpu to %s; no digits found\n", instr->s);
 		return;
 	} else {
-		rwlock_lock_w(&rtpe_config.config_lock);
-		rtpe_config.cpu_limit = num * 100;
-		rwlock_unlock_w(&rtpe_config.config_lock);
+		atomic_set_na(&rtpe_config.cpu_limit, (int) (num * 100));
 		cw->cw_printf(cw,  "Success setting maxcpu to %.1f\n", num);
 	}
 
 	return;
 }
 
-static void cli_incoming_set_maxload(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_maxload(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	char *endptr;
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
@@ -903,23 +994,21 @@ static void cli_incoming_set_maxload(str *instr, struct cli_writer *cw) {
 		cw->cw_printf(cw,  "Fail setting maxload to %s; errno=%d\n", instr->s, errno);
 		return;
 	} else if (endptr == instr->s) {
-		cw->cw_printf(cw,  "Fail setting maxload to %s; no digists found\n", instr->s);
+		cw->cw_printf(cw,  "Fail setting maxload to %s; no digits found\n", instr->s);
 		return;
 	} else {
-		rwlock_lock_w(&rtpe_config.config_lock);
-		rtpe_config.load_limit = num * 100;
-		rwlock_unlock_w(&rtpe_config.config_lock);
+		atomic_set_na(&rtpe_config.load_limit, (int) (num * 100));
 		cw->cw_printf(cw,  "Success setting maxload to %.2f\n", num);
 	}
 
 	return;
 }
 
-static void cli_incoming_set_maxbw(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_maxbw(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	char *endptr;
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
@@ -930,12 +1019,10 @@ static void cli_incoming_set_maxbw(str *instr, struct cli_writer *cw) {
 		cw->cw_printf(cw,  "Fail setting maxbw to %s; errno=%d\n", instr->s, errno);
 		return;
 	} else if (endptr == instr->s) {
-		cw->cw_printf(cw,  "Fail setting maxbw to %s; no digists found\n", instr->s);
+		cw->cw_printf(cw,  "Fail setting maxbw to %s; no digits found\n", instr->s);
 		return;
 	} else {
-		rwlock_lock_w(&rtpe_config.config_lock);
-		rtpe_config.bw_limit = num * 100;
-		rwlock_unlock_w(&rtpe_config.config_lock);
+		atomic_set_na(&rtpe_config.bw_limit, num);
 		cw->cw_printf(cw,  "Success setting maxbw to %" PRIu64 "\n", num);
 	}
 
@@ -946,8 +1033,8 @@ static void cli_incoming_set_gentimeout(str *instr, struct cli_writer *cw, int *
 	long timeout_num;
 	char *endptr;
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
@@ -958,61 +1045,42 @@ static void cli_incoming_set_gentimeout(str *instr, struct cli_writer *cw, int *
 		cw->cw_printf(cw,  "Fail setting timeout to %s; errno=%d\n", instr->s, errno);
 		return;
 	} else if (endptr == instr->s) {
-		cw->cw_printf(cw,  "Fail setting timeout to %s; no digists found\n", instr->s);
+		cw->cw_printf(cw,  "Fail setting timeout to %s; no digits found\n", instr->s);
 		return;
 	} else {
-		rwlock_lock_w(&rtpe_config.config_lock);
-		*conf_timeout = (int) timeout_num;
-		rwlock_unlock_w(&rtpe_config.config_lock);
+		atomic_set_na(conf_timeout, timeout_num);
 		cw->cw_printf(cw,  "Success setting timeout to %lu\n", timeout_num);
 	}
 }
 
-static void cli_incoming_set_timeout(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_timeout(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cli_incoming_set_gentimeout(instr, cw, &rtpe_config.timeout);
 }
-static void cli_incoming_set_silenttimeout(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_silenttimeout(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cli_incoming_set_gentimeout(instr, cw, &rtpe_config.silent_timeout);
 }
-static void cli_incoming_set_finaltimeout(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_finaltimeout(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cli_incoming_set_gentimeout(instr, cw, &rtpe_config.final_timeout);
 }
-static void cli_incoming_set_offertimeout(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_offertimeout(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cli_incoming_set_gentimeout(instr, cw, &rtpe_config.offer_timeout);
 }
 
-static void cli_incoming_list(str *instr, struct cli_writer *cw) {
-   if (str_shift(instr, 1)) {
-       cw->cw_printf(cw, "%s\n", "More parameters required.");
-       return;
-   }
-
-   cli_handler_do(cli_list_handlers, instr, cw);
-}
-
-static void cli_incoming_set(str *instr, struct cli_writer *cw) {
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+static void cli_generic_handler(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
-	cli_handler_do(cli_set_handlers, instr, cw);
+	cli_handler_do(handler, instr, cw);
 }
 
-static void cli_incoming_params(str *instr, struct cli_writer *cw) {
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
-		return;
-	}
-	cli_handler_do(cli_params_handlers, instr, cw);
-}
-
-static void cli_incoming_terminate(str *instr, struct cli_writer *cw) {
+static void cli_incoming_terminate(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
    call_t * c=0;
    struct call_monologue *ml;
 
-   if (str_shift(instr, 1)) {
-       cw->cw_printf(cw, "%s\n", "More parameters required.");
+   if (instr->len == 0) {
+       cw->cw_printf(cw, "More parameters required.\n");
        return;
    }
 
@@ -1026,7 +1094,7 @@ static void cli_incoming_terminate(str *instr, struct cli_writer *cw) {
 
 		// update cli
 		ilog(LOG_INFO,"All calls terminated by operator.");
-		cw->cw_printf(cw, "%s\n", "All calls terminated by operator.");
+		cw->cw_printf(cw, "All calls terminated by operator.\n");
 
 		return;
 
@@ -1037,7 +1105,7 @@ static void cli_incoming_terminate(str *instr, struct cli_writer *cw) {
 
 		// update cli
 		ilog(LOG_INFO,"All own calls terminated by operator.");
-		cw->cw_printf(cw, "%s\n", "All own calls terminated by operator.");
+		cw->cw_printf(cw, "All own calls terminated by operator.\n");
 
 		return;
 
@@ -1048,7 +1116,7 @@ static void cli_incoming_terminate(str *instr, struct cli_writer *cw) {
 
 		// update cli
 		ilog(LOG_INFO,"All foreign calls terminated by operator.");
-		cw->cw_printf(cw, "%s\n", "All foreign calls terminated by operator.");
+		cw->cw_printf(cw, "All foreign calls terminated by operator.\n");
 
 		return;
 	}
@@ -1078,81 +1146,100 @@ static void cli_incoming_terminate(str *instr, struct cli_writer *cw) {
    obj_put(c);
 }
 
-static void cli_incoming_ksadd(str *instr, struct cli_writer *cw) {
-	unsigned long uint_keyspace_db;
+static void cli_incoming_ksadd(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	long int_keyspace_db;
 	char *endptr;
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (!rtpe_redis_notify) {
+		cw->cw_printf(cw, "Keyspace notification feature has not been configured.\n");
+		return;
+	}
+
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
 	errno = 0;
-	uint_keyspace_db = strtoul(instr->s, &endptr, 10);
+	int_keyspace_db = strtol(instr->s, &endptr, 10);
 
-	if ((errno == ERANGE && (uint_keyspace_db == ULONG_MAX)) || (errno != 0 && uint_keyspace_db == 0)) {
-		cw->cw_printf(cw, "Fail adding keyspace %s to redis notifications; errono=%d\n", instr->s, errno);
+	if ((errno == ERANGE && (int_keyspace_db == ULONG_MAX)) || int_keyspace_db >= INT_MAX
+			|| int_keyspace_db < 0
+			|| (errno != 0 && int_keyspace_db == 0)) {
+		cw->cw_printf(cw, "Fail adding keyspace " STR_FORMAT " to redis notifications; errno=%d\n", STR_FMT(instr), errno);
 	} else if (endptr == instr->s) {
-		cw->cw_printf(cw, "Fail adding keyspace %s to redis notifications; no digists found\n", instr->s);
+		cw->cw_printf(cw, "Fail adding keyspace " STR_FORMAT " to redis notifications; no digits found\n", STR_FMT(instr));
 	} else {
-		rwlock_lock_w(&rtpe_config.config_lock);
-		if (!g_queue_find(&rtpe_config.redis_subscribed_keyspaces, GUINT_TO_POINTER(uint_keyspace_db))) {
-			g_queue_push_tail(&rtpe_config.redis_subscribed_keyspaces, GUINT_TO_POINTER(uint_keyspace_db));
-			redis_notify_subscribe_action(rtpe_redis_notify, SUBSCRIBE_KEYSPACE, uint_keyspace_db);
-			cw->cw_printf(cw, "Success adding keyspace %lu to redis notifications.\n", uint_keyspace_db);
+		rwlock_lock_w(&rtpe_config.keyspaces_lock);
+		if (!g_queue_find(&rtpe_config.redis_subscribed_keyspaces, GINT_TO_POINTER(int_keyspace_db))) {
+			g_queue_push_tail(&rtpe_config.redis_subscribed_keyspaces, GINT_TO_POINTER(int_keyspace_db));
+			redis_notify_subscribe_action(rtpe_redis_notify, SUBSCRIBE_KEYSPACE, int_keyspace_db);
+			cw->cw_printf(cw, "Success adding keyspace %ld to redis notifications.\n", int_keyspace_db);
 		} else {
-			cw->cw_printf(cw, "Keyspace %lu is already among redis notifications.\n", uint_keyspace_db);
+			cw->cw_printf(cw, "Keyspace %ld is already among redis notifications.\n", int_keyspace_db);
 		}
-		rwlock_unlock_w(&rtpe_config.config_lock);
+		rwlock_unlock_w(&rtpe_config.keyspaces_lock);
 	}
 }
 
-static void cli_incoming_ksrm(str *instr, struct cli_writer *cw) {
-	GList *l; 
-	unsigned long uint_keyspace_db;
+static void cli_incoming_ksrm(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	GList *l;
+	long int_keyspace_db;
 	char *endptr;
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (!rtpe_redis_notify) {
+		cw->cw_printf(cw, "Keyspace notification feature has not been configured.\n");
+		return;
+	}
+
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
 	errno = 0;
-	uint_keyspace_db = strtoul(instr->s, &endptr, 10);
+	int_keyspace_db = strtol(instr->s, &endptr, 10);
 
-	rwlock_lock_w(&rtpe_config.config_lock);
-	if ((errno == ERANGE && (uint_keyspace_db == ULONG_MAX)) || (errno != 0 && uint_keyspace_db == 0)) {
-		cw->cw_printf(cw, "Fail removing keyspace %s to redis notifications; errono=%d\n", instr->s, errno);
+	rwlock_lock_w(&rtpe_config.keyspaces_lock);
+	if ((errno == ERANGE && (int_keyspace_db == ULONG_MAX)) || int_keyspace_db >= INT_MAX
+			|| int_keyspace_db < 0
+			|| (errno != 0 && int_keyspace_db == 0)) {
+		cw->cw_printf(cw, "Fail removing keyspace " STR_FORMAT " to redis notifications; errno=%d\n", STR_FMT(instr), errno);
         } else if (endptr == instr->s) {
-                cw->cw_printf(cw, "Fail removing keyspace %s to redis notifications; no digists found\n", instr->s);
-	} else if ((l = g_queue_find(&rtpe_config.redis_subscribed_keyspaces, GUINT_TO_POINTER(uint_keyspace_db)))) {
+                cw->cw_printf(cw, "Fail removing keyspace " STR_FORMAT " to redis notifications; no digits found\n", STR_FMT(instr));
+	} else if ((l = g_queue_find(&rtpe_config.redis_subscribed_keyspaces, GINT_TO_POINTER(int_keyspace_db)))) {
 		// remove this keyspace
-		redis_notify_subscribe_action(rtpe_redis_notify, UNSUBSCRIBE_KEYSPACE, uint_keyspace_db);
+		redis_notify_subscribe_action(rtpe_redis_notify, UNSUBSCRIBE_KEYSPACE, int_keyspace_db);
 		g_queue_remove(&rtpe_config.redis_subscribed_keyspaces, l->data);
-		cw->cw_printf(cw, "Successfully unsubscribed from keyspace %lu.\n", uint_keyspace_db);
+		cw->cw_printf(cw, "Successfully unsubscribed from keyspace %lu.\n", int_keyspace_db);
 
 		// destroy foreign calls for this keyspace
-		destroy_keyspace_foreign_calls(uint_keyspace_db);
+		destroy_keyspace_foreign_calls(int_keyspace_db);
 
 		// update cli
-		cw->cw_printf(cw, "Successfully removed all foreign calls for keyspace %lu.\n", uint_keyspace_db);
+		cw->cw_printf(cw, "Successfully removed all foreign calls for keyspace %ld.\n", int_keyspace_db);
 	} else {
-		cw->cw_printf(cw, "Keyspace %lu is not among redis notifications.\n", uint_keyspace_db);
+		cw->cw_printf(cw, "Keyspace %ld is not among redis notifications.\n", int_keyspace_db);
 	}
-	rwlock_unlock_w(&rtpe_config.config_lock);
+	rwlock_unlock_w(&rtpe_config.keyspaces_lock);
 
 }
 
-static void cli_incoming_kslist(str *instr, struct cli_writer *cw) {
+static void cli_incoming_kslist(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	GList *l;
 
-	cw->cw_printf(cw,  "\nSubscribed-on keyspaces:\n");
-    
-	rwlock_lock_r(&rtpe_config.config_lock);
-	for (l = rtpe_config.redis_subscribed_keyspaces.head; l; l = l->next) {
-		cw->cw_printf(cw,  "%u ", GPOINTER_TO_UINT(l->data));
+	if (!rtpe_redis_notify) {
+		cw->cw_printf(cw, "Keyspace notification feature has not been configured.\n");
+		return;
 	}
-	rwlock_unlock_r(&rtpe_config.config_lock);
+
+	cw->cw_printf(cw,  "\nSubscribed-on keyspaces:\n");
+
+	rwlock_lock_r(&rtpe_config.keyspaces_lock);
+	for (l = rtpe_config.redis_subscribed_keyspaces.head; l; l = l->next) {
+		cw->cw_printf(cw,  "%d ", GPOINTER_TO_INT(l->data));
+	}
+	rwlock_unlock_r(&rtpe_config.keyspaces_lock);
 
 	cw->cw_printf(cw, "\n");
 }
@@ -1172,22 +1259,22 @@ static void cli_incoming_active_standby(struct cli_writer *cw, bool foreign) {
 
 	cw->cw_printf(cw, "Ok, all calls set to '%s'\n", foreign ? "foreign (standby)" : "owned (active)");
 }
-static void cli_incoming_active(str *instr, struct cli_writer *cw) {
+static void cli_incoming_active(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cli_incoming_active_standby(cw, false);
 }
-static void cli_incoming_standby(str *instr, struct cli_writer *cw) {
+static void cli_incoming_standby(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cli_incoming_active_standby(cw, true);
 }
 
 
-static void cli_incoming_debug(str *instr, struct cli_writer *cw) {
-	if (str_shift(instr, 1)) {
+static void cli_incoming_debug(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
 		cw->cw_printf(cw, "No call ID specified\n");
 		return;
 	}
 
 	str callid;
-	if (str_token_sep(&callid, instr, ' '))
+	if (!str_token_sep(&callid, instr, ' '))
 		callid = STR_NULL;
 
 	if (!callid.len) {
@@ -1228,11 +1315,12 @@ static void cli_incoming(struct streambuf_stream *s) {
    ilogs(control, LOG_INFO, "New cli connection from %s", s->addr);
 }
 
-static void cli_streambuf_printf(struct cli_writer *cw, const char *fmt, ...) {
+static size_t cli_streambuf_printf(struct cli_writer *cw, const char *fmt, ...) {
 	va_list va;
 	va_start(va, fmt);
-	streambuf_vprintf(cw->ptr, fmt, va);
+	size_t ret = streambuf_vprintf(cw->ptr, fmt, va);
 	va_end(va);
+	return ret;
 }
 
 static void cli_stream_readable(struct streambuf_stream *s) {
@@ -1249,7 +1337,7 @@ static void cli_stream_readable(struct streambuf_stream *s) {
        return;
    }
 
-   str_init(&instr, inbuf);
+   instr = STR(inbuf);
 
    struct cli_writer cw = {
        .cw_printf = cli_streambuf_printf,
@@ -1264,19 +1352,18 @@ static void cli_stream_readable(struct streambuf_stream *s) {
 
 void cli_handle(str *instr, struct cli_writer *cw) {
 	ilogs(control, LOG_INFO, "Got CLI command: " STR_FORMAT_M, STR_FMT_M(instr));
-	cli_handler_do(cli_top_handlers, instr, cw);
+	cli_handler_do(&cli_top_handlers, instr, cw);
 	release_closed_sockets();
 }
 
-static void cli_free(void *p) {
-	struct cli *c = p;
+static void cli_free(struct cli *c) {
 	streambuf_listener_shutdown(&c->listener);
 }
 
 struct cli *cli_new(const endpoint_t *ep) {
    struct cli *c;
 
-   c = obj_alloc0("cli", sizeof(*c), cli_free);
+   c = obj_alloc0(struct cli, cli_free);
 
    if (streambuf_listener_init(&c->listener, ep,
             cli_incoming, cli_stream_readable,
@@ -1287,7 +1374,6 @@ struct cli *cli_new(const endpoint_t *ep) {
       goto fail;
    }
 
-   obj_put(c);
    return c;
 
 fail:
@@ -1296,10 +1382,7 @@ fail:
    return NULL;
 }
 
-static void cli_incoming_list_loglevel(str *instr, struct cli_writer *cw) {
-	if (instr && instr->len)
-		str_shift(instr, 1);
-
+static void cli_incoming_list_loglevel(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	for (unsigned int i = 0; i < num_log_levels; i++) {
 		if (instr && instr->len) {
 			if (str_cmp(instr, log_level_names[i]))
@@ -1311,25 +1394,25 @@ static void cli_incoming_list_loglevel(str *instr, struct cli_writer *cw) {
 			cw->cw_printf(cw, "%s = %i\n", log_level_names[i], __get_log_level(i));
 	}
 }
-static void cli_incoming_list_loglevels(str *instr, struct cli_writer *cw) {
+static void cli_incoming_list_loglevels(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	for (unsigned int i = 0; i < num_log_levels; i++)
 		cw->cw_printf(cw, "%s - %s\n", log_level_names[i], log_level_descriptions[i]);
 }
-static void cli_incoming_set_loglevel(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_loglevel(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	int nl;
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
 	str subsys = STR_NULL;
 	if (instr->len && (instr->s[0] < '0' || instr->s[0] > '9'))
-		if (str_token_sep(&subsys, instr, ' '))
+		if (!str_token_sep(&subsys, instr, ' '))
 			subsys = STR_NULL;
 
 	if (!instr->len) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
@@ -1345,43 +1428,37 @@ static void cli_incoming_set_loglevel(str *instr, struct cli_writer *cw) {
 	cw->cw_printf(cw,  "Success setting loglevel to %i\n", nl);
 }
 
-static void cli_incoming_list_redisallowederrors(str *instr, struct cli_writer *cw) {
-	rwlock_lock_r(&rtpe_config.config_lock);
-	cw->cw_printf(cw, "%d\n", rtpe_config.redis_allowed_errors);
-	rwlock_unlock_r(&rtpe_config.config_lock);
+static void cli_incoming_list_redisallowederrors(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	cw->cw_printf(cw, "%d\n", atomic_get_na(&rtpe_config.redis_allowed_errors));
 }
 
-static void cli_incoming_set_redisallowederrors(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_redisallowederrors(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	long allowed_errors;
 	char *endptr;
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
 	errno = 0;
 	allowed_errors = strtol(instr->s, &endptr, 10);
 
-	rwlock_lock_w(&rtpe_config.config_lock);
-	rtpe_config.redis_allowed_errors = allowed_errors;
-	rwlock_unlock_w(&rtpe_config.config_lock);
+	atomic_set_na(&rtpe_config.redis_allowed_errors, allowed_errors);
 
 	cw->cw_printf(cw,  "Success setting redis-allowed-errors to %ld\n", allowed_errors);
 }
 
-static void cli_incoming_list_redisdisabletime(str *instr, struct cli_writer *cw) {
-	rwlock_lock_r(&rtpe_config.config_lock);
-	cw->cw_printf(cw, "%d\n", rtpe_config.redis_disable_time);
-	rwlock_unlock_r(&rtpe_config.config_lock);
+static void cli_incoming_list_redisdisabletime(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	cw->cw_printf(cw, "%d\n", atomic_get_na(&rtpe_config.redis_disable_time));
 }
 
-static void cli_incoming_set_redisdisable(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_redisdisable(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	int disable = 0;
 	char *endptr;
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
@@ -1416,12 +1493,12 @@ static void cli_incoming_set_redisdisable(str *instr, struct cli_writer *cw) {
 	}
 }
 
-static void cli_incoming_set_redisdisabletime(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_redisdisabletime(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	long seconds;
 	char *endptr;
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
@@ -1432,25 +1509,21 @@ static void cli_incoming_set_redisdisabletime(str *instr, struct cli_writer *cw)
 		return;
 	}
 
-	rwlock_lock_w(&rtpe_config.config_lock);
-	rtpe_config.redis_disable_time = seconds;
-	rwlock_unlock_w(&rtpe_config.config_lock);
+	atomic_set_na(&rtpe_config.redis_disable_time, seconds);
 
 	cw->cw_printf(cw,  "Success setting redis-disable-time to %ld\n", seconds);
 }
 
-static void cli_incoming_list_redisconnecttimeout(str *instr, struct cli_writer *cw) {
-	rwlock_lock_r(&rtpe_config.config_lock);
-	cw->cw_printf(cw, "%d\n", rtpe_config.redis_connect_timeout);
-	rwlock_unlock_r(&rtpe_config.config_lock);
+static void cli_incoming_list_redisconnecttimeout(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	cw->cw_printf(cw, "%d\n", atomic_get_na(&rtpe_config.redis_connect_timeout));
 }
 
-static void cli_incoming_set_redisconnecttimeout(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_redisconnecttimeout(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	long timeout;
 	char *endptr;
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return ;
 	}
 
@@ -1460,21 +1533,17 @@ static void cli_incoming_set_redisconnecttimeout(str *instr, struct cli_writer *
 		cw->cw_printf(cw,  "Invalid redis-connect-timeout value %ld, must be > 0\n", timeout);
 		return;
 	}
-	rwlock_lock_w(&rtpe_config.config_lock);
-	rtpe_config.redis_connect_timeout = timeout;
-	rwlock_unlock_w(&rtpe_config.config_lock);
+	atomic_set_na(&rtpe_config.redis_connect_timeout, timeout);
 	cw->cw_printf(cw,  "Success setting redis-connect-timeout to %ld\n", timeout);
 }
 
-static void cli_incoming_list_deletedelay(str *instr, struct cli_writer *cw) {
-	rwlock_lock_r(&rtpe_config.config_lock);
-	cw->cw_printf(cw, "%d\n", rtpe_config.delete_delay);
-	rwlock_unlock_r(&rtpe_config.config_lock);
+static void cli_incoming_list_deletedelay(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	cw->cw_printf(cw, "%d\n", atomic_get_na(&rtpe_config.delete_delay));
 }
 
-static void cli_incoming_set_deletedelay(str *instr, struct cli_writer *cw) {
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+static void cli_incoming_set_deletedelay(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
@@ -1483,20 +1552,18 @@ static void cli_incoming_set_deletedelay(str *instr, struct cli_writer *cw) {
 		cw->cw_printf(cw, "Invalid delete-delay value\n");
 		return;
 	}
-	rwlock_lock_w(&rtpe_config.config_lock);
-	rtpe_config.delete_delay = seconds;
-	rwlock_unlock_w(&rtpe_config.config_lock);
+	atomic_set_na(&rtpe_config.delete_delay, seconds);
 	cw->cw_printf(cw, "Success setting delete-delay to %d\n", seconds);
 }
 
-static void cli_incoming_call(str *instr, struct cli_writer *cw) {
-	if (str_shift(instr, 1)) {
+static void cli_incoming_call(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
 		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
 	str callid;
-	if (str_token_sep(&callid, instr, ' '))
+	if (!str_token_sep(&callid, instr, ' '))
 		callid = STR_NULL;
 
 	if (!callid.len) {
@@ -1510,7 +1577,7 @@ static void cli_incoming_call(str *instr, struct cli_writer *cw) {
 		return;
 	}
 
-	cli_handler_do(cli_call_handlers, instr, cw);
+	cli_handler_do(&cli_call_handlers, instr, cw);
 
 	if (cw->call) {
 		rwlock_unlock_w(&cw->call->master_lock);
@@ -1520,19 +1587,17 @@ static void cli_incoming_call(str *instr, struct cli_writer *cw) {
 
 
 
-static void cli_incoming_call_info(str *instr, struct cli_writer *cw) {
+static void cli_incoming_call_info(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cli_list_call_info(cw, cw->call);
 }
-static void cli_incoming_call_terminate(str *instr, struct cli_writer *cw) {
+static void cli_incoming_call_terminate(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cw->cw_printf(cw, "\nCall '" STR_FORMAT "' terminated.\n\n", STR_FMT(&cw->call->callid));
 	ilog(LOG_WARN, "Call " STR_FORMAT_M " terminated by operator", STR_FMT_M(&cw->call->callid));
 	rwlock_unlock_w(&cw->call->master_lock);
 	call_destroy(cw->call);
 	obj_release(cw->call);
 }
-static void cli_incoming_call_debug(str *instr, struct cli_writer *cw) {
-	str_shift(instr, 1);
-
+static void cli_incoming_call_debug(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	int flag = 1;
 
 	if (instr->len) {
@@ -1551,14 +1616,14 @@ static void cli_incoming_call_debug(str *instr, struct cli_writer *cw) {
 	cw->cw_printf(cw, "%s debugging for call '" STR_FORMAT "'\n", flag ? "Enabled" : "Disabled",
 			STR_FMT(&cw->call->callid));
 }
-static void cli_incoming_call_tag(str *instr, struct cli_writer *cw) {
-	if (str_shift(instr, 1)) {
+static void cli_incoming_call_tag(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
 		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
 	str tag;
-	if (str_token_sep(&tag, instr, ' '))
+	if (!str_token_sep(&tag, instr, ' '))
 		tag = STR_NULL;
 
 	if (!tag.len) {
@@ -1572,20 +1637,20 @@ static void cli_incoming_call_tag(str *instr, struct cli_writer *cw) {
 		return;
 	}
 
-	cli_handler_do(cli_tag_handlers, instr, cw);
+	cli_handler_do(&cli_tag_handlers, instr, cw);
 
 	cw->ml = NULL;
 }
 
 
 
-static void cli_incoming_tag_info(str *instr, struct cli_writer *cw) {
+static void cli_incoming_tag_info(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	cli_list_tag_info(cw, cw->ml);
 }
 
 #ifdef WITH_TRANSCODING
-static void cli_incoming_tag_delay(str *instr, struct cli_writer *cw) {
-	if (str_shift(instr, 1)) {
+static void cli_incoming_tag_delay(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
 		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
@@ -1606,8 +1671,8 @@ static void cli_incoming_tag_delay(str *instr, struct cli_writer *cw) {
 	}
 	codec_update_all_handlers(cw->ml);
 }
-static void cli_incoming_tag_detdtmf(str *instr, struct cli_writer *cw) {
-	if (str_shift(instr, 1)) {
+static void cli_incoming_tag_detdtmf(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
 		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
@@ -1627,20 +1692,18 @@ static void cli_incoming_tag_detdtmf(str *instr, struct cli_writer *cw) {
 
 
 
-static void cli_incoming_list_rediscmdtimeout(str *instr, struct cli_writer *cw) {
-	rwlock_lock_r(&rtpe_config.config_lock);
-	cw->cw_printf(cw, "%d\n", rtpe_config.redis_cmd_timeout);
-	rwlock_unlock_r(&rtpe_config.config_lock);
+static void cli_incoming_list_rediscmdtimeout(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	cw->cw_printf(cw, "%d\n", atomic_get_na(&rtpe_config.redis_cmd_timeout));
 }
 
-static void cli_incoming_set_rediscmdtimeout(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_rediscmdtimeout(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	long timeout;
 	char *endptr;
 	int fail = 0;
 
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return;
 	}
 
@@ -1651,15 +1714,11 @@ static void cli_incoming_set_rediscmdtimeout(str *instr, struct cli_writer *cw) 
 		return;
 	}
 
-	rwlock_lock_w(&rtpe_config.config_lock);
-	if (rtpe_config.redis_cmd_timeout == timeout) {
-		rwlock_unlock_w(&rtpe_config.config_lock);
+	if (atomic_get_na(&rtpe_config.redis_cmd_timeout) == timeout) {
 		cw->cw_printf(cw,  "Success setting redis-cmd-timeout to %ld\n", timeout);
 		return;
 	}
-	rtpe_config.redis_cmd_timeout = timeout;
-	rwlock_unlock_w(&rtpe_config.config_lock);
-
+	atomic_set_na(&rtpe_config.redis_cmd_timeout, timeout);
 
 	if (timeout == 0) {
 		cw->cw_printf(cw, "Warning: Setting redis-cmd-timeout to 0 (no timeout) will require a redis reconnect\n");
@@ -1694,7 +1753,7 @@ static void cli_incoming_set_rediscmdtimeout(str *instr, struct cli_writer *cw) 
 		cw->cw_printf(cw,  "Success setting redis-cmd-timeout to %ld\n", timeout);
 }
 
-static void cli_incoming_list_interfaces(str *instr, struct cli_writer *cw) {
+static void cli_incoming_list_interfaces(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	for (GList *l = all_local_interfaces.head; l; l = l->next) {
 		struct local_intf *lif = l->data;
 		// only show first-order interface entries: socket families must match
@@ -1712,35 +1771,35 @@ static void cli_incoming_list_interfaces(str *instr, struct cli_writer *cw) {
 				r - f, r, (double) (r - f) * 100.0 / r);
 		cw->cw_printf(cw, " Packets/bytes/errors:\n");
 		cw->cw_printf(cw, "  Ingress:   %10" PRIu64 " / %10" PRIu64 " / %10" PRIu64 "\n",
-				atomic64_get(&lif->stats.in.packets),
-				atomic64_get(&lif->stats.in.bytes),
-				atomic64_get(&lif->stats.in.errors));
+				atomic64_get_na(&lif->stats->in.packets),
+				atomic64_get_na(&lif->stats->in.bytes),
+				atomic64_get_na(&lif->stats->in.errors));
 		cw->cw_printf(cw, "  Egress:    %10" PRIu64 " / %10" PRIu64 " / %10" PRIu64 "\n",
-				atomic64_get(&lif->stats.out.packets),
-				atomic64_get(&lif->stats.out.bytes),
-				atomic64_get(&lif->stats.out.errors));
+				atomic64_get_na(&lif->stats->out.packets),
+				atomic64_get_na(&lif->stats->out.bytes),
+				atomic64_get_na(&lif->stats->out.errors));
 		cw->cw_printf(cw, " Packets lost/duplicates: %10" PRIu64 " / %10" PRIu64 "\n",
-				atomic64_get(&lif->stats.s.packets_lost),
-				atomic64_get(&lif->stats.s.duplicates));
+				atomic64_get_na(&lif->stats->s.packets_lost),
+				atomic64_get_na(&lif->stats->s.duplicates));
 		cw->cw_printf(cw, " MOS:    avg %3.1f, packet loss avg %3.0f%%\n",
-				(double) atomic64_get(&lif->stats.sampled.sums.mos)
-					/ atomic64_get(&lif->stats.sampled.counts.mos) / 10.,
-				(double) atomic64_get(&lif->stats.sampled.sums.packetloss)
-					/ atomic64_get(&lif->stats.sampled.counts.packetloss));
+				(double) atomic64_get_na(&lif->stats->sampled.sums.mos)
+					/ atomic64_get_na(&lif->stats->sampled.counts.mos) / 10.,
+				(double) atomic64_get_na(&lif->stats->sampled.sums.packetloss)
+					/ atomic64_get_na(&lif->stats->sampled.counts.packetloss));
 		cw->cw_printf(cw, " Jitter: avg %3.0f (measured %3.0f)\n",
-				(double) atomic64_get(&lif->stats.sampled.sums.jitter)
-					/ atomic64_get(&lif->stats.sampled.counts.jitter),
-				(double) atomic64_get(&lif->stats.sampled.sums.jitter_measured)
-					/ atomic64_get(&lif->stats.sampled.counts.jitter_measured));
+				(double) atomic64_get_na(&lif->stats->sampled.sums.jitter)
+					/ atomic64_get_na(&lif->stats->sampled.counts.jitter),
+				(double) atomic64_get_na(&lif->stats->sampled.sums.jitter_measured)
+					/ atomic64_get_na(&lif->stats->sampled.counts.jitter_measured));
 		cw->cw_printf(cw, " RTT:    e2e %3.0f, dsct %3.0f\n",
-				(double) atomic64_get(&lif->stats.sampled.sums.rtt_e2e)
-					/ atomic64_get(&lif->stats.sampled.counts.rtt_e2e),
-				(double) atomic64_get(&lif->stats.sampled.sums.rtt_dsct)
-					/ atomic64_get(&lif->stats.sampled.counts.rtt_dsct));
+				(double) atomic64_get_na(&lif->stats->sampled.sums.rtt_e2e)
+					/ atomic64_get_na(&lif->stats->sampled.counts.rtt_e2e),
+				(double) atomic64_get_na(&lif->stats->sampled.sums.rtt_dsct)
+					/ atomic64_get_na(&lif->stats->sampled.counts.rtt_dsct));
 	}
 }
 
-static void cli_incoming_list_jsonstats(str *instr, struct cli_writer *cw) {
+static void cli_incoming_list_jsonstats(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	g_autoptr(stats_metric_q) metrics = statistics_gather_metrics(NULL);
 
 	for (__auto_type l = metrics->head; l; l = l->next) {
@@ -1760,7 +1819,7 @@ static void cli_incoming_list_jsonstats(str *instr, struct cli_writer *cw) {
 	}
 }
 
-static void cli_incoming_list_transcoders(str *instr, struct cli_writer *cw) {
+static void cli_incoming_list_transcoders(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	mutex_lock(&rtpe_codec_stats_lock);
 
 	if (t_hash_table_size(rtpe_codec_stats) == 0)
@@ -1786,18 +1845,16 @@ static void cli_incoming_list_transcoders(str *instr, struct cli_writer *cw) {
 	mutex_unlock(&rtpe_codec_stats_lock);
 }
 
-static void cli_incoming_list_controltos(str *instr, struct cli_writer *cw) {
-	rwlock_lock_r(&rtpe_config.config_lock);
-	cw->cw_printf(cw, "%d\n", rtpe_config.control_tos);
-	rwlock_unlock_r(&rtpe_config.config_lock);
+static void cli_incoming_list_controltos(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	cw->cw_printf(cw, "%d\n", atomic_get_na(&rtpe_config.control_tos));
 }
 
-static void cli_incoming_set_controltos(str *instr, struct cli_writer *cw) {
+static void cli_incoming_set_controltos(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
 	long tos;
 	char *endptr;
 
-	if (str_shift(instr, 1)) {
-		cw->cw_printf(cw, "%s\n", "More parameters required.");
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
 		return ;
 	}
 
@@ -1808,9 +1865,7 @@ static void cli_incoming_set_controltos(str *instr, struct cli_writer *cw) {
 		return;
 	}
 
-	rwlock_lock_w(&rtpe_config.config_lock);
-	rtpe_config.control_tos = tos;
-	rwlock_unlock_w(&rtpe_config.config_lock);
+	atomic_set_na(&rtpe_config.control_tos, tos);
 
 	for (GList *l = rtpe_control_ng.head; l; l = l->next) {
 		struct control_ng *c = l->data;
@@ -1820,4 +1875,297 @@ static void cli_incoming_set_controltos(str *instr, struct cli_writer *cw) {
 	}
 
 	cw->cw_printf(cw,  "Success setting redis-connect-timeout to %ld\n", tos);
+}
+
+#ifdef WITH_TRANSCODING
+static void cli_incoming_media_list_files(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	str_q list = media_player_list_files();
+	while (list.head) {
+		str *name = t_queue_pop_head(&list);
+		time_t atime, mtime;
+		if (media_player_get_file_times(name, &mtime, &atime))
+			cw->cw_printf(cw, STR_FORMAT ", loaded %lu s ago, last used %lu s ago\n",
+					STR_FMT(name),
+					(long) rtpe_now.tv_sec - mtime,
+					(long) rtpe_now.tv_sec - atime);
+		str_free(name);
+	}
+}
+
+static void cli_incoming_media_list_dbs(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	GQueue list = media_player_list_dbs();
+	while (list.head) {
+		void *idp = g_queue_pop_head(&list);
+		unsigned long long id = GPOINTER_TO_UINT(idp);
+		time_t atime, mtime;
+		if (media_player_get_db_times(id, &mtime, &atime))
+			cw->cw_printf(cw, "%llu, loaded %lu s ago, last used %lu s ago\n", id,
+					(long) rtpe_now.tv_sec - mtime,
+					(long) rtpe_now.tv_sec - atime);
+	}
+}
+
+static void cli_incoming_media_add_file(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
+		return ;
+	}
+
+	bool ok = media_player_add_cached_file(instr);
+	if (ok)
+		cw->cw_printf(cw, "Success\n");
+	else
+		cw->cw_printf(cw, "Failed to reload '" STR_FORMAT "'\n", STR_FMT(instr));
+}
+
+static void cli_incoming_media_reload_file(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
+		return ;
+	}
+
+	bool ok = media_player_reload_file(instr);
+	if (ok)
+		cw->cw_printf(cw, "Success\n");
+	else
+		cw->cw_printf(cw, "Failed to reload '" STR_FORMAT "'\n", STR_FMT(instr));
+}
+
+static void cli_incoming_media_reload_files(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	unsigned int num = media_player_reload_files();
+	cw->cw_printf(cw, "%u media files reloaded\n", num);
+}
+
+static void cli_incoming_media_add_db(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
+		return ;
+	}
+
+	unsigned long long id = str_to_ui(instr, 0);
+	if (id == 0 || id == ULLONG_MAX)
+		cw->cw_printf(cw, "Invalid ID '" STR_FORMAT "'\n", STR_FMT(instr));
+	else {
+		bool ok = media_player_add_db_media(id);
+		if (ok)
+			cw->cw_printf(cw, "Success\n");
+		else
+			cw->cw_printf(cw, "Failed to reload '" STR_FORMAT "'\n", STR_FMT(instr));
+	}
+}
+
+static void cli_incoming_media_reload_db(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
+		return ;
+	}
+
+	unsigned long long id = str_to_ui(instr, 0);
+	if (id == 0 || id == ULLONG_MAX)
+		cw->cw_printf(cw, "Invalid ID '" STR_FORMAT "'\n", STR_FMT(instr));
+	else {
+		bool ok = media_player_reload_db_media(id);
+		if (ok)
+			cw->cw_printf(cw, "Success\n");
+		else
+			cw->cw_printf(cw, "Failed to reload '" STR_FORMAT "'\n", STR_FMT(instr));
+	}
+}
+
+static void cli_incoming_media_reload_dbs(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	unsigned int num = media_player_reload_db_medias();
+	cw->cw_printf(cw, "%u media entries reloaded\n", num);
+}
+
+static void cli_incoming_media_add_cache(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
+		return ;
+	}
+
+	unsigned long long id = str_to_ui(instr, 0);
+	if (id == 0 || id == ULLONG_MAX)
+		cw->cw_printf(cw, "Invalid ID '" STR_FORMAT "'\n", STR_FMT(instr));
+	else {
+		bool ok = media_player_add_cache(id);
+		if (ok)
+			cw->cw_printf(cw, "Success\n");
+		else
+			cw->cw_printf(cw, "Failed to reload '" STR_FORMAT "'\n", STR_FMT(instr));
+	}
+}
+
+static void cli_incoming_media_reload_cache(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
+		return ;
+	}
+
+	unsigned long long id = str_to_ui(instr, 0);
+	if (id == 0 || id == ULLONG_MAX)
+		cw->cw_printf(cw, "Invalid ID '" STR_FORMAT "'\n", STR_FMT(instr));
+	else {
+		bool ok = media_player_reload_cache(id);
+		if (ok)
+			cw->cw_printf(cw, "Success\n");
+		else
+			cw->cw_printf(cw, "Failed to reload '" STR_FORMAT "'\n", STR_FMT(instr));
+	}
+}
+
+static void cli_incoming_media_reload_caches(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	unsigned int num = media_player_reload_caches();
+	cw->cw_printf(cw, "%u media entries reloaded\n", num);
+}
+
+static void cli_incoming_media_evict_file(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
+		return ;
+	}
+
+	bool ok = media_player_evict_file(instr);
+	if (ok)
+		cw->cw_printf(cw, "Success\n");
+	else
+		cw->cw_printf(cw, "Failed to evict '" STR_FORMAT "'", STR_FMT(instr));
+}
+
+static void cli_incoming_media_evict_files(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	unsigned int num = media_player_evict_files();
+	cw->cw_printf(cw, "%u media files evicted\n", num);
+}
+
+static void cli_incoming_media_evict_db(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
+		return ;
+	}
+
+	str token;
+	while (str_token_sep(&token, instr, ' ')) {
+		unsigned long long id = str_to_ui(&token, 0);
+		if (id == 0 || id == ULLONG_MAX)
+			cw->cw_printf(cw, "Invalid ID '" STR_FORMAT "'\n", STR_FMT(&token));
+		else {
+			bool ok = media_player_evict_db_media(id);
+			if (ok)
+				cw->cw_printf(cw, "Success (%llu)\n", id);
+			else
+				cw->cw_printf(cw, "Failed to evict %llu\n", id);
+		}
+	}
+}
+
+static void cli_incoming_media_evict_dbs(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	unsigned int num = media_player_evict_db_medias();
+	cw->cw_printf(cw, "%u DB media entries evicted\n", num);
+}
+
+static void cli_incoming_media_list_caches(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	GQueue list = media_player_list_caches();
+	while (list.head) {
+		void *idp = g_queue_pop_head(&list);
+		unsigned long long id = GPOINTER_TO_UINT(idp);
+		time_t atime, mtime;
+		if (media_player_get_cache_times(id, &mtime, &atime))
+			cw->cw_printf(cw, "%llu, loaded %lu s ago, last used %lu s ago\n", id,
+					(long) rtpe_now.tv_sec - mtime,
+					(long) rtpe_now.tv_sec - atime);
+	}
+}
+
+static void cli_incoming_media_list_players(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	charp_q list = media_player_list_player_cache();
+	while (list.head) {
+		char *s = t_queue_pop_head(&list);
+		cw->cw_printf(cw, "%s\n", s);
+		g_free(s);
+	}
+}
+
+static void cli_incoming_media_evict_cache(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	if (instr->len == 0) {
+		cw->cw_printf(cw, "More parameters required.\n");
+		return ;
+	}
+
+	str token;
+	while (str_token_sep(&token, instr, ' ')) {
+		unsigned long long id = str_to_ui(&token, 0);
+		if (id == 0 || id == ULLONG_MAX)
+			cw->cw_printf(cw, "Invalid ID '" STR_FORMAT "'\n", STR_FMT(&token));
+		else {
+			bool ok = media_player_evict_cache(id);
+			if (ok)
+				cw->cw_printf(cw, "Success (%llu)\n", id);
+			else
+				cw->cw_printf(cw, "Failed to evict %llu\n", id);
+		}
+	}
+}
+
+static void cli_incoming_media_evict_caches(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	unsigned int num = media_player_evict_caches();
+	cw->cw_printf(cw, "%u DB cache entries evicted\n", num);
+}
+
+static void cli_incoming_media_evict_players(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	unsigned int num = media_player_evict_player_caches();
+	cw->cw_printf(cw, "%u DB cache entries evicted\n", num);
+}
+#endif
+
+static size_t ng_printf(struct cli_writer *cw, const char *fmt, ...) {
+	GString *s = cw->ptr;
+	size_t ret = s->len;
+	va_list va;
+	va_start(va, fmt);
+	g_string_append_vprintf(s, fmt, va);
+	va_end(va);
+	ret = s->len - ret;
+	return ret;
+}
+
+const char *cli_ng(ng_command_ctx_t *ctx) {
+	__auto_type parser = ctx->parser_ctx.parser;
+	str body;
+	if (!parser->dict_get_str(ctx->req, "body", &body))
+		return "No 'body' in message";
+
+	g_autoptr(GString) response = g_string_new("");
+
+	struct cli_writer cw = {
+		.cw_printf = ng_printf,
+		.ptr = response,
+	};
+	cli_handle(&body, &cw);
+
+	parser->dict_add_str_dup(ctx->resp, "response", &STR_LEN(response->str, response->len));
+
+	return NULL;
+}
+
+static void cli_recurse_help(struct cli_writer *cw, const cli_handler_t *handler, str *prefix) {
+	for (unsigned int i = 0; i < handler->num_commands; i++) {
+		__auto_type c = &handler->commands[i];
+		__cli_handler_print_help(c, prefix, cw);
+
+		if (c->next) {
+			prefix->len += 4;
+			cli_recurse_help(cw, c->next, prefix);
+			prefix->len -= 4;
+		}
+
+		if (prefix->len == 4)
+			cw->cw_printf(cw, "\n");
+	}
+}
+
+static void cli_incoming_usage(str *instr, struct cli_writer *cw, const cli_handler_t *handler) {
+	cw->cw_printf(cw, "    Supported commands are:\n\n");
+
+	str prefix = STR("                                                  ");
+	prefix.len = 4;
+	cli_recurse_help(cw, &cli_top_handlers, &prefix);
 }

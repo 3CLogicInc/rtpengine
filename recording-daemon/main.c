@@ -68,6 +68,7 @@ int notify_retries = 10;
 gboolean notify_record;
 gboolean notify_purge;
 gboolean mix_output_per_media = 0;
+gboolean flush_packets = 0;
 
 static GQueue threads = G_QUEUE_INIT; // only accessed from main thread
 
@@ -195,7 +196,7 @@ static void options(int *argc, char ***argv) {
 
 	GOptionEntry e[] = {
 		{ "table",		't', 0, G_OPTION_ARG_INT,	&ktable,	"Kernel table rtpengine uses",		"INT"		},
-		{ "spool-dir",		0,   0, G_OPTION_ARG_STRING,	&spool_dir,	"Directory containing rtpengine metadata files", "PATH" },
+		{ "spool-dir",		0,   0, G_OPTION_ARG_FILENAME,	&spool_dir,	"Directory containing rtpengine metadata files", "PATH" },
 		{ "num-threads",	0,   0, G_OPTION_ARG_INT,	&num_threads,	"Number of worker threads",		"INT"		},
 		{ "output-storage",	0,   0, G_OPTION_ARG_STRING,	&os_str,	"Where to store audio streams",	        "file|db|both"	},
 		{ "output-dir",		0,   0, G_OPTION_ARG_STRING,	&output_dir,	"Where to write media files to",	"PATH"		},
@@ -216,7 +217,7 @@ static void options(int *argc, char ***argv) {
 		{ "mysql-user",		0,   0,	G_OPTION_ARG_STRING,	&c_mysql_user,	"MySQL connection credentials",		"USERNAME"	},
 		{ "mysql-pass",		0,   0,	G_OPTION_ARG_STRING,	&c_mysql_pass,	"MySQL connection credentials",		"PASSWORD"	},
 		{ "mysql-db",		0,   0,	G_OPTION_ARG_STRING,	&c_mysql_db,	"MySQL database name",			"STRING"	},
-		{ "forward-to", 	0,   0, G_OPTION_ARG_STRING,	&forward_to,	"Where to forward to (unix socket)",	"PATH"		},
+		{ "forward-to", 	0,   0, G_OPTION_ARG_FILENAME,	&forward_to,	"Where to forward to (unix socket)",	"PATH"		},
 		{ "tcp-send-to", 	0,   0, G_OPTION_ARG_STRING,	&tcp_send_to,	"Where to send to (TCP destination)",	"IP:PORT"	},
 		{ "tls-send-to", 	0,   0, G_OPTION_ARG_STRING,	&tls_send_to,	"Where to send to (TLS destination)",	"IP:PORT"	},
 		{ "tcp-resample", 	0,   0, G_OPTION_ARG_INT,	&tls_resample,	"Sampling rate for TCP/TLS PCM output",	"INT"		},
@@ -230,6 +231,7 @@ static void options(int *argc, char ***argv) {
 #if CURL_AT_LEAST_VERSION(7,56,0)
 		{ "notify-record", 	0,   0, G_OPTION_ARG_NONE,	&notify_record, "Also attach recorded file to request", NULL		},
 		{ "notify-purge", 	0,   0, G_OPTION_ARG_NONE,	&notify_purge,	"Remove the local file if notify success", NULL		},
+		{ "flush-packets", 	0,   0, G_OPTION_ARG_NONE,	&flush_packets,	"Output buffer will be flushed after every packet", NULL },
 #endif
 		{ NULL, }
 	};

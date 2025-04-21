@@ -32,7 +32,7 @@ decode_t *decoder_new(const char *payload_str, const char *format, int ptime, ou
 		return NULL;
 	}
 
-	str name = STR_INIT_LEN(payload_str, slash - payload_str);
+	str name = STR_LEN(payload_str, slash - payload_str);
 	int clockrate = atoi(slash + 1);
 	if (clockrate <= 0) {
 		ilog(LOG_ERR, "Invalid clock rate %i (parsed from '%.20s'/'%.20s')",
@@ -82,7 +82,7 @@ decode_t *decoder_new(const char *payload_str, const char *format, int ptime, ou
 	else
 		out_format.format = AV_SAMPLE_FMT_S16; // needed for TLS-only scenarios
 
-	str fmtp = STR_INIT(format);
+	str fmtp = STR(format);
 
 	decoder_t *dec = decoder_new_fmtp(def, rtp_clockrate, channels, ptime, &out_format, NULL, &fmtp, NULL);
 	if (!dec)
@@ -115,19 +115,22 @@ static int decoder_got_frame(decoder_t *dec, AVFrame *frame, void *sp, void *dp)
 	if (metafile->mix_out) {
 		dbg("adding packet from stream #%lu to mix output", stream->id);
 		if (G_UNLIKELY(deco->mixer_idx == (unsigned int) -1))
-			deco->mixer_idx = mix_get_index(metafile->mix, ssrc, stream->media_sdp_id);
+			deco->mixer_idx = mix_get_index(metafile->mix, ssrc, stream->media_sdp_id, stream->channel_slot);
 		format_t actual_format;
 		if (output_config(metafile->mix_out, &dec->dest_format, &actual_format))
 			goto no_mix_out;
 		mix_config(metafile->mix, &actual_format);
 		// XXX might be a second resampling to same format
-		AVFrame *dec_frame = resample_frame(&deco->mix_resampler, frame, &actual_format);
+		AVFrame *copy_frame = av_frame_clone(frame);
+		AVFrame *dec_frame = resample_frame(&deco->mix_resampler, copy_frame, &actual_format);
 		if (!dec_frame) {
 			pthread_mutex_unlock(&metafile->mix_lock);
 			goto err;
 		}
 		if (mix_add(metafile->mix, dec_frame, deco->mixer_idx, ssrc, metafile->mix_out))
 			ilog(LOG_ERR, "Failed to add decoded packet to mixed output");
+		if (dec_frame != copy_frame)
+			av_frame_free(&copy_frame);
 	}
 no_mix_out:
 	pthread_mutex_unlock(&metafile->mix_lock);
@@ -183,7 +186,8 @@ no_recording:
 		int linesize = av_get_bytes_per_sample(dec_frame->format) * dec_frame->nb_samples;
 		dbg("Writing %u bytes PCM to TLS", linesize);
 		streambuf_write(ssrc->tls_fwd_stream, (char *) dec_frame->extended_data[0], linesize);
-		av_frame_free(&dec_frame);
+		if (dec_frame != frame)
+			av_frame_free(&dec_frame);
 
 	}
 

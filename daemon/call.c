@@ -2,19 +2,14 @@
 
 #include <stdio.h>
 #include <unistd.h>
-#include <glib.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
-#include <stdbool.h>
-#include <time.h>
 #include <xmlrpc_client.h>
 #include <sys/wait.h>
-#include <time.h>
-#include <sys/time.h>
 #include <inttypes.h>
 
 #include "poller.h"
@@ -24,8 +19,6 @@
 #include "control_tcp.h"
 #include "streambuf.h"
 #include "redis.h"
-#include "bencode.h"
-#include "sdp.h"
 #include "str.h"
 #include "stun.h"
 #include "rtcp.h"
@@ -33,22 +26,18 @@
 #include "call_interfaces.h"
 #include "ice.h"
 #include "log_funcs.h"
-#include "recording.h"
 #include "rtplib.h"
 #include "cdr.h"
-#include "statistics.h"
 #include "ssrc.h"
 #include "main.h"
 #include "graphite.h"
 #include "codec.h"
 #include "media_player.h"
 #include "jitter_buffer.h"
-#include "t38.h"
 #include "mqtt.h"
 #include "janus.h"
-#include "dtmf.h"
 #include "audio_player.h"
-#include "sdp.h"
+#include "bufferpool.h"
 
 #include "xt_RTPENGINE.h"
 
@@ -57,15 +46,19 @@ struct iterator_helper {
 	GSList			*del_timeout;
 	GSList			*del_scheduled;
 	uint64_t		transcoded_media;
+	uint64_t		user_streams;
+	uint64_t		kernel_streams;
+	uint64_t		user_kernel_streams;
 };
 struct xmlrpc_helper {
 	enum xmlrpc_format fmt;
 	GQueue			strings;
 };
 
-rwlock_t rtpe_callhash_lock;
+rwlock_t rtpe_callhash_lock = RWLOCK_STATIC_INIT;
 rtpe_calls_ht rtpe_callhash;
 struct call_iterator_list rtpe_call_iterators[NUM_CALL_ITERATORS];
+__thread call_t *call_memory_arena;
 static struct mqtt_timer *global_mqtt_timer;
 
 unsigned int call_socket_cpu_affinity = 0;
@@ -75,11 +68,12 @@ unsigned int call_socket_cpu_affinity = 0;
  */
 static struct timeval add_ongoing_calls_dur_in_interval(struct timeval *interval_start,
 		struct timeval *interval_duration);
-static void __call_free(void *p);
+static void __call_free(call_t *p);
 static void __call_cleanup(call_t *c);
 static void __monologue_stop(struct call_monologue *ml);
 static void media_stop(struct call_media *m);
-static void __subscribe_medias_both_ways(struct call_media * a, struct call_media * b);
+static void __subscribe_medias_both_ways(struct call_media * a, struct call_media * b,
+		bool is_offer, medias_q *);
 
 /* called with call->master_lock held in R */
 static int call_timer_delete_monologues(call_t *c) {
@@ -132,26 +126,27 @@ void call_make_own_foreign(call_t *c, bool foreign) {
 static void call_timer_iterator(call_t *c, struct iterator_helper *hlp) {
 	unsigned int check;
 	bool good = false;
+	bool do_update = false;
+	bool has_srtp = false;
 	struct packet_stream *ps;
 	stream_fd *sfd;
 	int tmp_t_reason = UNKNOWN;
-	struct call_monologue *ml;
 	enum call_stream_state css;
-	atomic64 *timestamp;
+	uint64_t timestamp;
 
 	hlp->count++;
 
 	rwlock_lock_r(&c->master_lock);
 	log_info_call(c);
 
-	rwlock_lock_r(&rtpe_config.config_lock);
-
 	// final timeout applicable to all calls (own and foreign)
-	if (rtpe_config.final_timeout && rtpe_now.tv_sec >= (c->created.tv_sec + rtpe_config.final_timeout)) {
+	if (atomic_get_na(&rtpe_config.final_timeout)
+			&& rtpe_now.tv_sec >= (c->created.tv_sec + atomic_get_na(&rtpe_config.final_timeout)))
+	{
 		ilog(LOG_INFO, "Closing call due to final timeout");
 		tmp_t_reason = FINAL_TIMEOUT;
 		for (__auto_type it = c->monologues.head; it; it = it->next) {
-			ml = it->data;
+			__auto_type ml = it->data;
 			gettimeofday(&(ml->terminated),NULL);
 			ml->term_reason = tmp_t_reason;
 		}
@@ -178,13 +173,16 @@ static void call_timer_iterator(call_t *c, struct iterator_helper *hlp) {
 		goto out;
 
 	// ignore media timeout if call was recently taken over
-	if (CALL_ISSET(c, FOREIGN_MEDIA) && rtpe_now.tv_sec - c->last_signal <= rtpe_config.timeout)
+	if (CALL_ISSET(c, FOREIGN_MEDIA)
+			&& rtpe_now.tv_sec - c->last_signal <= atomic_get_na(&rtpe_config.timeout))
 		goto out;
+
+	ice_fragments_cleanup(c->sdp_fragments, false);
 
 	for (__auto_type it = c->streams.head; it; it = it->next) {
 		ps = it->data;
 
-		timestamp = &ps->last_packet;
+		timestamp = packet_stream_last_packet(ps);
 
 		if (!ps->media)
 			goto next;
@@ -197,24 +195,60 @@ static void call_timer_iterator(call_t *c, struct iterator_helper *hlp) {
 		css = call_stream_state_machine(ps);
 
 		if (css == CSS_ICE)
-			timestamp = &ps->media->ice_agent->last_activity;
+			timestamp = atomic64_get_na(&ps->media->ice_agent->last_activity);
+
+		if (PS_ISSET(ps, RTP)) {
+			if (rtpe_now.tv_sec - atomic64_get_na(&ps->stats_in->last_packet) < 2) {
+				// kernel activity
+				if (rtpe_now.tv_sec - atomic64_get_na(&ps->last_packet) < 2)
+					hlp->user_kernel_streams++; // user activity
+				else
+					hlp->kernel_streams++;
+			}
+			else if (rtpe_now.tv_sec - atomic64_get_na(&ps->last_packet) < 2)
+				hlp->user_streams++; // user activity
+		}
+
+		bool active_media = (rtpe_now.tv_sec - packet_stream_last_packet(ps) < 1);
+		if (active_media)
+			CALL_CLEAR(sfd->call, FOREIGN_MEDIA);
+
+		for (unsigned int u = 0; u < G_N_ELEMENTS(ps->ssrc_in); u++) {
+			struct ssrc_ctx *ctx = ps->ssrc_in[u];
+			if (!ctx)
+				break;
+
+			if (rtpe_now.tv_sec - atomic64_get_na(&ctx->stats->last_packet) < 2)
+				payload_tracker_add(&ctx->tracker,
+						atomic_get_na(&ctx->stats->last_pt));
+		}
+		for (unsigned int u = 0; u < G_N_ELEMENTS(ps->ssrc_out); u++) {
+			struct ssrc_ctx *ctx = ps->ssrc_out[u];
+			if (!ctx)
+				break;
+
+			if (rtpe_now.tv_sec - atomic64_get_na(&ctx->stats->last_packet) < 2)
+				payload_tracker_add(&ctx->tracker,
+						atomic_get_na(&ctx->stats->last_pt));
+		}
+
 
 no_sfd:
 		if (good)
 			goto next;
 
-		check = rtpe_config.timeout;
+		check = atomic_get_na(&rtpe_config.timeout);
 		tmp_t_reason = TIMEOUT;
 		if (!MEDIA_ISSET(ps->media, RECV) || !sfd) {
-			check = rtpe_config.silent_timeout;
+			check = atomic_get_na(&rtpe_config.silent_timeout);
 			tmp_t_reason = SILENT_TIMEOUT;
 		}
 		else if (!PS_ISSET(ps, FILLED)) {
-			check = rtpe_config.offer_timeout;
+			check = atomic_get_na(&rtpe_config.offer_timeout);
 			tmp_t_reason = OFFER_TIMEOUT;
 		}
 
-		if (rtpe_now.tv_sec - atomic64_get(timestamp) < check)
+		if (timestamp > rtpe_now.tv_sec || rtpe_now.tv_sec - timestamp < check)
 			good = true;
 
 next:
@@ -223,15 +257,23 @@ next:
 
 	for (__auto_type it = c->medias.head; it; it = it->next) {
 		struct call_media *media = it->data;
-		if (rtpe_config.measure_rtp) {
-			media_update_stats(media);
+		if (media->protocol && media->protocol->srtp)
+			has_srtp = true;
+
+		if (rtpe_config.measure_rtp)
 			ssrc_collect_metrics(media);
-		}
 		if (MEDIA_ISSET(media, TRANSCODING))
 			hlp->transcoded_media++;
 	}
 
-	if (good || IS_FOREIGN_CALL(c)) {
+	if (good) {
+		if (IS_FOREIGN_CALL(c))
+			goto out;
+
+		// update every 5 minutes
+		if (has_srtp && rtpe_now.tv_sec - atomic64_get_na(&c->last_redis_update) > 60*5)
+			do_update = true;
+
 		goto out;
 	}
 
@@ -239,7 +281,7 @@ next:
 		goto out;
 
 	for (__auto_type it = c->monologues.head; it; it = it->next) {
-		ml = it->data;
+		__auto_type ml = it->data;
 		gettimeofday(&(ml->terminated),NULL);
 		ml->term_reason = tmp_t_reason;
 	}
@@ -254,8 +296,11 @@ delete:
 	goto out;
 
 out:
-	rwlock_unlock_r(&rtpe_config.config_lock);
 	rwlock_unlock_r(&c->master_lock);
+
+	if (do_update)
+		redis_update_onekey(c, rtpe_redis_write);
+
 	log_info_pop();
 }
 
@@ -268,25 +313,33 @@ void xmlrpc_kill_calls(void *p) {
 	sigset_t ss;
 	int i = 0;
 	int status;
-	str *tag, *tag2 = NULL, *tag3 = NULL;
-	const char *url;
 
 	int els_per_ent = 2;
-	if (xh->fmt == XF_KAMAILIO)
+	if (xh->fmt == XF_SEMS)
+		els_per_ent = 3;
+	else if (xh->fmt == XF_KAMAILIO)
 		els_per_ent = 4;
 
 	while (xh->strings.length >= els_per_ent) {
+		const char *url;
+		str *call_id, *tag = NULL, *tag2 = NULL;
+
 		usleep(10000);
 
 		url = xh->strings.head->data;
-		tag = xh->strings.head->next->data;
-		if (xh->fmt == XF_KAMAILIO) {
-			tag2 = xh->strings.head->next->next->data;
-			tag3 = xh->strings.head->next->next->next->data;
+		call_id = xh->strings.head->next->data;
+		if (xh->fmt == XF_KAMAILIO || xh->fmt == XF_SEMS) {
+			tag = xh->strings.head->next->next->data;
+			if (xh->fmt == XF_KAMAILIO)
+				tag2 = xh->strings.head->next->next->next->data;
 		}
 
-		ilog(LOG_INFO, "Forking child to close call with tag " STR_FORMAT_M " via XMLRPC call to %s",
-				STR_FMT_M(tag), url);
+		if (tag)
+			ilog(LOG_INFO, "Forking child to close call (ID " STR_FORMAT_M ", tag " STR_FORMAT_M ") via XMLRPC call to %s",
+					STR_FMT_M(call_id), STR_FMT_M(tag), url);
+		else
+			ilog(LOG_INFO, "Forking child to close call (ID " STR_FORMAT_M ") via XMLRPC call to %s",
+					STR_FMT_M(call_id), url);
 		pid = fork();
 
 		if (pid) {
@@ -323,7 +376,12 @@ retry:
 		if (!rtpe_config.common.log_stderr) {
 			openlog("rtpengine/child", LOG_PID | LOG_NDELAY, LOG_DAEMON);
 		}
-		ilog(LOG_INFO, "Initiating XMLRPC call for tag " STR_FORMAT_M "", STR_FMT_M(tag));
+
+		if (tag)
+			ilog(LOG_INFO, "Initiating XMLRPC for call (ID " STR_FORMAT_M ", tag " STR_FORMAT_M ")",
+					STR_FMT_M(call_id), STR_FMT_M(tag));
+		else
+			ilog(LOG_INFO, "Initiating XMLRPC for call (ID " STR_FORMAT_M ")", STR_FMT_M(call_id));
 
 		alarm(5);
 
@@ -341,11 +399,11 @@ retry:
 						"sbc", "postControlCmd", tag->s, "teardown");
 			break;
 		case XF_CALLID:
-			xmlrpc_client_call2f(&e, c, url, "teardown", &r, "(s)", tag->s);
+			xmlrpc_client_call2f(&e, c, url, "teardown", &r, "(s)", call_id->s);
 			break;
 		case XF_KAMAILIO:
 			xmlrpc_client_call2f(&e, c, url, "dlg.terminate_dlg", &r, "(sss)",
-					tag->s, tag2->s, tag3->s);
+					call_id->s, tag->s, tag2->s);
 			break;
 		}
 
@@ -407,7 +465,7 @@ void kill_calls_timer(GSList *list, const char *url) {
 			goto destroy;
 
 		if (rtpe_config.fmt == XF_KAMAILIO)
-			dup_tags = g_hash_table_new(str_hash, str_equal);
+			dup_tags = g_hash_table_new((GHashFunc) str_hash, (GEqualFunc) str_equal);
 
 		rwlock_lock_r(&ca->master_lock);
 
@@ -419,7 +477,7 @@ void kill_calls_timer(GSList *list, const char *url) {
 
 		if (url_prefix) {
 			snprintf(url_buf, sizeof(url_buf), "%s%s%s",
-					url_prefix, sockaddr_print_buf(cb_addr),
+					url_prefix, sockaddr_print_p_buf(cb_addr),
 					url_suffix);
 		}
 		else
@@ -432,6 +490,7 @@ void kill_calls_timer(GSList *list, const char *url) {
 				if (!cm->tag.s || !cm->tag.len)
 					continue;
 				g_queue_push_tail(&xh->strings, strdup(url_buf));
+				g_queue_push_tail(&xh->strings, str_dup(&ca->callid));
 				g_queue_push_tail(&xh->strings, str_dup(&cm->tag));
 			}
 			break;
@@ -510,6 +569,10 @@ enum thread_looper_action call_timer(void) {
 	/* stats derived while iterating calls */
 	RTPE_GAUGE_SET(transcoded_media, hlp.transcoded_media); /* TODO: move out from here? */
 
+	RTPE_GAUGE_SET(userspace_streams, hlp.user_streams);
+	RTPE_GAUGE_SET(kernel_only_streams, hlp.kernel_streams);
+	RTPE_GAUGE_SET(kernel_user_streams, hlp.user_kernel_streams);
+
 	kill_calls_timer(hlp.del_scheduled, NULL);
 	kill_calls_timer(hlp.del_timeout, rtpe_config.b2b_url);
 
@@ -518,14 +581,12 @@ enum thread_looper_action call_timer(void) {
 
 	return TLA_CONTINUE;
 }
-#undef DS
 
 
 int call_init(void) {
 	rtpe_callhash = rtpe_calls_ht_new();
 	if (!t_hash_table_is_set(rtpe_callhash))
 		return -1;
-	rwlock_init(&rtpe_callhash_lock);
 
 	for (int i = 0; i < NUM_CALL_ITERATORS; i++)
 		mutex_init(&rtpe_call_iterators[i].lock);
@@ -602,10 +663,12 @@ struct call_media *call_media_new(call_t *call) {
 	med = uid_slice_alloc0(med, &call->medias.q);
 	med->call = call;
 	codec_store_init(&med->codecs, med);
+	codec_store_init(&med->offered_codecs, med);
 	med->media_subscribers_ht = subscription_ht_new();
 	med->media_subscriptions_ht = subscription_ht_new();
 	mutex_init(&med->dtmf_lock);
 	med->sdp_attr_print = sdp_insert_media_attributes;
+	RESET_BANDWIDTH(med->sdp_media_bandwidth, -1);
 	return med;
 }
 
@@ -619,9 +682,13 @@ static struct call_media *__get_media(struct call_monologue *ml, const struct st
 	if (sp->media_id.len) {
 		// in this case, the media sections can be out of order and the media ID
 		// string is used to determine which media section to operate on.
-		med = g_hash_table_lookup(ml->media_ids, &sp->media_id);
-		if (med)
-			return med;
+		med = t_hash_table_lookup(ml->media_ids, &sp->media_id);
+		if (med) {
+			if (med->type_id == sp->type_id)
+				return med;
+			ilogs(ice, LOG_WARN, "Ignoring media ID '" STR_FORMAT "' as media type doesn't match. "
+					"Was media ID changed?", STR_FMT(&sp->media_id));
+		}
 		if (flags->trickle_ice)
 			ilogs(ice, LOG_ERR, "Received trickle ICE SDP fragment with unknown media ID '"
 					STR_FORMAT "'",
@@ -648,7 +715,7 @@ static struct call_media *__get_media(struct call_monologue *ml, const struct st
 	med = call_media_new(call);
 	med->monologue = ml;
 	med->index = want_index;
-	call_str_cpy(ml->call, &med->type, &sp->type);
+	med->type = call_str_cpy(&sp->type);
 	med->type_id = sp->type_id;
 
 	ml->medias->pdata[arr_index] = med;
@@ -887,7 +954,7 @@ static int __wildcard_endpoint_map(struct call_media *media, unsigned int num_po
 }
 
 static void __rtp_stats_free(void *p) {
-	g_slice_free1(sizeof(struct rtp_stats), p);
+	bufferpool_unref(p);
 }
 
 struct packet_stream *__packet_stream_new(call_t *call) {
@@ -901,6 +968,8 @@ struct packet_stream *__packet_stream_new(call_t *call) {
 	stream->rtp_stats = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, __rtp_stats_free);
 	recording_init_stream(stream);
 	stream->send_timer = send_timer_new(stream);
+	stream->stats_in = bufferpool_alloc0(shm_bufferpool, sizeof(*stream->stats_in));
+	stream->stats_out = bufferpool_alloc0(shm_bufferpool, sizeof(*stream->stats_out));
 
 	if (rtpe_config.jb_length && !CALL_ISSET(call, DISABLE_JB))
 		stream->jb = jitter_buffer_new(call);
@@ -1008,7 +1077,7 @@ void call_stream_crypto_reset(struct packet_stream *ps) {
 		for (unsigned int u = 0; u < G_N_ELEMENTS(ps->ssrc_in); u++) {
 			if (!ps->ssrc_in[u]) // end of list
 				break;
-			ps->ssrc_in[u]->srtp_index = 0;
+			atomic_set_na(&ps->ssrc_in[u]->stats->ext_seq, 0);
 		}
 		mutex_unlock(&ps->in_lock);
 
@@ -1016,7 +1085,7 @@ void call_stream_crypto_reset(struct packet_stream *ps) {
 		for (unsigned int u = 0; u < G_N_ELEMENTS(ps->ssrc_out); u++) {
 			if (!ps->ssrc_out[u]) // end of list
 				break;
-			ps->ssrc_out[u]->srtp_index = 0;
+			atomic_set_na(&ps->ssrc_out[u]->stats->ext_seq, 0);
 		}
 		mutex_unlock(&ps->out_lock);
 	}
@@ -1048,8 +1117,10 @@ enum call_stream_state call_stream_state_machine(struct packet_stream *ps) {
 		mutex_lock(&ps->in_lock);
 		struct dtls_connection *d = dtls_ptr(ps->selected_sfd);
 		if (d && d->init && !d->connected) {
-			dtls(ps->selected_sfd, NULL, NULL);
+			int dret = dtls(ps->selected_sfd, NULL, NULL);
 			mutex_unlock(&ps->in_lock);
+			if (dret == 1)
+				call_media_unkernelize(media, "DTLS connected");
 			return CSS_DTLS;
 		}
 		mutex_unlock(&ps->in_lock);
@@ -1057,14 +1128,14 @@ enum call_stream_state call_stream_state_machine(struct packet_stream *ps) {
 
 	if (PS_ISSET(ps, PIERCE_NAT) && PS_ISSET(ps, FILLED) && !PS_ISSET(ps, CONFIRMED)) {
 		for (__auto_type l = ps->sfds.head; l; l = l->next) {
-			static const str fake_rtp = STR_CONST_INIT("\x80\x7f\xff\xff\x00\x00\x00\x00"
+			static const str fake_rtp = STR_CONST("\x80\x7f\xff\xff\x00\x00\x00\x00"
 					"\x00\x00\x00\x00");
 			stream_fd *sfd = l->data;
 			if (sfd->socket.fd == -1 || ps->endpoint.address.family == NULL)
 				continue;
 			socket_sendto(&sfd->socket, fake_rtp.s, fake_rtp.len, &ps->endpoint);
-			atomic64_inc(&ps->stats_out.packets);
-			atomic64_add(&ps->stats_out.bytes, fake_rtp.len);
+			atomic64_inc_na(&ps->stats_out->packets);
+			atomic64_add_na(&ps->stats_out->bytes, fake_rtp.len);
 		}
 		ret = CSS_PIERCE_NAT;
 	}
@@ -1152,8 +1223,9 @@ void __rtp_stats_update(GHashTable *dst, struct codec_store *cs) {
 		if (rs)
 			continue;
 
-		rs = g_slice_alloc0(sizeof(*rs));
+		rs = bufferpool_alloc0(shm_bufferpool, sizeof(*rs));
 		rs->payload_type = pt->payload_type;
+		rs->clock_rate = pt->clock_rate;
 		g_hash_table_insert(dst, GINT_TO_POINTER(rs->payload_type), rs);
 	}
 
@@ -1398,7 +1470,7 @@ static void __ice_offer(const sdp_ng_flags *flags, struct call_media *this,
 		if (flags->trickle_ice)
 			MEDIA_SET(this, TRICKLE_ICE);
 	}
-	else if (flags->opmode == OP_REQUEST) {
+	else if (flags->opmode == OP_SUBSCRIBE_REQ) {
 		// leave source media (`other`) alone
 		switch (flags->ice_lite_option) {
 			case ICE_LITE_OFF:
@@ -1425,7 +1497,7 @@ static void __ice_offer(const sdp_ng_flags *flags, struct call_media *this,
 	else if (!MEDIA_ISSET(this, INITIALIZED) || ice_restart) {
 		if (MEDIA_ISSET(this, ICE_LITE_SELF))
 			MEDIA_CLEAR(this, ICE_CONTROLLING);
-		else if (flags->opmode == OP_OFFER || flags->opmode == OP_REQUEST)
+		else if (flags->opmode == OP_OFFER || flags->opmode == OP_SUBSCRIBE_REQ)
 			MEDIA_SET(this, ICE_CONTROLLING);
 		else
 			MEDIA_CLEAR(this, ICE_CONTROLLING);
@@ -1465,9 +1537,46 @@ static void __sdes_flags(struct crypto_params_sdes *cps, const sdp_ng_flags *fla
 		cps->params.session_params.unauthenticated_srtp = 0;
 }
 
+static bool reorder_sdes_preferences(sdes_q *sdes_in, const str_q *offered_order) {
+	if (!sdes_in || !sdes_in->length || !offered_order || !offered_order->length)
+		return false; // nothing to do
+
+	ilog(LOG_DEBUG, "The crypto suites for the offerer may be re-ordered");
+
+	bool ret = false;
+	sdes_list *insert_pos = sdes_in->head; // first preffered suite goes first in the list
+
+	for (str_list *l = offered_order->head; l; l = l->next) {
+		str * cs_name = l->data;
+
+		// find matching suites in `sdes_in` after the current insert position and
+		// move them up
+		__auto_type elem = t_list_find_custom(insert_pos->next, cs_name, crypto_params_sdes_cmp);
+
+		if (!elem)
+			continue;
+
+		// found a match: remove from list at current position and insert at
+		// the insert position, then advance insert position
+		__auto_type cps_found = elem->data;
+
+		ilog(LOG_DEBUG, "Reordering suites for offerer, prioritising: %s (cps tag: %d)",
+				cps_found->params.crypto_suite->name, cps_found->tag);
+
+		t_queue_delete_link(sdes_in, elem);
+		t_queue_insert_before(sdes_in, insert_pos, cps_found);
+		insert_pos = insert_pos->next;
+
+		ret = true;
+	}
+
+	return ret;
+}
+
 /**
  *  Only generates SDES parameters for outgoing SDP, which is our media "out" direction.
- * `other` can be NULL.
+ * `this` is the receiver of the message.
+ * `other` is the sender and can be NULL.
  */
 __attribute__((nonnull(1, 2)))
 static void __generate_crypto(const sdp_ng_flags *flags, struct call_media *this,
@@ -1485,10 +1594,12 @@ static void __generate_crypto(const sdp_ng_flags *flags, struct call_media *this
 	/* preferred crypto suites for the offerer - generated answer */
 	const str_q *offered_order = &flags->sdes_offerer_pref;
 
-	bool is_offer = (flags->opmode == OP_OFFER || flags->opmode == OP_REQUEST);
+	bool is_offer = (flags->opmode == OP_OFFER || flags->opmode == OP_SUBSCRIBE_REQ);
 
 	if (!this->protocol || !this->protocol->srtp || MEDIA_ISSET(this, PASSTHRU)) {
 		crypto_params_sdes_queue_clear(cpq);
+		// reorder received SDES suites towards offerer based on preference
+		reorder_sdes_preferences(offered_cpq, offered_order);
 		/* clear crypto for the this leg b/c we are in passthrough mode */
 		MEDIA_CLEAR(this, DTLS);
 		MEDIA_CLEAR(this, SDES);
@@ -1694,61 +1805,10 @@ static void __generate_crypto(const sdp_ng_flags *flags, struct call_media *this
 		}
 
 		/* set preferences list of crypto suites for the offerer, if given */
-		if ((offered_order && offered_order->head) && (offered_cpq && offered_cpq->head)) {
-			ilog(LOG_DEBUG, "The crypto suites for the offerer will be re-ordered.");
-
-			struct crypto_params_sdes * cps_found;
-			sdes_q offered_cpq_orig_list = *offered_cpq;
-
-			t_queue_init(offered_cpq); /* re-initialize offered crypto suites */
-
-			for (auto_iter(l, offered_order->head); l; l = l->next)
-			{
-				str * cs_name = l->data;
-				__auto_type elem = t_queue_find_custom(&offered_cpq_orig_list, cs_name, crypto_params_sdes_cmp);
-
-				if (!elem)
-					continue;
-
-				cps_found = elem->data;
-
-				/* check sdes_only limitations */
-				if (crypto_params_sdes_check_limitations(flags->sdes_only,
-						flags->sdes_no, cps_found->params.crypto_suite)) {
-					t_queue_delete_link(&offered_cpq_orig_list, elem);
-					crypto_params_sdes_free(cps_found);
-					continue;
-				}
-
-				ilog(LOG_DEBUG, "Reordering suites for offerer, adding: %s (cps tag: %d)",
-					cps_found->params.crypto_suite->name, cps_found->tag);
-
-				/* affects a proper handling of crypto suites ordering,
-				 * when sending processed answer to the media session originator */
-				MEDIA_SET(other, REORDER_FORCED);
-
-				t_queue_push_tail(offered_cpq, cps_found);
-				t_queue_delete_link(&offered_cpq_orig_list, elem);
-			}
-
-			/* now add the rest */
-			while ((cps_found = t_queue_pop_head(&offered_cpq_orig_list)))
-			{
-				ilog(LOG_DEBUG, "Reordering suites for offerer, adding: %s (cps tag: %d)",
-						cps_found->params.crypto_suite->name, cps_found->tag);
-
-				/* check sdes_only limitations */
-				if (crypto_params_sdes_check_limitations(flags->sdes_only,
-						flags->sdes_no, cps_found->params.crypto_suite)) {
-					crypto_params_sdes_free(cps_found);
-					continue;
-				}
-
-				t_queue_push_tail(offered_cpq, cps_found);
-			}
-
-			/* clear older data we are poiting using a copy now */
-			crypto_params_sdes_queue_clear(&offered_cpq_orig_list);
+		if (reorder_sdes_preferences(offered_cpq, offered_order)) {
+			/* affects a proper handling of crypto suites ordering,
+			 * when sending processed answer to the media session originator */
+			MEDIA_SET(other, REORDER_FORCED);
 		}
 	}
 
@@ -2085,7 +2145,6 @@ static void __dtls_logic(const sdp_ng_flags *flags,
 		struct call_media *other_media, struct stream_params *sp)
 {
 	uint64_t tmp;
-	call_t *call = other_media->call;
 
 	/* active and passive are from our POV */
 	tmp = atomic64_get_na(&other_media->media_flags);
@@ -2131,7 +2190,7 @@ static void __dtls_logic(const sdp_ng_flags *flags,
 		__dtls_restart(other_media);
 	}
 
-	call_str_cpy(call, &other_media->tls_id, &sp->tls_id);
+	other_media->tls_id = call_str_cpy(&sp->tls_id);
 
 	MEDIA_CLEAR(other_media, DTLS);
 	if (MEDIA_ISSET2(other_media, SETUP_PASSIVE, SETUP_ACTIVE)
@@ -2181,21 +2240,20 @@ __attribute__((nonnull(2, 3, 4)))
 static void __update_media_id(struct call_media *media, struct call_media *other_media,
 		struct stream_params *sp, const sdp_ng_flags *flags)
 {
-	call_t *call = other_media->call;
 	struct call_monologue *ml = media ? media->monologue : NULL;
 	struct call_monologue *other_ml = other_media->monologue;
 
 	if (flags->opmode == OP_OFFER ||
 		flags->opmode == OP_PUBLISH ||
-		flags->opmode == OP_REQUEST ||
+		flags->opmode == OP_SUBSCRIBE_REQ ||
 		IS_OP_OTHER(flags->opmode))
 	{
 		if (!other_media->media_id.s) {
 			// incoming side: we copy what we received
 			if (sp->media_id.s)
-				call_str_cpy(call, &other_media->media_id, &sp->media_id);
+				other_media->media_id = call_str_cpy(&sp->media_id);
 			if (other_media->media_id.s)
-				g_hash_table_insert(other_ml->media_ids, &other_media->media_id,
+				t_hash_table_insert(other_ml->media_ids, &other_media->media_id,
 						other_media);
 		}
 		else {
@@ -2204,9 +2262,9 @@ static void __update_media_id(struct call_media *media, struct call_media *other
 			if (sp->media_id.s) {
 				if (str_cmp_str(&other_media->media_id, &sp->media_id)) {
 					// mismatch - update
-					g_hash_table_remove(other_ml->media_ids, &other_media->media_id);
-					call_str_cpy(call, &other_media->media_id, &sp->media_id);
-					g_hash_table_insert(other_ml->media_ids, &other_media->media_id,
+					t_hash_table_remove(other_ml->media_ids, &other_media->media_id);
+					other_media->media_id = call_str_cpy(&sp->media_id);
+					t_hash_table_insert(other_ml->media_ids, &other_media->media_id,
 							other_media);
 				}
 			}
@@ -2219,15 +2277,15 @@ static void __update_media_id(struct call_media *media, struct call_media *other
 		if (media && !media->media_id.s) {
 			// outgoing side: we copy from the other side
 			if (other_media->media_id.s)
-				call_str_cpy(call, &media->media_id, &other_media->media_id);
+				media->media_id = call_str_cpy(&other_media->media_id);
 			else if (flags->generate_mid) {
 				// or generate one
 				char buf[64];
 				snprintf(buf, sizeof(buf), "%u", other_media->index);
-				call_str_cpy_c(call, &media->media_id, buf);
+				media->media_id = call_str_cpy_c(buf);
 			}
 			if (media->media_id.s)
-				g_hash_table_insert(ml->media_ids, &media->media_id, media);
+				t_hash_table_insert(ml->media_ids, &media->media_id, media);
 		}
 		else {
 			// we already have a media ID. keep what we have and ignore what's
@@ -2262,8 +2320,8 @@ static void __t38_reset(struct call_media *media, struct call_media *other_media
 
 	media->protocol = other_media->protocol;
 	media->type_id = other_media->type_id;
-	call_str_cpy(media->call, &media->type, &other_media->type);
-	call_str_cpy(media->call, &media->format_str, &other_media->format_str);
+	media->type = call_str_cpy(&other_media->type);
+	media->format_str = call_str_cpy(&other_media->format_str);
 }
 
 __attribute__((nonnull(2, 3, 4)))
@@ -2274,16 +2332,16 @@ static void __update_media_protocol(struct call_media *media, struct call_media 
 	if (str_cmp_str(&other_media->type, &sp->type)) {
 		ilog(LOG_DEBUG, "Updating media type from '" STR_FORMAT "' to '" STR_FORMAT "'",
 				STR_FMT(&other_media->type), STR_FMT(&sp->type));
-		call_str_cpy(other_media->call, &other_media->type, &sp->type);
+		other_media->type = call_str_cpy(&sp->type);
 		other_media->type_id = codec_get_type(&other_media->type);
 		if (media) {
-			call_str_cpy(media->call, &media->type, &sp->type);
+			media->type = call_str_cpy(&sp->type);
 			media->type_id = other_media->type_id;
 		}
 	}
 
 	/* deduct protocol from stream parameters received */
-	call_str_cpy(other_media->call, &other_media->protocol_str, &sp->protocol_str);
+	other_media->protocol_str = call_str_cpy(&sp->protocol_str);
 
 	if (other_media->protocol != sp->protocol) {
 		other_media->protocol = sp->protocol;
@@ -2307,8 +2365,12 @@ static void __update_media_protocol(struct call_media *media, struct call_media 
 						media->protocol = NULL; // reject
 				}
 				// pass through any other protocol change?
-				else if (!flags->protocol_accept)
-					;
+				else if (!flags->protocol_accept) {
+					if (media->protocol && sp->protocol && !media->protocol->osrtp && sp->protocol->osrtp) {
+						ilog(LOG_WARNING, "Ignore OSRTP answer since this was not offered");
+						other_media->protocol = media->protocol;
+					}
+				}
 				else
 					media->protocol = NULL;
 			}
@@ -2319,6 +2381,9 @@ static void __update_media_protocol(struct call_media *media, struct call_media 
 	/* default is to leave the protocol unchanged */
 	if (media && !media->protocol)
 		media->protocol = other_media->protocol;
+
+	if (media && !media->protocol_str.s)
+		media->protocol_str = call_str_cpy(&other_media->protocol_str);
 
 	// handler overrides requested by the user
 
@@ -2343,7 +2408,7 @@ static void __update_media_protocol(struct call_media *media, struct call_media 
 		if (!media->protocol)
 			media->protocol = &transport_protocols[PROTO_RTP_AVP];
 		media->type_id = MT_AUDIO;
-		call_str_cpy_c(media->call, &media->type, "audio");
+		media->type = call_str_cpy_c("audio");
 		return;
 	}
 
@@ -2353,8 +2418,8 @@ static void __update_media_protocol(struct call_media *media, struct call_media 
 	{
 		media->protocol = &transport_protocols[PROTO_UDPTL];
 		media->type_id = MT_IMAGE;
-		call_str_cpy_c(media->call, &media->type, "image");
-		call_str_cpy_c(media->call, &media->format_str, "t38");
+		media->type = call_str_cpy_c("image");
+		media->format_str = call_str_cpy_c("t38");
 		return;
 	}
 
@@ -2391,7 +2456,7 @@ static void codecs_offer(struct call_media *media, struct call_media *other_medi
 	codec_store_offer(&other_media->codecs, &flags->codec_offer, &sp->codecs);
 	if (!other_media->codecs.strip_full)
 		codec_store_offer(&other_media->codecs, &flags->codec_transcode, &sp->codecs);
-	codec_store_check_empty(&other_media->codecs, &sp->codecs);
+	codec_store_check_empty(&other_media->codecs, &sp->codecs, flags);
 	codec_store_accept(&other_media->codecs, &flags->codec_accept, NULL);
 	codec_store_accept(&other_media->codecs, &flags->codec_consume, &sp->codecs);
 	codec_store_track(&other_media->codecs, &flags->codec_mask);
@@ -2424,7 +2489,7 @@ static void codecs_offer(struct call_media *media, struct call_media *other_medi
 	codec_store_strip(&media->codecs, &flags->codec_mask, flags->codec_except);
 	codec_store_offer(&media->codecs, &flags->codec_offer, &sp->codecs);
 	codec_store_transcode(&media->codecs, &flags->codec_transcode, &sp->codecs);
-	codec_store_check_empty(&media->codecs, &sp->codecs);
+	codec_store_check_empty(&media->codecs, &sp->codecs, flags);
 	codec_store_synthesise(&media->codecs, &other_media->codecs);
 
 	// update supp codecs based on actions so far
@@ -2442,6 +2507,9 @@ static void codecs_offer(struct call_media *media, struct call_media *other_medi
 	codec_handlers_update(media, other_media, .flags = flags, .sp = sp, 
 			.allow_asymmetric = !!(flags->allow_asymmetric_codecs),
 			.reset_transcoding = true);
+
+	// keep a copy of the final list of what was offered
+	codec_store_copy(&other_media->offered_codecs, &other_media->codecs);
 }
 
 __attribute__((nonnull(1, 2, 3, 4)))
@@ -2470,7 +2538,10 @@ static void codecs_answer(struct call_media *media, struct call_media *other_med
 				.allow_asymmetric = !!flags->allow_asymmetric_codecs);
 	codec_store_strip(&other_media->codecs, &flags->codec_strip, flags->codec_except);
 	codec_store_offer(&other_media->codecs, &flags->codec_offer, &sp->codecs);
-	codec_store_check_empty(&other_media->codecs, &sp->codecs);
+	codec_store_check_empty(&other_media->codecs, &sp->codecs, flags);
+
+	// restore list of originally offered codecs
+	codec_store_copy(&media->codecs, &media->offered_codecs);
 
 	// update callee side codec handlers again (second pass after the offer) as we
 	// might need to update some handlers, e.g. when supplemental codecs have been
@@ -2481,7 +2552,8 @@ static void codecs_answer(struct call_media *media, struct call_media *other_med
 	ilogs(codec, LOG_DEBUG, "Codec answer for " STR_FORMAT " #%u",
 			STR_FMT(&other_media->monologue->tag),
 			other_media->index);
-	codec_store_answer(&media->codecs, &other_media->codecs, flags);
+	codec_store_answer(&media->codecs, &other_media->codecs, flags,
+			.allow_asymmetric = !!flags->allow_asymmetric_codecs);
 
 	// set up handlers
 	codec_handlers_update(media, other_media, .flags = flags, .sp = sp,
@@ -2517,7 +2589,7 @@ void codecs_offer_answer(struct call_media *media, struct call_media *other_medi
 
 /* called with call->master_lock held in W */
 static void __update_init_subscribers(struct call_media *media, struct stream_params *sp,
-		sdp_ng_flags *flags, enum call_opmode opmode)
+		sdp_ng_flags *flags, enum ng_opmode opmode)
 {
 	if (!media)
 		return;
@@ -2546,8 +2618,15 @@ static void __update_init_subscribers(struct call_media *media, struct stream_pa
 	/* we are now ready to fire up ICE if so desired and requested */
 	ice_update(media->ice_agent, sp, opmode == OP_OFFER); /* sp == NULL: update in case rtcp-mux changed */
 
+	if (sp) {
+		// take over and store received ICE candidates
+		ice_candidates_free(&media->ice_candidates);
+		media->ice_candidates = sp->ice_candidates;
+		t_queue_init(&sp->ice_candidates);
+	}
+
 	recording_setup_media(media);
-	t38_gateway_start(media->t38_gateway);
+	t38_gateway_start(media->t38_gateway, flags ? flags->codec_set : str_case_value_ht_null());
 	audio_player_start(media);
 
 	if (mqtt_publish_scope() == MPS_MEDIA)
@@ -2555,7 +2634,7 @@ static void __update_init_subscribers(struct call_media *media, struct stream_pa
 }
 
 /* called with call->master_lock held in W */
-void update_init_subscribers(struct call_monologue *ml, enum call_opmode opmode) {
+void update_init_subscribers(struct call_monologue *ml, enum ng_opmode opmode) {
 	for (unsigned int i = 0; i < ml->medias->len; i++)
 	{
 		struct call_media *media = ml->medias->pdata[i];
@@ -2565,17 +2644,85 @@ void update_init_subscribers(struct call_monologue *ml, enum call_opmode opmode)
 	}
 }
 
-__attribute__((nonnull(1, 2)))
-static void __call_monologue_init_from_flags(struct call_monologue *ml, sdp_ng_flags *flags) {
+/* called with call->master_lock held in W */
+static void __update_init_medias(const medias_q *medias, enum ng_opmode opmode) {
+	for (auto_iter(l, medias->head); l; l = l->next)
+		__update_init_subscribers(l->data, NULL, NULL, opmode);
+}
+
+/* called with call->master_lock held in W */
+static void __medias_unconfirm(medias_q *medias, const char *reason) {
+	for (auto_iter(l, medias->head); l; l = l->next)
+		__media_unconfirm(l->data, reason);
+}
+
+__attribute__((nonnull(1, 3)))
+static void __call_monologue_init_from_flags(struct call_monologue *ml, struct call_monologue *other_ml,
+		sdp_ng_flags *flags)
+{
 	call_t *call = ml->call;
 
 	call->last_signal = rtpe_now.tv_sec;
 	call->deleted = 0;
+	call->media_rec_slots = (flags->media_rec_slots > 0 && call->media_rec_slots == 0)
+								? flags->media_rec_slots
+								: call->media_rec_slots;
 
 	// consume session attributes
-	t_queue_clear_full(&ml->sdp_attributes, sdp_attr_free);
-	ml->sdp_attributes = flags->session_attributes;
-	t_queue_init(&flags->session_attributes);
+	t_queue_clear_full(&ml->generic_attributes, sdp_attr_free);
+	t_queue_clear_full(&ml->all_attributes, sdp_attr_free);
+	ml->generic_attributes = flags->generic_attributes;
+	t_queue_init(&flags->generic_attributes);
+	ml->all_attributes = flags->all_attributes;
+	t_queue_init(&flags->all_attributes);
+
+	/* set moh flags for future processing */
+	if (flags->moh_sendrecv)
+		ML_SET(ml, MOH_SENDRECV);
+	if (flags->moh_zero_connection)
+		ML_SET(ml, MOH_ZEROCONN);
+	if (flags->moh_blob.len)
+		ml->moh_blob = call_str_cpy(&flags->moh_blob);
+	if (flags->moh_file.len)
+		ml->moh_file = call_str_cpy(&flags->moh_file);
+	if (flags->moh_db_id > 0)
+		/* only set when defined by flags, must be kept then for future offer/answer exchanges */
+		ml->moh_db_id = flags->moh_db_id;
+
+	/* consume sdp session parts */
+	{
+		/* for cases with origin replacements, keep the very first used origin */
+		if (other_ml && !other_ml->session_last_sdp_orig && flags->session_sdp_orig.parsed)
+			other_ml->session_last_sdp_orig = sdp_orig_dup(&flags->session_sdp_orig);
+
+		/* origin (name, version etc.) */
+		if (flags->session_sdp_orig.parsed) {
+			if (ml->session_sdp_orig)
+				sdp_orig_free(ml->session_sdp_orig);
+			ml->session_sdp_orig = sdp_orig_dup(&flags->session_sdp_orig);
+		}
+
+		/* sdp session name */
+		if (flags->session_sdp_name.len &&
+			(!ml->sdp_session_name.len || /* if not set yet */
+			(ml->sdp_session_name.len && !flags->replace_sess_name))) /* replace_sess_name = do not replace if possible*/
+		{
+			ml->sdp_session_name = call_str_cpy(&flags->session_sdp_name);
+		}
+		/* sdp session timing */
+		if (flags->session_timing.len)
+			ml->sdp_session_timing = call_str_cpy(&flags->session_timing);
+		/* sdp bandwidth per session level
+		 * 0 value is supported (e.g. b=RR:0 and b=RS:0), to be able to disable rtcp */
+		ml->sdp_session_bandwidth.as = flags->session_bandwidth.as;
+		ml->sdp_session_bandwidth.rr = flags->session_bandwidth.rr;
+		ml->sdp_session_bandwidth.rs = flags->session_bandwidth.rs;
+		ml->sdp_session_bandwidth.ct = flags->session_bandwidth.ct;
+		ml->sdp_session_bandwidth.tias = flags->session_bandwidth.tias;
+		/* sdp session group */
+		if (flags->session_group.len)
+			ml->sdp_session_group = call_str_cpy(&flags->session_group);
+	}
 
 	// reset offer ipv4/ipv6/mixed media stats
 	if (flags->opmode == OP_OFFER) {
@@ -2593,7 +2740,7 @@ static void __call_monologue_init_from_flags(struct call_monologue *ml, sdp_ng_f
 	__tos_change(call, flags);
 
 	if (flags->label.s) {
-		call_str_cpy(call, &ml->label, &flags->label);
+		ml->label = call_str_cpy(&flags->label);
 		t_hash_table_replace(call->labels, &ml->label, ml);
 	}
 
@@ -2615,20 +2762,19 @@ static void __call_monologue_init_from_flags(struct call_monologue *ml, sdp_ng_f
 #ifdef WITH_TRANSCODING
 	if (flags->recording_announcement) {
 		media_player_new(&ml->rec_player, ml);
-		bool ret = true;
 		media_player_opts_t opts = MPO(
 				.repeat = flags->repeat_times,
+				.duration_spent = flags->repeat_duration,
 				.start_pos = flags->start_pos,
 				.block_egress = !!flags->block_egress,
+				.codec_set = flags->codec_set,
+				.file = flags->file,
+				.blob = flags->blob,
+				.db_id = flags->db_id,
 			);
-		if (flags->file.len)
-			ret = media_player_init_file(ml->rec_player, &flags->file, opts);
-		else if (flags->blob.len)
-			ret = media_player_init_blob(ml->rec_player, &flags->blob, opts);
-		else if (flags->db_id > 0)
-			ret = media_player_init_db(ml->rec_player, flags->db_id, opts);
-		if (!ret)
-			ilog(LOG_WARN, "Failed to initialise media player for recording announcement");
+
+		if (!media_player_add(ml->rec_player, opts))
+			ilog(LOG_WARN, "Failed to add media player for recording announcement");
 	}
 #endif
 }
@@ -2640,13 +2786,11 @@ static void __update_media_label(struct call_media *media, struct call_media *ot
 	if (!media)
 		return;
 
-	call_t *call = media->call;
-
-	if (flags->siprec && flags->opmode == OP_REQUEST) {
+	if (flags->siprec && flags->opmode == OP_SUBSCRIBE_REQ) {
 		if (!media->label.len) {
 			char buf[64];
 			snprintf(buf, sizeof(buf), "%u", other_media->unique_id);
-			call_str_cpy_c(call, &media->label, buf);
+			media->label = call_str_cpy_c(buf);
 		}
 		// put same label on both sides
 		if (!other_media->label.len)
@@ -2659,9 +2803,6 @@ __attribute__((nonnull(1, 3, 4)))
 static void __media_init_from_flags(struct call_media *other_media, struct call_media *media,
 		struct stream_params *sp, sdp_ng_flags *flags)
 {
-	call_t *call = other_media->call;
-	__auto_type additional_attributes = &sp->attributes; /* attributes in str format */
-
 	if (flags->opmode == OP_OFFER && flags->reset) {
 		if (media)
 			MEDIA_CLEAR(media, INITIALIZED);
@@ -2729,6 +2870,7 @@ static void __media_init_from_flags(struct call_media *other_media, struct call_
 		bf_copy_same(&other_media->media_flags, &sp->sp_flags,
 				SHARED_FLAG_RTCP_MUX | SHARED_FLAG_ASYMMETRIC | SHARED_FLAG_UNIDIRECTIONAL |
 				SHARED_FLAG_ICE | SHARED_FLAG_TRICKLE_ICE | SHARED_FLAG_ICE_LITE_PEER |
+				SHARED_FLAG_END_OF_CANDIDATES |
 				SHARED_FLAG_RTCP_FB | SHARED_FLAG_LEGACY_OSRTP | SHARED_FLAG_LEGACY_OSRTP_REV);
 
 		// duplicate the entire queue of offered crypto params
@@ -2746,9 +2888,12 @@ static void __media_init_from_flags(struct call_media *other_media, struct call_
 		 * extmap
 		 * other (unknown type)
 		 */
-		t_queue_clear_full(&other_media->sdp_attributes, sdp_attr_free);
-		other_media->sdp_attributes = *additional_attributes;
-		t_queue_init(additional_attributes);
+		t_queue_clear_full(&other_media->generic_attributes, sdp_attr_free);
+		t_queue_clear_full(&other_media->all_attributes, sdp_attr_free);
+		other_media->generic_attributes = sp->generic_attributes;
+		t_queue_init(&sp->generic_attributes);
+		other_media->all_attributes = sp->all_attributes;
+		t_queue_init(&sp->all_attributes);
 	}
 
 	// codec and RTP payload types handling
@@ -2757,6 +2902,9 @@ static void __media_init_from_flags(struct call_media *other_media, struct call_
 			media->ptime = sp->ptime;
 		if (!MEDIA_ISSET(other_media, PTIME_OVERRIDE))
 			other_media->ptime = sp->ptime;
+	}
+	if (media && sp->maxptime > 0) {
+		media->maxptime = sp->maxptime;
 	}
 	if (media && flags->ptime > 0) {
 		media->ptime = flags->ptime;
@@ -2770,11 +2918,11 @@ static void __media_init_from_flags(struct call_media *other_media, struct call_
 		MEDIA_SET(other_media, PTIME_OVERRIDE);
 	}
 	if (str_cmp_str(&other_media->format_str, &sp->format_str))
-		call_str_cpy(call, &other_media->format_str, &sp->format_str);
+		other_media->format_str = call_str_cpy(&sp->format_str);
 	if (media && str_cmp_str(&media->format_str, &sp->format_str)) {
 		// update opposite side format string only if protocols match
 		if (media->protocol == other_media->protocol)
-			call_str_cpy(call, &media->format_str, &sp->format_str);
+			media->format_str = call_str_cpy(&sp->format_str);
 	}
 
 	/* deduct address family from stream parameters received */
@@ -2787,6 +2935,16 @@ static void __media_init_from_flags(struct call_media *other_media, struct call_
 		if (sp->desired_family)
 			media->desired_family = sp->desired_family;
 	}
+
+	if (flags->opmode == OP_OFFER) {
+		ilog(LOG_DEBUG, "setting other slot to %u, setting slot to %u", flags->media_rec_slot_offer, flags->media_rec_slot_answer);
+		other_media->media_rec_slot = flags->media_rec_slot_offer;
+		if (media)
+			media->media_rec_slot = flags->media_rec_slot_answer;
+	}
+
+	/* bandwidth */
+	other_media->sdp_media_bandwidth = sp->media_session_bandiwdth;
 }
 
 unsigned int proto_num_ports(unsigned int sp_ports, struct call_media *media, sdp_ng_flags *flags,
@@ -2829,116 +2987,188 @@ static void media_update_transcoding_flag(struct call_media *media) {
 		MEDIA_SET(media, TRANSCODING);
 }
 
+/**
+ * For handling sdp media level manipulations (media sessions remove).
+ * This function just adds a fictitious media for this side, pretending it had 0 port.
+ */
+static struct call_media * monologue_add_zero_media(struct call_monologue *sender_ml, struct stream_params *sp,
+	unsigned int *num_ports_other, sdp_ng_flags *flags)
+{
+	struct call_media *sender_media = NULL;
+	sp->rtp_endpoint.port = 0; /* pretend it was a zero stream */
+	sender_media = __get_media(sender_ml, sp, flags, 0);
+	sender_media->media_sdp_id = sp->media_sdp_id;
+	__media_init_from_flags(sender_media, NULL, sp, flags);
+	*num_ports_other = proto_num_ports(sp->num_ports, sender_media, flags,
+			(flags->rtcp_mux_demux || flags->rtcp_mux_accept) ? true : false);
+	__disable_streams(sender_media, *num_ports_other);
+	__init_interface(sender_media, &sp->direction[0], *num_ports_other);
+	return sender_media;
+}
+
 /* called with call->master_lock held in W */
 int monologue_offer_answer(struct call_monologue *monologues[2], sdp_streams_q *streams,
 		sdp_ng_flags *flags)
 {
-	struct call_media *media, *other_media;
+	struct call_media *receiver_media, *sender_media = NULL;
 	struct endpoint_map *em;
-	struct call_monologue *other_ml = monologues[0];
-	struct call_monologue *monologue = monologues[1];
+	struct call_monologue *sender_ml = monologues[0];
+	struct call_monologue *receiver_ml = monologues[1];
 	unsigned int num_ports_this, num_ports_other;
+	bool is_offer = (flags->opmode == OP_OFFER);
+	unsigned int medias_offset = 0; /* media indexes offset for case with media manipulations */
 
 	/* we must have a complete dialogue, even though the to-tag (monologue->tag)
 	 * may not be known yet */
-	if (!other_ml) {
+	if (!sender_ml) {
 		ilog(LOG_ERROR, "Incomplete dialogue association");
 		return -1;
 	}
 
-	__call_monologue_init_from_flags(other_ml, flags);
+	__call_monologue_init_from_flags(sender_ml, receiver_ml, flags);
 
 	if (flags->exclude_recording) {
-		ML_SET(monologue, NO_RECORDING);
-		ML_SET(other_ml, NO_RECORDING);
+		ML_SET(receiver_ml, NO_RECORDING);
+		ML_SET(sender_ml, NO_RECORDING);
 	}
 
-	__C_DBG("this="STR_FORMAT" other="STR_FORMAT, STR_FMT(&monologue->tag), STR_FMT(&other_ml->tag));
+	__C_DBG("this="STR_FORMAT" other="STR_FORMAT, STR_FMT(&receiver_ml->tag), STR_FMT(&sender_ml->tag));
+
+	if (flags->opmode == OP_OFFER)
+		ML_CLEAR(receiver_ml, FINAL_RESPONSE);
+	else if (flags->opmode == OP_ANSWER && flags->message_type == SIP_REPLY && flags->code >= 200)
+		ML_SET(sender_ml, FINAL_RESPONSE);
+	else
+		ML_CLEAR(sender_ml, FINAL_RESPONSE);
 
 	for (__auto_type sp_iter = streams->head; sp_iter; sp_iter = sp_iter->next) {
 		struct stream_params *sp = sp_iter->data;
 		__C_DBG("processing media stream #%u", sp->index);
 		assert(sp->index > 0);
 
-		/* first, check for existence of call_media struct on both sides of
-		 * the dialogue */
-		media = __get_media(monologue, sp, flags, 0);
-		other_media = __get_media(other_ml, sp, flags, 0);
-		media->media_sdp_id = sp->media_sdp_id;
-		other_media->media_sdp_id = sp->media_sdp_id;
+		/**
+		 * for an offer, a sequence in which sender_media->media_subscriptions.head medias are gotten by index, matters.
+		 * This affects later the sequencing of medias, e.g. for subscribe requests.
+		 */
 
-		/* OTHER is the side which has sent the message. SDP parameters in
-		 * "sp" are as advertised by OTHER side. The message will be sent to
-		 * THIS side. Parameters sent to THIS side may be overridden by
+		/* handling of media sessions level manipulations (media sessions remove) */
+		if (is_offer && flags->sdp_media_remove[sp->type_id]) {
+			sender_media = monologue_add_zero_media(sender_ml, sp, &num_ports_other, flags);
+			medias_offset++;
+
+			if (sender_media->logical_intf == NULL)
+				goto error_intf;
+
+			ilog(LOG_DEBUG, "Media type '"STR_FORMAT"' is to be removed by SDP manipulations.", STR_FMT(&sp->type));
+			continue;
+		}
+
+		/* sender's side, get by index */
+		sender_media = __get_media(sender_ml, sp, flags, 0);
+		sender_media->media_sdp_id = sp->media_sdp_id;
+
+		/* receiver's side, try media subscriptions lookup, fall back to index-based lookup */
+		receiver_media = NULL;
+		for (auto_iter(l, sender_media->media_subscriptions.head); l && !receiver_media; l = l->next) {
+			__auto_type ms = l->data;
+			__auto_type r_media = ms->media;
+			if (!r_media)
+				continue;
+			if (r_media->monologue != receiver_ml)
+				continue;
+			/* check type, it must match */
+			if (str_cmp_str(&r_media->type, &sender_media->type))
+				continue;
+			/* check a=mid, it must match if present */
+			if (sender_media->media_id.len && r_media->media_id.len
+					&& str_cmp_str(&sender_media->media_id, &r_media->media_id))
+				continue;
+			/* found it */
+			receiver_media = r_media;
+		}
+		if (!receiver_media) {
+			ilog(LOG_WARNING, "No matching media (index: %d) using subscription, just use an index.", sp->index);
+			receiver_media = __get_media(receiver_ml, sp, flags, sp->index - medias_offset);
+		}
+		receiver_media->media_sdp_id = sp->media_sdp_id;
+
+		/* SDP parameters in "sp" are advertised by sender side.
+		 * Parameters sent to receiver side may be overridden by
 		 * what's in "flags". If this is an answer, or if we have talked to
-		 * THIS side (recipient) before, then the structs will be populated with
+		 * receiver's side before, then the structs will be populated with
 		 * details already. */
 
 		/* if medias still not subscribed to each other, do it now */
-		if (!call_get_media_subscription(media->media_subscribers_ht, other_media) &&
-			!call_get_media_subscription(other_media->media_subscribers_ht, media))
-		{
-			__subscribe_medias_both_ways(media, other_media);
-		}
+		g_auto(medias_q) old_medias = TYPED_GQUEUE_INIT;
+		__subscribe_medias_both_ways(sender_media, receiver_media, is_offer, &old_medias);
 
-		struct media_subscription * ms = call_get_media_subscription(media->media_subscribers_ht, other_media);
+		struct media_subscription * ms = call_get_media_subscription(receiver_media->media_subscribers_ht, sender_media);
 		if (ms)
 			ms->attrs.transcoding = 0;
 
-		__media_init_from_flags(other_media, media, sp, flags);
+		__media_init_from_flags(sender_media, receiver_media, sp, flags);
 
-		codecs_offer_answer(media, other_media, sp, flags);
+		codecs_offer_answer(receiver_media, sender_media, sp, flags);
 
 		/* send and recv are from our POV */
-		bf_copy_same(&media->media_flags, &sp->sp_flags,
+		bf_copy_same(&receiver_media->media_flags, &sp->sp_flags,
 				SP_FLAG_SEND | SP_FLAG_RECV);
-		bf_copy(&other_media->media_flags, MEDIA_FLAG_RECV, &sp->sp_flags, SP_FLAG_SEND);
-		bf_copy(&other_media->media_flags, MEDIA_FLAG_SEND, &sp->sp_flags, SP_FLAG_RECV);
+		bf_copy(&sender_media->media_flags, MEDIA_FLAG_RECV, &sp->sp_flags, SP_FLAG_SEND);
+		bf_copy(&sender_media->media_flags, MEDIA_FLAG_SEND, &sp->sp_flags, SP_FLAG_RECV);
 
 		if (sp->rtp_endpoint.port) {
 			/* DTLS stuff */
-			__dtls_logic(flags, other_media, sp);
+			__dtls_logic(flags, sender_media, sp);
 
 			/* control rtcp-mux */
-			__rtcp_mux_logic(flags, media, other_media);
+			__rtcp_mux_logic(flags, receiver_media, sender_media);
 
 			/* SDES and DTLS */
-			__generate_crypto(flags, media, other_media);
-		}
+			__generate_crypto(flags, receiver_media, sender_media);
 
-		if (media->desired_family->af == AF_INET) {
-			if (flags->opmode == OP_OFFER) {
-				CALL_SET(media->call, IPV4_OFFER);
-			} else if (flags->opmode == OP_ANSWER) {
-				CALL_SET(media->call, IPV4_ANSWER);
-			}
-		} else if (media->desired_family->af == AF_INET6) {
-			if (flags->opmode == OP_OFFER) {
-				CALL_SET(media->call, IPV6_OFFER);
-			} else if (flags->opmode == OP_ANSWER) {
-				CALL_SET(media->call, IPV6_ANSWER);
+			/* set `a=setup:` for the message media type */
+			if (sender_media->type_id == MT_MESSAGE) {
+				/* not from our POV, but from POV of media sent further to destination */
+				bf_copy(&receiver_media->media_flags, MEDIA_FLAG_SETUP_ACTIVE,
+						&sp->sp_flags, SP_FLAG_SETUP_ACTIVE);
+				bf_copy(&receiver_media->media_flags, MEDIA_FLAG_SETUP_PASSIVE,
+						&sp->sp_flags, SP_FLAG_SETUP_PASSIVE);
 			}
 		}
 
-		num_ports_this = proto_num_ports(sp->num_ports, media, flags,
+		if (receiver_media->desired_family->af == AF_INET) {
+			if (flags->opmode == OP_OFFER) {
+				CALL_SET(receiver_media->call, IPV4_OFFER);
+			} else if (flags->opmode == OP_ANSWER) {
+				CALL_SET(receiver_media->call, IPV4_ANSWER);
+			}
+		} else if (receiver_media->desired_family->af == AF_INET6) {
+			if (flags->opmode == OP_OFFER) {
+				CALL_SET(receiver_media->call, IPV6_OFFER);
+			} else if (flags->opmode == OP_ANSWER) {
+				CALL_SET(receiver_media->call, IPV6_ANSWER);
+			}
+		}
+
+		num_ports_this = proto_num_ports(sp->num_ports, receiver_media, flags,
 				flags->rtcp_mux_require ? true : false);
-		num_ports_other = proto_num_ports(sp->num_ports, other_media, flags,
+		num_ports_other = proto_num_ports(sp->num_ports, sender_media, flags,
 				(flags->rtcp_mux_demux || flags->rtcp_mux_accept) ? true : false);
 
 		/* local interface selection */
-		__init_interface(media, &sp->direction[1], num_ports_this);
-		__init_interface(other_media, &sp->direction[0], num_ports_other);
+		__init_interface(receiver_media, &sp->direction[1], num_ports_this);
+		__init_interface(sender_media, &sp->direction[0], num_ports_other);
 
-		if (media->logical_intf == NULL || other_media->logical_intf == NULL) {
+		if (receiver_media->logical_intf == NULL || sender_media->logical_intf == NULL) {
 			goto error_intf;
 		}
 
 		/* ICE stuff - must come after interface and address family selection */
-		__ice_offer(flags, media, other_media, ice_is_restart(other_media->ice_agent, sp));
+		__ice_offer(flags, receiver_media, sender_media, ice_is_restart(sender_media->ice_agent, sp));
 
 
 		/* we now know what's being advertised by the other side */
-		MEDIA_SET(other_media, INITIALIZED);
+		MEDIA_SET(sender_media, INITIALIZED);
 
 
 		if (!sp->rtp_endpoint.port) {
@@ -2946,49 +3176,50 @@ int monologue_offer_answer(struct call_monologue *monologues[2], sdp_streams_q *
 			 * RFC 3264, chapter 6:
 			 * If a stream is rejected, the offerer and answerer MUST NOT
 			 * generate media (or RTCP packets) for that stream. */
-			__disable_streams(media, num_ports_this);
-			__disable_streams(other_media, num_ports_other);
+			__disable_streams(receiver_media, num_ports_this);
+			__disable_streams(sender_media, num_ports_other);
 			continue;
 		}
-		if (is_addr_unspecified(&sp->rtp_endpoint.address) && !MEDIA_ISSET(other_media, TRICKLE_ICE)) {
+		if (is_addr_unspecified(&sp->rtp_endpoint.address) && !MEDIA_ISSET(sender_media, TRICKLE_ICE)) {
 			/* Zero endpoint address, equivalent to setting the media stream
 			 * to sendonly or inactive */
-			MEDIA_CLEAR(media, RECV);
-			MEDIA_CLEAR(other_media, SEND);
+			MEDIA_CLEAR(receiver_media, RECV);
+			MEDIA_CLEAR(sender_media, SEND);
 		}
 
 
 		/* get that many ports for each side, and one packet stream for each port, then
 		 * assign the ports to the streams */
-		em = __get_endpoint_map(media, num_ports_this, &sp->rtp_endpoint, flags, false);
+		em = __get_endpoint_map(receiver_media, num_ports_this, &sp->rtp_endpoint, flags, false);
 		if (!em) {
 			goto error_ports;
 		}
 
-		if (flags->disable_jb && media->call)
-			CALL_SET(media->call, DISABLE_JB);
+		if (flags->disable_jb && receiver_media->call)
+			CALL_SET(receiver_media->call, DISABLE_JB);
 
-		__num_media_streams(media, num_ports_this);
-		__assign_stream_fds(media, &em->intf_sfds);
+		__num_media_streams(receiver_media, num_ports_this);
+		__assign_stream_fds(receiver_media, &em->intf_sfds);
 
-		if (__num_media_streams(other_media, num_ports_other)) {
+		if (__num_media_streams(sender_media, num_ports_other)) {
 			/* new streams created on OTHER side. normally only happens in
 			 * initial offer. create a wildcard endpoint_map to be filled in
 			 * when the answer comes. */
-			if (__wildcard_endpoint_map(other_media, num_ports_other))
+			if (__wildcard_endpoint_map(sender_media, num_ports_other))
 				goto error_ports;
 		}
 
-		__update_init_subscribers(other_media, sp, flags, flags->opmode);
-		__update_init_subscribers(media, NULL, NULL, flags->opmode);
+		__update_init_subscribers(sender_media, sp, flags, flags->opmode);
+		__update_init_subscribers(receiver_media, NULL, NULL, flags->opmode);
+		__update_init_medias(&old_medias, flags->opmode);
 
-		media_update_transcoding_flag(media);
-		media_update_transcoding_flag(other_media);
+		media_update_transcoding_flag(receiver_media);
+		media_update_transcoding_flag(sender_media);
 	}
 
 	// set ipv4/ipv6/mixed media stats
 	if (flags->opmode == OP_OFFER || flags->opmode == OP_ANSWER) {
-		statistics_update_ip46_inc_dec(monologue->call, CMC_INCREMENT);
+		statistics_update_ip46_inc_dec(receiver_ml->call, CMC_INCREMENT);
 	}
 
 	return 0;
@@ -3012,7 +3243,7 @@ static void __unsubscribe_media_link(struct call_media * which, subscription_lis
 	struct media_subscription * rev_ms = ms->link->data;
 	struct call_media * from = ms->media;
 
-	ilog(LOG_DEBUG, "Unsubscribing media with monologue tag '" STR_FORMAT_M "' (index: %d)"
+	ilog(LOG_DEBUG, "Unsubscribing media with monologue tag '" STR_FORMAT_M "' (index: %d) "
 			"from media with monologue tag '" STR_FORMAT_M "' (index: %d)",
 			STR_FMT_M(&which->monologue->tag), which->index,
 			STR_FMT_M(&from->monologue->tag), from->index);
@@ -3049,7 +3280,7 @@ static bool __unsubscribe_media(struct call_media * which, struct call_media * f
 /**
  * Deletes all offer/answer media subscriptions.
  */
-static void __unsubscribe_all_offer_answer_medias(struct call_media * cm) {
+static void __unsubscribe_all_offer_answer_medias(struct call_media * cm, medias_q *medias) {
 	for (__auto_type l = cm->media_subscribers.head; l; )
 	{
 		struct media_subscription * ms = l->data;
@@ -3061,6 +3292,9 @@ static void __unsubscribe_all_offer_answer_medias(struct call_media * cm) {
 
 		__auto_type next = l->next;
 		struct call_media * other_cm = ms->media;
+
+		if (medias)
+			t_queue_push_tail(medias, other_cm);
 
 		__unsubscribe_media(other_cm, cm);
 		__unsubscribe_media(cm, other_cm);
@@ -3154,7 +3388,8 @@ void __add_media_subscription(struct call_media * which, struct call_media * to,
 /**
  * Subscribe medias to each other.
  */
-static void __subscribe_medias_both_ways(struct call_media * a, struct call_media * b)
+static void __subscribe_medias_both_ways(struct call_media * a, struct call_media * b,
+		bool is_offer, medias_q *medias)
 {
 	if (!a || !b)
 		return;
@@ -3177,9 +3412,12 @@ static void __subscribe_medias_both_ways(struct call_media * a, struct call_medi
 	a_attrs.egress = b_attrs.egress = false;
 	a_attrs.rtcp_only = b_attrs.rtcp_only = false;
 
-	/* release existing subscriptions both ways */
-	__unsubscribe_all_offer_answer_medias(a);
-	__unsubscribe_all_offer_answer_medias(b);
+	/* Release existing subscriptions both ways.
+	 * But leave those for SDP offer, if there are any,
+	 * because can be a branched offer. */
+	if (!is_offer)
+		__unsubscribe_all_offer_answer_medias(a, medias);
+	__unsubscribe_all_offer_answer_medias(b, medias);
 
 	/* (re)create, preserving existing attributes if there have been any */
 	__add_media_subscription(a, b, &a_attrs);
@@ -3188,6 +3426,7 @@ static void __subscribe_medias_both_ways(struct call_media * a, struct call_medi
 
 /**
  * Retrieve exsisting media subscriptions for a call monologue.
+ * Checks if given media is in subscriptions/subscribers HT of opposite media.
  */
 struct media_subscription *call_get_media_subscription(subscription_ht ht, struct call_media * cm) {
 	subscription_list *l = t_hash_table_lookup(ht, cm);
@@ -3196,10 +3435,57 @@ struct media_subscription *call_get_media_subscription(subscription_ht ht, struc
 	return l->data;
 }
 
+/**
+ * Retrieve top most media subscription of given media.
+ */
+struct media_subscription *call_media_get_top_ms(struct call_media * cm) {
+	if (cm->media_subscriptions.head)
+		return cm->media_subscriptions.head->data;
+	return NULL;
+}
+
+/**
+ * Retrieve top most media subscription of top media for a given call monologue.
+ * It's useful for offer/answer model cases,
+ * where most of cases single-to-single subscription model is used.
+ */
+struct media_subscription *call_ml_get_top_ms(struct call_monologue *ml) {
+	for (int i = 0; i < ml->medias->len; i++)
+	{
+		struct call_media * media = ml->medias->pdata[i];
+		if (!media)
+			continue;
+		__auto_type subcription = media->media_subscriptions.head;
+		if (subcription)
+			return subcription->data;
+	}
+	return NULL;
+}
+
+/**
+ * Checks if any present audio medias are sendonly/inactive.
+ * Should only be used when medias are already initialized with flags.
+ */
+bool call_ml_sendonly_inactive(struct call_monologue *ml) {
+	for (int i = 0; i < ml->medias->len; i++)
+	{
+		struct call_media * media = ml->medias->pdata[i];
+		if (!media || media->type_id != MT_AUDIO)
+			continue;
+		/* sendonly media for rtpengine means: receive from this media, but don't send to it
+		 * sendonly: !MEDIA_ISSET(media, SEND) && MEDIA_ISSET(media, RECV)
+		 * inactive: !MEDIA_ISSET(media, SEND) && !MEDIA_ISSET(media, RECV)
+		 */
+		if (!MEDIA_ISSET(media, SEND))
+			return true;
+	}
+	return false;
+}
+
 /* called with call->master_lock held in W */
 __attribute__((nonnull(1, 2, 3)))
 int monologue_publish(struct call_monologue *ml, sdp_streams_q *streams, sdp_ng_flags *flags) {
-	__call_monologue_init_from_flags(ml, flags);
+	__call_monologue_init_from_flags(ml, NULL, flags);
 
 	if (flags->exclude_recording)
 		ML_SET(ml, NO_RECORDING);
@@ -3342,7 +3628,7 @@ int monologue_subscribe_request(const subscription_q *srms, struct call_monologu
 	unsigned int index = 1; /* running counter for output/dst medias */
 
 	__unsubscribe_medias_from_all(dst_ml);
-	__call_monologue_init_from_flags(dst_ml, flags);
+	__call_monologue_init_from_flags(dst_ml, NULL, flags);
 
 	g_auto(GQueue) mls = G_QUEUE_INIT; /* to avoid duplications */
 	for (auto_iter(sl, srms->head); sl; sl = sl->next)
@@ -3358,6 +3644,10 @@ int monologue_subscribe_request(const subscription_q *srms, struct call_monologu
 			if (ret)
 				return -1;
 		}
+
+		/* update last used origin: copy from source to the dest monologue */
+		if (src_ml && src_ml->session_last_sdp_orig && !dst_ml->session_last_sdp_orig)
+			dst_ml->session_last_sdp_orig = sdp_orig_dup(src_ml->session_last_sdp_orig);
 	}
 	return 0;
 }
@@ -3460,7 +3750,6 @@ int monologue_unsubscribe(struct call_monologue *dst_ml, sdp_ng_flags *flags) {
 			continue;
 
 		__media_unconfirm(media, "media unsubscribe");
-		__update_init_subscribers(media, NULL, NULL, flags->opmode);
 
 		/* TODO: should we care about subscribers as well? */
 		for (__auto_type l = media->media_subscriptions.head; l; )
@@ -3473,14 +3762,76 @@ int monologue_unsubscribe(struct call_monologue *dst_ml, sdp_ng_flags *flags) {
 				continue;
 
 			__media_unconfirm(src_media, "media unsubscribe");
-			__update_init_subscribers(src_media, NULL, NULL, flags->opmode);
 			__unsubscribe_media_link(media, l);
+			__update_init_subscribers(src_media, NULL, NULL, flags->opmode);
 
 			l = next;
 		}
+
+		__update_init_subscribers(media, NULL, NULL, flags->opmode);
 	}
 
 	return 0;
+}
+
+
+__attribute__((nonnull(1, 2, 3)))
+void dialogue_connect(struct call_monologue *src_ml, struct call_monologue *dst_ml, sdp_ng_flags *flags) {
+	// for each source media, find a usable destination media
+	for (unsigned int i = 0; i < src_ml->medias->len; i++) {
+		__auto_type src_media = src_ml->medias->pdata[i];
+		if (!src_media)
+			continue;
+
+		struct call_media *dst_media = NULL;
+
+		// try a=mid first if there is one
+		if (src_media->media_id.len) {
+			dst_media = t_hash_table_lookup(dst_ml->media_ids, &src_media->media_id);
+			// type must still match
+			if (str_cmp_str(&dst_media->type, &src_media->type))
+				dst_media = NULL;
+		}
+
+		// otherwise try by index
+		if (!dst_media) {
+			for (unsigned int j = 0; j < dst_ml->medias->len; j++) {
+				unsigned int dx = (j + i) % dst_ml->medias->len;
+				dst_media = dst_ml->medias->pdata[dx];
+				if (!dst_media)
+					continue;
+				// if type matches, we can connect
+				if (!str_cmp_str(&dst_media->type, &src_media->type))
+					break;
+				dst_media = NULL;
+			}
+		}
+
+		// anything found?
+		if (!dst_media) {
+			ilog(LOG_WARN, "Unable to find usable media (type '" STR_FORMAT "') to connect call",
+					STR_FMT(&src_media->type));
+			continue;
+		}
+
+		__media_unconfirm(src_media, "connect");
+		__media_unconfirm(dst_media, "connect");
+
+		g_auto(medias_q) medias = TYPED_GQUEUE_INIT;
+
+		__subscribe_medias_both_ways(src_media, dst_media, false, &medias);
+
+		__medias_unconfirm(&medias, "connect");
+
+		codec_handlers_update(src_media, dst_media,
+				.allow_asymmetric = !!flags->allow_asymmetric_codecs);
+		codec_handlers_update(dst_media, src_media,
+				.allow_asymmetric = !!flags->allow_asymmetric_codecs);
+
+		__update_init_subscribers(src_media, NULL, NULL, flags->opmode);
+		__update_init_subscribers(dst_media, NULL, NULL, flags->opmode);
+		__update_init_medias(&medias, flags->opmode);
+	}
 }
 
 
@@ -3603,6 +3954,19 @@ static void __call_cleanup(call_t *c) {
 	recording_finish(c, false);
 }
 
+// rtpe_callhash_lock must be held
+// returns true if call ID was removed
+static bool __remove_call_id_from_hash(str *callid, call_t *c) {
+	call_t *call_ht = NULL;
+	t_hash_table_steal_extended(rtpe_callhash, callid, NULL, &call_ht);
+	if (!call_ht)
+		return false;
+	if (call_ht == c)
+		return true;
+	t_hash_table_insert(rtpe_callhash, &call_ht->callid, call_ht);
+	return false;
+}
+
 /* called lock-free, but must hold a reference to the call */
 void call_destroy(call_t *c) {
 	struct packet_stream *ps=0;
@@ -3616,22 +3980,19 @@ void call_destroy(call_t *c) {
 	}
 
 	rwlock_lock_w(&rtpe_callhash_lock);
-	call_t *call_ht = NULL;
-	t_hash_table_steal_extended(rtpe_callhash, &c->callid, NULL, &call_ht);
-	if (call_ht) {
-		if (call_ht != c) {
-			t_hash_table_insert(rtpe_callhash, &call_ht->callid, call_ht);
-			call_ht = NULL;
-		}
-		else
-			RTPE_GAUGE_DEC(total_sessions);
+	bool removed = __remove_call_id_from_hash(&c->callid, c);
+	for (auto_iter(l, c->callid_aliases.head); l; l = l->next) {
+		__auto_type alias = l->data;
+		if (__remove_call_id_from_hash(alias, c))
+			obj_put(c);
 	}
 	rwlock_unlock_w(&rtpe_callhash_lock);
 
 	// if call not found in callhash => previously deleted
-	if (!call_ht)
+	if (!removed)
 		return;
 
+	RTPE_GAUGE_DEC(total_sessions);
 	obj_put(c);
 
 
@@ -3668,6 +4029,9 @@ void call_destroy(call_t *c) {
 				(unsigned int) (rtpe_now.tv_sec - ml->created) / 60,
 				(unsigned int) (rtpe_now.tv_sec - ml->created) % 60,
 				STR_FMT_M(&ml->viabranch));
+
+		for (__auto_type alias = ml->tag_aliases.head; alias; alias = alias->next)
+			ilog(LOG_DEBUG, "---     Alias: '" STR_FORMAT "'", STR_FMT(alias->data));
 
 		for (unsigned int i = 0; i < ml->medias->len; i++)
 		{
@@ -3741,13 +4105,13 @@ void call_destroy(call_t *c) {
 						FMT_M(addr, ps->endpoint.port),
 						(!PS_ISSET(ps, RTP) && PS_ISSET(ps, RTCP)) ? " (RTCP)" : "",
 						FMT_M(ps->ssrc_in[0] ? ps->ssrc_in[0]->parent->h.ssrc : 0),
-						atomic64_get(&ps->stats_in.packets),
-						atomic64_get(&ps->stats_in.bytes),
-						atomic64_get(&ps->stats_in.errors),
-						rtpe_now.tv_sec - atomic64_get(&ps->last_packet),
-						atomic64_get(&ps->stats_out.packets),
-						atomic64_get(&ps->stats_out.bytes),
-						atomic64_get(&ps->stats_out.errors));
+						atomic64_get_na(&ps->stats_in->packets),
+						atomic64_get_na(&ps->stats_in->bytes),
+						atomic64_get_na(&ps->stats_in->errors),
+						rtpe_now.tv_sec - packet_stream_last_packet(ps),
+						atomic64_get_na(&ps->stats_out->packets),
+						atomic64_get_na(&ps->stats_out->bytes),
+						atomic64_get_na(&ps->stats_out->errors));
 			}
 		}
 
@@ -3821,10 +4185,9 @@ no_stats_output:
 }
 
 
-int call_stream_address46(char *o, struct packet_stream *ps, enum stream_address_format format,
-		int *len, const struct local_intf *ifa, bool keep_unspec)
+int call_stream_address(GString *s, struct packet_stream *ps, enum stream_address_format format,
+		const struct local_intf *ifa, bool keep_unspec)
 {
-	int l = 0;
 	const struct intf_address *ifa_addr;
 
 	if (!ifa) {
@@ -3835,15 +4198,16 @@ int call_stream_address46(char *o, struct packet_stream *ps, enum stream_address
 	}
 	ifa_addr = &ifa->spec->local_address;
 
-	if (format == SAF_NG)
-		l += sprintf(o + l, "%s ", ifa_addr->addr.family->rfc_name);
+	if (format == SAF_NG) {
+		g_string_append(s, ifa_addr->addr.family->rfc_name);
+		g_string_append_c(s, ' ');
+	}
 
 	if (PS_ISSET(ps, ZERO_ADDR) && keep_unspec)
-		l += sprintf(o + l, "%s", ifa_addr->addr.family->unspec_string);
+		g_string_append(s, ifa_addr->addr.family->unspec_string);
 	else
-		l += sprintf(o + l, "%s", sockaddr_print_buf(&ifa->advertised_address.addr));
+		sockaddr_print_gstring(s, &ifa->advertised_address.addr);
 
-	*len = l;
 	return ifa_addr->addr.family->af;
 }
 
@@ -3858,16 +4222,19 @@ void call_media_free(struct call_media **mdp) {
 	t_queue_clear(&md->streams);
 	t_queue_clear(&md->endpoint_maps);
 	codec_store_cleanup(&md->codecs);
+	codec_store_cleanup(&md->offered_codecs);
 	codec_handlers_free(md);
 	codec_handler_free(&md->t38_handler);
 	t38_gateway_put(&md->t38_gateway);
-	t_queue_clear_full(&md->sdp_attributes, sdp_attr_free);
+	t_queue_clear_full(&md->generic_attributes, sdp_attr_free);
+	t_queue_clear_full(&md->all_attributes, sdp_attr_free);
 	t_queue_clear_full(&md->dtmf_recv, dtmf_event_free);
 	t_queue_clear_full(&md->dtmf_send, dtmf_event_free);
 	t_hash_table_destroy(md->media_subscribers_ht);
 	t_hash_table_destroy(md->media_subscriptions_ht);
 	t_queue_clear_full(&md->media_subscribers, media_subscription_free);
 	t_queue_clear_full(&md->media_subscriptions, media_subscription_free);
+	ice_candidates_free(&md->ice_candidates);
 	mutex_destroy(&md->dtmf_lock);
 	g_slice_free1(sizeof(*md), md);
 	*mdp = NULL;
@@ -3876,19 +4243,22 @@ void call_media_free(struct call_media **mdp) {
 void __monologue_free(struct call_monologue *m) {
 	t_ptr_array_free(m->medias, true);
 	g_hash_table_destroy(m->associated_tags);
-	g_hash_table_destroy(m->media_ids);
+	t_hash_table_destroy(m->media_ids);
 	free_ssrc_hash(&m->ssrc_hash);
 	if (m->last_out_sdp)
 		g_string_free(m->last_out_sdp, TRUE);
-	str_free_dup(&m->last_in_sdp);
-	sdp_sessions_clear(&m->last_in_sdp_parsed);
-	t_queue_clear_full(&m->sdp_attributes, sdp_attr_free);
+	if (m->session_sdp_orig)
+		sdp_orig_free(m->session_sdp_orig);
+	if (m->session_last_sdp_orig)
+		sdp_orig_free(m->session_last_sdp_orig);
+	t_queue_clear_full(&m->generic_attributes, sdp_attr_free);
+	t_queue_clear_full(&m->all_attributes, sdp_attr_free);
+	t_queue_clear(&m->tag_aliases);
 	sdp_streams_clear(&m->last_in_sdp_streams);
 	g_slice_free1(sizeof(*m), m);
 }
 
-static void __call_free(void *p) {
-	call_t *c = p;
+static void __call_free(call_t *c) {
 	struct call_monologue *m;
 	struct call_media *md;
 	struct packet_stream *ps;
@@ -3920,6 +4290,7 @@ static void __call_free(void *p) {
 	t_hash_table_destroy(c->tags);
 	t_hash_table_destroy(c->viabranches);
 	t_hash_table_destroy(c->labels);
+	t_queue_clear(&c->callid_aliases);
 
 	while (c->streams.head) {
 		ps = t_queue_pop_head(&c->streams);
@@ -3930,11 +4301,14 @@ static void __call_free(void *p) {
 			ssrc_ctx_put(&ps->ssrc_in[u]);
 		for (unsigned int u = 0; u < G_N_ELEMENTS(ps->ssrc_out); u++)
 			ssrc_ctx_put(&ps->ssrc_out[u]);
+		bufferpool_unref(ps->stats_in);
+		bufferpool_unref(ps->stats_out);
 		g_slice_free1(sizeof(*ps), ps);
 	}
 
-	call_buffer_free(&c->buffer);
-	mutex_destroy(&c->buffer_lock);
+	memory_arena_free(&c->buffer);
+	ice_fragments_cleanup(c->sdp_fragments, true);
+	t_hash_table_destroy(c->sdp_fragments);
 	rwlock_destroy(&c->master_lock);
 
 	assert(c->stream_fds.head == NULL);
@@ -3944,18 +4318,20 @@ static call_t *call_create(const str *callid) {
 	call_t *c;
 
 	ilog(LOG_NOTICE, "Creating new call");
-	c = obj_alloc0("call", sizeof(*c), __call_free);
-	mutex_init(&c->buffer_lock);
-	call_buffer_init(&c->buffer);
+	c = obj_alloc0(call_t, __call_free);
+	memory_arena_init(&c->buffer);
 	rwlock_init(&c->master_lock);
 	c->tags = tags_ht_new();
 	c->viabranches = tags_ht_new();
 	c->labels = labels_ht_new();
-	call_str_cpy(c, &c->callid, callid);
+	call_memory_arena_set(c);
+	c->callid = call_str_cpy(callid);
 	c->created = rtpe_now;
 	c->dtls_cert = dtls_cert();
 	c->tos = rtpe_config.default_tos;
 	c->poller = rtpe_get_poller();
+	c->sdp_fragments = fragments_ht_new();
+	c->redis_hosted_db = -1;
 	if (rtpe_config.cpu_affinity)
 		c->cpu_affinity = call_socket_cpu_affinity++ % rtpe_config.cpu_affinity;
 	else
@@ -4065,8 +4441,163 @@ call_t *call_get(const str *callid) {
 	return ret;
 }
 
+// special version of call_get() to get two calls while avoiding deadlock
+call_get2_ret_t call_get2(call_t **ret1, call_t **ret2, const str *callid1, const str *callid2) {
+	call_get2_ret_t ret;
+
+	while (true) {
+		RWLOCK_R(&rtpe_callhash_lock);
+
+		*ret1 = t_hash_table_lookup(rtpe_callhash, callid1);
+		if (!*ret1)
+			return CG2_NF1;
+		*ret2 = t_hash_table_lookup(rtpe_callhash, callid2);
+		if (!*ret2)
+			return CG2_NF2;
+
+		if (*ret1 == *ret2) {
+			*ret2 = NULL;
+			ret = CG2_SAME;
+			rwlock_lock_w(&(*ret1)->master_lock);
+			obj_hold(*ret1);
+		}
+		else {
+			rwlock_lock_w(&(*ret1)->master_lock);
+			if (rwlock_trylock_w(&(*ret2)->master_lock)) {
+				// try again
+				rwlock_unlock_w(&(*ret1)->master_lock);
+				continue;
+			}
+
+			ret = CG2_OK;
+			obj_hold(*ret1);
+			obj_hold(*ret2);
+		}
+
+		break;
+	}
+
+	log_info_call(*ret1);
+	return ret;
+}
+
+static gboolean fragment_move(str *key, fragment_q *q, void *c) {
+	call_t *call = c;
+	t_hash_table_insert(call->sdp_fragments, key, q);
+	return TRUE;
+}
+
+// both calls must be locked and a reference held. call2 will be released and set to NULL upon return
+bool call_merge(call_t *call, call_t **call2p) {
+	call_t *call2 = *call2p;
+
+	// chcek for tag collisions: duplicate tags are a failure
+	for (auto_iter(l, call2->monologues.head); l; l = l->next) {
+		if (t_hash_table_lookup(call->tags, &l->data->tag))
+			return false;
+	}
+
+	ilog(LOG_DEBUG, "Merging call " STR_FORMAT_M " into " STR_FORMAT_M,
+			STR_FMT_M(&call2->callid), STR_FMT_M(&call->callid));
+
+	// move buffers
+	bencode_buffer_merge(&call->buffer, &call2->buffer);
+
+	// move all contained objects: we have to renumber all unique IDs, and redirect any
+	// `call` pointers
+
+	unsigned int last_id = call->monologues.head->data->unique_id;
+	while (call2->monologues.head) {
+		__auto_type ml = t_queue_pop_head(&call2->monologues);
+		ml->unique_id = ++last_id;
+		ml->call = call;
+		t_queue_push_tail(&call->monologues, ml);
+		t_hash_table_insert(call->tags, &ml->tag, ml);
+		for (auto_iter(l, ml->tag_aliases.head); l; l = l->next)
+			t_hash_table_insert(call->tags, l->data, ml);
+		if (ml->viabranch.len)
+			t_hash_table_insert(call->viabranches, &ml->viabranch, ml);
+		if (ml->label.len)
+			t_hash_table_insert(call->labels, &ml->label, ml);
+	}
+
+	last_id = call->medias.head->data->unique_id;
+	while (call2->medias.head) {
+		__auto_type media = t_queue_pop_head(&call2->medias);
+		media->unique_id = ++last_id;
+		media->call = call;
+		t_queue_push_tail(&call->medias, media);
+	}
+
+	t_hash_table_foreach_remove(call2->sdp_fragments, fragment_move, call);
+
+	last_id = call->streams.head->data->unique_id;
+	while (call2->streams.head) {
+		__auto_type stream = t_queue_pop_head(&call2->streams);
+		stream->unique_id = ++last_id;
+		stream->call = call;
+		t_queue_push_tail(&call->streams, stream);
+	}
+
+	last_id = call->stream_fds.head->data->unique_id;
+	while (call2->stream_fds.head) {
+		__auto_type sfd = t_queue_pop_head(&call2->stream_fds);
+		sfd->unique_id = ++last_id;
+		// call objects are held by reference here
+		if (sfd->call) {
+			obj_put(sfd->call);
+			sfd->call = obj_get(call);
+		}
+		t_queue_push_tail(&call->stream_fds, sfd);
+	}
+
+	last_id = call->endpoint_maps.head->data->unique_id;
+	while (call2->endpoint_maps.head) {
+		__auto_type endpoint_map = t_queue_pop_head(&call2->endpoint_maps);
+		endpoint_map->unique_id = ++last_id;
+		t_queue_push_tail(&call->endpoint_maps, endpoint_map);
+	}
+
+	// redirect hash table entry for old ID. store old ID in new call
+
+	str *old_id = call_str_dup(&call2->callid);
+	t_queue_push_tail(&call->callid_aliases, old_id);
+
+	rwlock_lock_w(&rtpe_callhash_lock);
+
+	call_t *call_ht = NULL;
+	t_hash_table_steal_extended(rtpe_callhash, &call2->callid, NULL, &call_ht);
+	if (call_ht) {
+		if (call_ht != call2) {
+			// already deleted and replace by a different call
+			t_hash_table_insert(rtpe_callhash, &call_ht->callid, call_ht);
+			call_ht = NULL;
+		}
+		else {
+			// insert a new reference under the old call ID
+			t_hash_table_insert(rtpe_callhash, old_id, obj_get(call));
+			RTPE_GAUGE_DEC(total_sessions);
+		}
+	} // else: already deleted
+
+	rwlock_unlock_w(&rtpe_callhash_lock);
+
+	if (call_ht)
+		obj_put(call_ht);
+
+	__call_iterator_remove(call2);
+	mqtt_timer_stop(&call2->mqtt_timer);
+	__call_cleanup(call2);
+
+	rwlock_unlock_w(&call2->master_lock);
+	obj_put(call2);
+	*call2p = NULL;
+
+	return true;
+}
+
 /* returns call with master_lock held in W, or possibly NULL iff opmode == OP_ANSWER */
-call_t *call_get_opmode(const str *callid, enum call_opmode opmode) {
+call_t *call_get_opmode(const str *callid, enum ng_opmode opmode) {
 	if (opmode == OP_OFFER)
 		return call_get_or_create(callid, false);
 	return call_get(callid);
@@ -4090,9 +4621,11 @@ struct call_monologue *__monologue_create(call_t *call) {
 	ret->created = rtpe_now.tv_sec;
 	ret->associated_tags = g_hash_table_new(g_direct_hash, g_direct_equal);
 	ret->medias = medias_arr_new();
-	ret->media_ids = g_hash_table_new(str_hash, str_equal);
+	ret->media_ids = media_id_ht_new();
 	ret->ssrc_hash = create_ssrc_hash_call();
 	ret->sdp_attr_print = sdp_insert_monologue_attributes;
+	/* explicitely set b=RR/b=RS to -1 so it's not considered as 0 inadvertently */
+	RESET_BANDWIDTH(ret->sdp_session_bandwidth, -1);
 
 	gettimeofday(&ret->started, NULL);
 
@@ -4109,11 +4642,30 @@ struct call_monologue *__monologue_create(call_t *call) {
 void __monologue_tag(struct call_monologue *ml, const str *tag) {
 	call_t *call = ml->call;
 
-	__C_DBG("tagging monologue with '"STR_FORMAT"'", STR_FMT(tag));
-	if (ml->tag.s)
-		t_hash_table_remove(call->tags, &ml->tag);	/* remove tag from tags of the call object */
-	call_str_cpy(call, &ml->tag, tag);
-	t_hash_table_insert(call->tags, &ml->tag, ml); 		/* and insert a new one */
+	if (!ml->tag.s) {
+		__C_DBG("tagging monologue with '" STR_FORMAT "'", STR_FMT(tag));
+		ml->tag = call_str_cpy(tag);
+		t_hash_table_insert(call->tags, &ml->tag, ml);
+		return;
+	}
+
+	if (!str_cmp_str(&ml->tag, tag))
+		return; // no change
+
+	// to-tag has changed, save previous as alias
+	__C_DBG("tagging monologue with '" STR_FORMAT "', saving previous '" STR_FORMAT "' as alias",
+			STR_FMT(tag), STR_FMT(&ml->tag));
+	// remove old entry first, as `ml->tag` will be changed
+	t_hash_table_remove(call->tags, &ml->tag);
+	// duplicate string and save as alias
+	str *old_tag = call_str_dup(&ml->tag);
+	t_queue_push_tail(&ml->tag_aliases, old_tag);
+	// add duplicated old tag into hash table
+	t_hash_table_insert(call->tags, old_tag, ml);
+	// update tag to new one
+	ml->tag = call_str_cpy(tag);
+	// and add new one to hash table
+	t_hash_table_insert(call->tags, &ml->tag, ml);
 }
 
 void __monologue_viabranch(struct call_monologue *ml, const str *viabranch) {
@@ -4125,7 +4677,7 @@ void __monologue_viabranch(struct call_monologue *ml, const str *viabranch) {
 	__C_DBG("tagging monologue with viabranch '"STR_FORMAT"'", STR_FMT(viabranch));
 	if (ml->viabranch.s)
 		t_hash_table_remove(call->viabranches, &ml->viabranch);
-	call_str_cpy(call, &ml->viabranch, viabranch);
+	ml->viabranch = call_str_cpy(viabranch);
 	t_hash_table_insert(call->viabranches, &ml->viabranch, ml);
 }
 
@@ -4368,75 +4920,6 @@ static bool call_monologues_associations_left(call_t * c) {
 }
 
 /**
- * Check whether given totag is already subscribed to the given monologue medias.
- * Returns: true - subscribed, false - not subscribed.
- */
-static bool call_totag_subscribed_to_monologue(const str * totag, const struct call_monologue * monologue)
-{
-	if (!totag || !totag->s)
-		return false;
-
-	for (int i = 0; i < monologue->medias->len; i++)
-	{
-		struct call_media * media = monologue->medias->pdata[i];
-		if (!media)
-			continue;
-
-		for (__auto_type subscriber = media->media_subscribers.head;
-			subscriber;
-			subscriber = subscriber->next)
-		{
-			struct media_subscription * ms = subscriber->data;
-			if (!ms->attrs.offer_answer)	/* is this really needed? */
-				continue;
-
-			struct call_monologue * subscriber_monologue = ms->monologue;
-			if (!str_cmp_str(&subscriber_monologue->tag, totag))	/* subscriber found */
-				return true;
-		}
-	}
-	return false;
-}
-/**
- * Check whether given viabranch is intact with a monologue, which owns
- * existing media subscribriptions to it.
- *
- * It tags a monologue, media of which is subscribed to given monologue, using given viabranch,
- * in case previous other side hasn't been tagged with the via-branch
- *
- * Returns: true - intact, false - not intact.
- */
-static bool call_viabranch_intact_monologue(const str * viabranch, struct call_monologue * monologue)
-{
-	for (int i = 0; i < monologue->medias->len; i++)
-	{
-		struct call_media * media = monologue->medias->pdata[i];
-		if (!media)
-			continue;
-
-		for (__auto_type subscriber = media->media_subscribers.head;
-			subscriber;
-			subscriber = subscriber->next)
-		{
-			struct media_subscription * ms = subscriber->data;
-			struct call_monologue * subscriber_monologue = ms->monologue;
-
-			/* check the viabranch. if it's not known, then this is a branched offer and we need
-			* to create a new "other side" for this branch. */
-			if (!subscriber_monologue->viabranch.s) {
-				/* previous "other side" hasn't been tagged with the via-branch, so we'll just
-				* use this one and tag it */
-				__monologue_viabranch(subscriber_monologue, viabranch);
-				return true;
-			}
-			if (!str_cmp_str(&subscriber_monologue->viabranch, viabranch))
-				return true; /* dialogue still intact */
-		}
-	}
-	return false;
-}
-
-/**
  * Based on given From-tag create a new monologue for this dialog,
  * if given tag wasn't present in 'tags' of this call.
  *
@@ -4453,7 +4936,8 @@ static bool call_viabranch_intact_monologue(const str * viabranch, struct call_m
 static int call_get_monologue_new(struct call_monologue *monologues[2], call_t *call,
 		const str *fromtag,
 		const str *totag,
-		const str *viabranch)
+		const str *viabranch,
+		sdp_ng_flags *flags)
 {
 	struct call_monologue *ret, *os = NULL; /* ret - initial offer, os - other side */
 
@@ -4470,38 +4954,26 @@ static int call_get_monologue_new(struct call_monologue *monologues[2], call_t *
 
 	__C_DBG("found existing monologue");
 	/* unkernelize existing monologue medias, which are subscribed to something */
-	__monologue_unconfirm(ret, "signalling on existing monologue");
-	for (int i = 0; i < ret->medias->len; i++)
-	{
-		struct call_media * media = ret->medias->pdata[i];
-		if (!media)
-			continue;
+	dialogue_unconfirm(ret, "signalling on existing monologue");
 
-		for (__auto_type subcription = media->media_subscriptions.head; subcription; subcription = subcription->next) {
-			struct media_subscription * ms = subcription->data;
-			__media_unconfirm(ms->media, "signalling on existing media");
-		}
-	}
-
-	/* If to-tag is presented, confirm that media associations are intact.
+	/* If to-tag is present, retrieve it.
 	 * Create a new monologue for the other side, if the monologue with such to-tag not found.
 	 */
-	if (totag && totag->s &&
-		!call_totag_subscribed_to_monologue(totag, ret))
-	{
+	if (totag && totag->s) {
 		struct call_monologue * monologue = call_get_monologue(call, totag);
 		if (!monologue)
 			goto new_branch;
 	}
 
-	if (!viabranch || call_viabranch_intact_monologue(viabranch, ret)) {
-		goto monologues_intact;
+	if (!viabranch) {
+		/* dialogue complete */
+		goto have_dialogue;
 	} else {
 		os = t_hash_table_lookup(call->viabranches, viabranch);
 		if (os) {
 			/* previously seen branch, use it */
 			__monologue_unconfirm(os, "dialogue/branch association changed");
-			goto monologues_intact;
+			goto have_dialogue;
 		}
 	}
 
@@ -4511,8 +4983,9 @@ new_branch:
 	__C_DBG("create new \"other side\" monologue for viabranch "STR_FORMAT, STR_FMT0(viabranch));
 	os = __monologue_create(call);
 	__monologue_viabranch(os, viabranch);
+	goto finish;
 
-monologues_intact:
+have_dialogue:
 	for (unsigned int i = 0; i < ret->medias->len; i++)
 	{
 		struct call_media *media = ret->medias->pdata[i];
@@ -4525,15 +4998,15 @@ monologues_intact:
 				continue;
 			if (!os)
 				os = ms->monologue;
-			if (totag && totag->s && !ms->monologue->tag.s)
+			if (totag && totag->s)
 				__monologue_tag(ms->monologue, totag);
 			/* There should be only one monologue?
 			 * TODO: check if there's more than one-to-one mapping */
-			goto monologues_intact_finalize;
+			goto finish;
 		}
 	}
 
-monologues_intact_finalize:
+finish:
 	if (G_UNLIKELY(!os))
 		return -1;
 	__tags_associate(ret, os);
@@ -4557,17 +5030,22 @@ monologues_intact_finalize:
 static int call_get_dialogue(struct call_monologue *monologues[2], call_t *call,
 		const str *fromtag,
 		const str *totag,
-		const str *viabranch)
+		const str *viabranch,
+		sdp_ng_flags *flags)
 {
 	struct call_monologue *ft, *tt;
 
 	__C_DBG("getting dialogue for tags '"STR_FORMAT"'<>'"STR_FORMAT"' in call '"STR_FORMAT"'",
 			STR_FMT(fromtag), STR_FMT(totag), STR_FMT(&call->callid));
 
+	/* ft - is always this side's tag (in offer it's message's from-tag, in answer it's message's to-tag)
+	 * tt - is always other side's tag (in offer it's message's to-tag, in answer it's message's from-tag)
+	 */
+
 	/* we start with the to-tag. if it's not known, we treat it as a branched offer */
 	tt = call_get_monologue(call, totag);
 	if (!tt)
-		return call_get_monologue_new(monologues, call, fromtag, totag, viabranch);
+		return call_get_monologue_new(monologues, call, fromtag, totag, viabranch, flags);
 
 	/* if the from-tag is known already, return that */
 	ft = call_get_monologue(call, fromtag);
@@ -4591,38 +5069,54 @@ static int call_get_dialogue(struct call_monologue *monologues[2], call_t *call,
 		}
 		/* it seems ft hasn't seen tt before */
 		goto tag_setup;
+	}
 
 	/* try to determine the monologue from the viabranch,
 	 * or using the top most tt's subscription, if there is one.
 	 * Otherwise just create a brand-new one.
 	 */
-	} else {
-		/* viabranch */
-		if (viabranch)
-			ft = t_hash_table_lookup(call->viabranches, viabranch);
-		/* top most subscription of tt */
-		if (!ft) {
-			struct call_media *media = tt->medias->pdata[0];
-			if (media && media->media_subscriptions.head) {
-				struct media_subscription * ms = media->media_subscriptions.head->data;
-				if (ms->monologue)
-					ft = ms->monologue;
+	if (viabranch)
+		ft = t_hash_table_lookup(call->viabranches, viabranch);
+	/* first possible subscription of tt (other side) */
+	if (!ft) {
+		/* find by any other's side subscriptions (expected one-monologue to one-monologue talk) */
+		for (int i = 0; i < tt->medias->len; i++)
+		{
+			struct call_media *media = tt->medias->pdata[i];
+			if (!media || !media->media_subscriptions.head)
+				continue;
+			struct media_subscription * ms = media->media_subscriptions.head->data;
+			if (ms->monologue) {
+				ft = ms->monologue;
+				__C_DBG("Found existing monologue '" STR_FORMAT "' for this side, by lookup of other side subscriptions",
+						STR_FMT(&ft->tag));
+				break;
 			}
 		}
-		/* otherwise create a brand-new one.
-		 * The lookup of the offer monologue from the answer monologue is only valid,
-		 * if the offer monologue belongs to an unanswered call (empty tag),
-		 * hence `ft->tag` has to be empty at this stage.
-		 */
-		if (!ft || ft->tag.s)
+	}
+	/* otherwise create a brand-new one.
+	 * The lookup of the offer monologue from the answer monologue is only valid,
+	 * if the offer monologue belongs to an unanswered call (empty tag),
+	 * hence `ft->tag` has to be empty at this stage.
+	 */
+	if (!ft)
+		ft = __monologue_create(call);
+	else if (ft->tag.s) {
+		// Allow an updated/changed to-tag in answers unless the flag to
+		// suppress this feature is set. A changed to-tag will be stored
+		// as a tag alias.
+		if (!flags || flags->opmode != OP_ANSWER || flags->new_branch
+				|| (ML_ISSET(ft, FINAL_RESPONSE) && !flags->provisional))
 			ft = __monologue_create(call);
 	}
 
 tag_setup:
+	if (ft == tt)
+		return -1; // it's a hard error to have a monologue talking to itself
+
 	/* the fromtag monologue may be newly created, or half-complete from the totag, or
 	 * derived from the viabranch. */
-	if (!ft->tag.s || str_cmp_str(&ft->tag, fromtag))
-		__monologue_tag(ft, fromtag);
+	__monologue_tag(ft, fromtag);
 
 	dialogue_unconfirm(ft, "dialogue signalling event");
 	dialogue_unconfirm(tt, "dialogue signalling event");
@@ -4646,13 +5140,14 @@ done:
 int call_get_mono_dialogue(struct call_monologue *monologues[2], call_t *call,
 		const str *fromtag,
 		const str *totag,
-		const str *viabranch)
+		const str *viabranch,
+		sdp_ng_flags *flags)
 {
 	/* initial offer */
 	if (!totag || !totag->s)
-		return call_get_monologue_new(monologues, call, fromtag, NULL, viabranch);
+		return call_get_monologue_new(monologues, call, fromtag, NULL, viabranch, flags);
 
-	return call_get_dialogue(monologues, call, fromtag, totag, viabranch);
+	return call_get_dialogue(monologues, call, fromtag, totag, viabranch, flags);
 }
 
 static void media_stop(struct call_media *m) {
@@ -4707,7 +5202,7 @@ static void monologue_stop(struct call_monologue *ml, bool stop_media_subsribers
 // call must be locked in W.
 // unlocks the call and releases the reference prior to returning, even on error.
 int call_delete_branch(call_t *c, const str *branch,
-	const str *fromtag, const str *totag, bencode_item_t *output, int delete_delay)
+	const str *fromtag, const str *totag, ng_command_ctx_t *ctx, int delete_delay)
 {
 	struct call_monologue *ml;
 	int ret;
@@ -4771,9 +5266,6 @@ int call_delete_branch(call_t *c, const str *branch,
 do_delete:
 	c->destroyed = rtpe_now;
 
-	if (output)
-		ng_call_stats(c, fromtag, totag, output, NULL);
-
 	/* stop media player and all medias of ml.
 	 * same for media subscribers */
 	monologue_stop(ml, true);
@@ -4791,9 +5283,15 @@ do_delete:
 	if (!del_stop)
 		goto del_all;
 
+	if (ctx)
+		ng_call_stats(ctx, c, fromtag, totag, NULL);
+
 	goto success_unlock;
 
 del_all:
+	if (ctx)
+		ng_call_stats(ctx, c, NULL, NULL, NULL);
+
 	for (__auto_type i = c->monologues.head; i; i = i->next) {
 		ml = i->data;
 		monologue_stop(ml, false);
@@ -4835,12 +5333,12 @@ out:
 
 
 int call_delete_branch_by_id(const str *callid, const str *branch,
-	const str *fromtag, const str *totag, bencode_item_t *output, int delete_delay)
+	const str *fromtag, const str *totag, ng_command_ctx_t *ctx, int delete_delay)
 {
 	call_t *c = call_get(callid);
 	if (!c) {
 		ilog(LOG_INFO, "Call-ID to delete not found");
 		return -1;
 	}
-	return call_delete_branch(c, branch, fromtag, totag, output, delete_delay);
+	return call_delete_branch(c, branch, fromtag, totag, ctx, delete_delay);
 }

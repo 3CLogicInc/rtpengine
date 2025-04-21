@@ -556,7 +556,7 @@ static int rtcp_rr(struct rtcp_chain_element *el, struct rtcp_process_ctx *log_c
 static int rtcp_sdes(struct rtcp_chain_element *el, struct rtcp_process_ctx *log_ctx) {
 	CAH(sdes_list_start, el->sdes);
 
-	str comp_s = STR_INIT_LEN(el->sdes->chunks, el->len - sizeof(el->sdes->header));
+	str comp_s = STR_LEN(el->sdes->chunks, el->len - sizeof(el->sdes->header));
 	int i = 0;
 	while (1) {
 		struct sdes_chunk *sdes_chunk = (struct sdes_chunk *) comp_s.s;
@@ -614,7 +614,7 @@ static void xr_voip_metrics(struct xr_rb_voip_metrics *rb, struct rtcp_process_c
 
 static int rtcp_xr(struct rtcp_chain_element *el, struct rtcp_process_ctx *log_ctx) {
 	CAH(common, el->rtcp_packet);
-	str comp_s = STR_INIT_LEN(el->buf + sizeof(el->xr->rtcp), el->len - sizeof(el->xr->rtcp));
+	str comp_s = STR_LEN(el->buf + sizeof(el->xr->rtcp), el->len - sizeof(el->xr->rtcp));
 	while (1) {
 		struct xr_report_block *rb = (void *) comp_s.s;
 		if (comp_s.len < sizeof(*rb))
@@ -774,13 +774,13 @@ INLINE int check_session_keys(struct crypto_context *c) {
 		goto error;
 
 	err = "Failed to generate SRTCP session keys";
-	str_init_len_assert(&s, c->session_key, c->params.crypto_suite->session_key_len);
+	s = STR_LEN_ASSERT(c->session_key, c->params.crypto_suite->session_key_len);
 	if (crypto_gen_session_key(c, &s, 0x03, SRTCP_R_LENGTH))
 		goto error;
-	str_init_len_assert(&s, c->session_auth_key, c->params.crypto_suite->srtcp_auth_key_len);
+	s = STR_LEN_ASSERT(c->session_auth_key, c->params.crypto_suite->srtcp_auth_key_len);
 	if (crypto_gen_session_key(c, &s, 0x04, SRTCP_R_LENGTH))
 		goto error;
-	str_init_len_assert(&s, c->session_salt, c->params.crypto_suite->session_salt_len);
+	s = STR_LEN_ASSERT(c->session_salt, c->params.crypto_suite->session_salt_len);
 	if (crypto_gen_session_key(c, &s, 0x05, SRTCP_R_LENGTH))
 		goto error;
 
@@ -842,6 +842,7 @@ error:
 /* rfc 3711 section 3.4 */
 int rtcp_avp2savp(str *s, struct crypto_context *c, struct ssrc_ctx *ssrc_ctx) {
 	struct rtcp_packet *rtcp;
+	unsigned int i;
 	uint32_t *idx;
 	str to_auth, payload;
 
@@ -852,14 +853,14 @@ int rtcp_avp2savp(str *s, struct crypto_context *c, struct ssrc_ctx *ssrc_ctx) {
 	if (check_session_keys(c))
 		return -1;
 
+	i = atomic_get_na(&ssrc_ctx->stats->rtcp_seq);
 	crypto_debug_init(1);
-	crypto_debug_printf("RTCP SSRC %" PRIx32 ", idx %" PRIu64 ", plain pl: ",
-			rtcp->ssrc, ssrc_ctx->srtcp_index);
+	crypto_debug_printf("RTCP SSRC %" PRIx32 ", idx %u, plain pl: ",
+			rtcp->ssrc, i);
 	crypto_debug_dump(&payload);
 
 	int prev_len = payload.len;
-	if (!c->params.session_params.unencrypted_srtcp && crypto_encrypt_rtcp(c, rtcp, &payload,
-				ssrc_ctx->srtcp_index))
+	if (!c->params.session_params.unencrypted_srtcp && crypto_encrypt_rtcp(c, rtcp, &payload, i))
 		return -1;
 	s->len += payload.len - prev_len;
 
@@ -867,9 +868,9 @@ int rtcp_avp2savp(str *s, struct crypto_context *c, struct ssrc_ctx *ssrc_ctx) {
 	crypto_debug_dump(&payload);
 
 	idx = (void *) s->s + s->len;
-	*idx = htonl((c->params.session_params.unencrypted_srtcp ? 0ULL : 0x80000000ULL) |
-			ssrc_ctx->srtcp_index++);
+	*idx = htonl((c->params.session_params.unencrypted_srtcp ? 0ULL : 0x80000000ULL) | i);
 	s->len += sizeof(*idx);
+	atomic_inc_na(&ssrc_ctx->stats->rtcp_seq);
 
 	to_auth = *s;
 
@@ -1322,7 +1323,7 @@ static void transcode_rr(struct rtcp_process_ctx *ctx, struct report_block *rr) 
 
 	// substitute our own values
 	
-	unsigned int packets = atomic64_get(&input_ctx->packets);
+	unsigned int packets = atomic64_get(&input_ctx->stats->packets);
 
 	// we might not be keeping track of stats for this SSRC (handler_func_passthrough_ssrc).
 	// just leave the values in place.
@@ -1352,7 +1353,7 @@ static void transcode_rr(struct rtcp_process_ctx *ctx, struct report_block *rr) 
 	else
 		rr->fraction_lost = tot_lost * 256 / (packets + lost);
 
-	rr->high_seq_received = htonl(atomic64_get(&input_ctx->last_seq));
+	rr->high_seq_received = htonl(atomic_get_na(&input_ctx->stats->ext_seq));
 	// XXX jitter, last SR
 
 out:
@@ -1367,7 +1368,7 @@ static void transcode_sr(struct rtcp_process_ctx *ctx, struct sender_report_pack
 		return;
 	if (!ctx->mp->ssrc_out)
 		return;
-	unsigned int packets = atomic64_get(&ctx->mp->ssrc_out->packets);
+	unsigned int packets = atomic64_get(&ctx->mp->ssrc_out->stats->packets);
 
 	// we might not be keeping track of stats for this SSRC (handler_func_passthrough_ssrc).
 	// just leave the values in place.
@@ -1375,9 +1376,9 @@ static void transcode_sr(struct rtcp_process_ctx *ctx, struct sender_report_pack
 		return;
 
 	// substitute our own values
-	sr->octet_count = htonl(atomic64_get(&ctx->mp->ssrc_out->octets));
+	sr->octet_count = htonl(atomic64_get(&ctx->mp->ssrc_out->stats->bytes));
 	sr->packet_count = htonl(packets);
-	sr->timestamp = htonl(atomic64_get(&ctx->mp->ssrc_out->last_ts));
+	sr->timestamp = htonl(atomic_get_na(&ctx->mp->ssrc_out->stats->timestamp));
 	// XXX NTP timestamp
 }
 
@@ -1465,7 +1466,7 @@ static GString *rtcp_sender_report(struct ssrc_sender_report *ssr,
 			mutex_unlock(&se->h.lock);
 
 			uint64_t lost = se->packets_lost;
-			uint64_t tot = atomic64_get(&s->packets);
+			uint64_t tot = atomic64_get(&s->stats->packets);
 
 			*rr = (struct report_block) {
 				.ssrc = htonl(s->parent->h.ssrc),
@@ -1473,7 +1474,7 @@ static GString *rtcp_sender_report(struct ssrc_sender_report *ssr,
 				.number_lost[0] = (lost >> 16) & 0xff,
 				.number_lost[1] = (lost >> 8) & 0xff,
 				.number_lost[2] = lost & 0xff,
-				.high_seq_received = htonl(atomic64_get(&s->last_seq)),
+				.high_seq_received = htonl(atomic_get_na(&s->stats->ext_seq)),
 				.lsr = htonl(ntp_middle_bits),
 				.dlsr = htonl(tv_diff * 65536 / 1000000),
 				.jitter = htonl(jitter >> 4),
@@ -1486,7 +1487,7 @@ static GString *rtcp_sender_report(struct ssrc_sender_report *ssr,
 					.ssrc = s->parent->h.ssrc,
 					.fraction_lost = lost * 256 / (tot + lost),
 					.packets_lost = lost,
-					.high_seq_received = atomic64_get(&s->last_seq),
+					.high_seq_received = atomic_get_na(&s->stats->ext_seq),
 					.lsr = ntp_middle_bits,
 					.dlsr = tv_diff * 65536 / 1000000,
 					.jitter = jitter >> 4,
@@ -1544,7 +1545,7 @@ void rtcp_receiver_reports(GQueue *out, struct ssrc_hash *hash, struct call_mono
 		struct ssrc_ctx *i = &e->input_ctx;
 		if (i->ref != ml)
 			continue;
-		if (!atomic64_get(&i->packets))
+		if (!atomic64_get_na(&i->stats->packets))
 			continue;
 
 		ssrc_ctx_hold(i);
@@ -1575,8 +1576,6 @@ void rtcp_send_report(struct call_media *media, struct ssrc_ctx *ssrc_out) {
 	if (ps->selected_sfd->socket.fd == -1 || ps->endpoint.address.family == NULL)
 		return;
 
-	media_update_stats(media);
-
 	log_info_stream_fd(ps->selected_sfd);
 
 	GQueue rrs = G_QUEUE_INIT;
@@ -1590,21 +1589,21 @@ void rtcp_send_report(struct call_media *media, struct ssrc_ctx *ssrc_out) {
 
 	GString *sr = rtcp_sender_report(&ssr, ssrc_out->parent->h.ssrc,
 			ssrc_out->ssrc_map_out ? : ssrc_out->parent->h.ssrc,
-			atomic64_get(&ssrc_out->last_ts),
-			atomic64_get(&ssrc_out->packets),
-			atomic64_get(&ssrc_out->octets),
+			atomic_get_na(&ssrc_out->stats->timestamp),
+			atomic64_get_na(&ssrc_out->stats->packets),
+			atomic64_get(&ssrc_out->stats->bytes),
 			&rrs, &srrs);
 
 	// handle crypto
 
-	str rtcp_packet = STR_INIT_GS(sr);
+	str rtcp_packet = STR_GS(sr);
 
 	const struct streamhandler *crypt_handler = determine_handler(&transport_protocols[PROTO_RTP_AVP],
 			media, true);
 
 	if (crypt_handler && crypt_handler->out->rtcp_crypt) {
 		g_string_set_size(sr, sr->len + RTP_BUFFER_TAIL_ROOM);
-		rtcp_packet = STR_INIT_LEN(sr->str, sr->len - RTP_BUFFER_TAIL_ROOM);
+		rtcp_packet = STR_LEN(sr->str, sr->len - RTP_BUFFER_TAIL_ROOM);
 		crypt_handler->out->rtcp_crypt(&rtcp_packet, ps, ssrc_out);
 	}
 
@@ -1616,8 +1615,6 @@ void rtcp_send_report(struct call_media *media, struct ssrc_ctx *ssrc_out) {
 		struct sink_handler *sh = l->data;
 		struct packet_stream *sink = sh->sink;
 		struct call_media *other_media = sink->media;
-
-		media_update_stats(other_media);
 
 		ssrc_sender_report(other_media, &ssr, &rtpe_now);
 		for (GList *k = srrs.head; k; k = k->next) {

@@ -8,13 +8,16 @@
 struct rtpengine_config rtpe_config;
 struct global_stats_gauge rtpe_stats_gauge;
 struct global_gauge_min_max rtpe_gauge_min_max;
-struct global_stats_counter rtpe_stats;
+struct global_stats_counter *rtpe_stats;
 struct global_stats_counter rtpe_stats_rate;
 struct global_stats_counter rtpe_stats_intv;
 struct global_stats_sampled rtpe_stats_sampled;
 struct global_sampled_min_max rtpe_sampled_min_max;
 struct global_sampled_min_max rtpe_sampled_graphite_min_max;
 struct global_sampled_min_max rtpe_sampled_graphite_min_max_sampled;
+__thread struct bufferpool *media_bufferpool;
+void append_thread_lpr_to_glob_lpr(void) {}
+struct bufferpool *shm_bufferpool;
 
 static void most_cmp(struct payload_tracker *t, const char *cmp, const char *file, int line) {
 	char buf[1024] = "";

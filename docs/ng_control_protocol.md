@@ -63,6 +63,7 @@ Currently the following commands are defined:
 * subscribe request
 * subscribe answer
 * unsubscribe
+* connect
 
 The response dictionary must contain at least one key called `result`.
 The value can be either `ok` or `error`.
@@ -119,7 +120,11 @@ will automatically be supported without having to worry about support in the con
 
 When the flags are passed to rtpengine, they are formated as following:
 
-	{ "rtpp_flags": "replace-origin replace-session-connection via-branch=auto-next strict-source label=callee OSRTP-accept transport-protocol=RTP/AVP address-family=IP4" }
+	{ "rtpp_flags": "replace-origin via-branch=auto-next strict-source label=callee OSRTP-accept transport-protocol=RTP/AVP address-family=IP4" }
+
+Lists and dictionaries are supported in this format using square brackets `[ ]`, for example:
+
+	{ "rtpp_flags": "via-branch=auto-next OSRTP=[accept] codec=[transcode=[PCMA PCMU] accept=[AMR-WB AMR] strip=[EVS]]" }
 
 Regardless whether the flags parsing is done by the module or daemon,
 a functional behavior remains the same and has no difference in terms of SDP processing.
@@ -208,6 +213,12 @@ Optionally included keys are:
 	interfaces, whether or not they are configured using the `BASE:SUFFIX` interface name notation.
 	This special keyword is provided only for legacy support and should be considered obsolete.
 	It will be removed in future versions.
+
+    For commands that require only one interface (e.g. `publish`), use the
+    `interface=...` key. For commands that require two interfaces, as an
+    alternative to the `direction=` key, the two interfaces can be listed
+    separately, using `from-interface=...` for the first interface and
+    `to-interface=...` for the second one.
 
 * `digit` or `code`
 
@@ -310,6 +321,12 @@ Optionally included keys are:
 * `endpoint-learning`
 
 	Contains one of the strings `off`, `immediate`, `delayed` or `heuristic`. This tells rtpengine which endpoint learning algorithm to use and overrides the `endpoint-learning` configuration option. This option can also be put into the `flags` list using a prefix of `endpoint-learning-`.
+
+* `from-interface`
+
+    Contains a string identifying the network interface pertaining to the
+    "received from" direction of this message. Identical to setting the first
+    `direction=` value.
 
 * `frequency` or `frequencies`
 
@@ -556,6 +573,22 @@ Optionally included keys are:
 		Reject rtcp-mux if it has been offered. Can be used together with `offer` to achieve the opposite
 		effect of `demux`.
 
+* `SIP message type`
+
+    Contains a string indicating whether the SIP message that triggered this
+    signalling message was either a `SIP request` or a `SIP response`.
+
+* `SIP code`
+
+    Contains an integer corresponding to the SIP response code (e.g. 180 or
+    200) if this signalling message was triggered by a SIP response.
+
+* `template`
+
+    Contains the name of a signalling template to be used for this particular
+    control message. See documentation for *SIGNALLING TEMPLATES* in the man
+    page.
+
 * `via-branch`
 
 	The SIP `Via` branch as string. Used to additionally refine the matching logic between media streams
@@ -704,6 +737,12 @@ Optionally included keys are:
 		*rtpengine* responds with the string `load limit` in the `result` key of the response
 		dictionary. The response dictionary may also contain the optional key `message` with
 		an explanatory string. No other key is required in the response dictionary.
+
+* `to-interface`
+
+    Contains a string identifying the network interface pertaining to the
+    "going to" direction of this message. Identical to setting the second
+    `direction=` value.
 
 * `to-label`
 
@@ -861,6 +900,18 @@ Spaces in each string may be replaced by hyphens.
     Note that payload type number translation will not be performed in this
     situation.
 
+* `allow no codec media`
+
+    Enables special handling for SDP media sections (`m=` lines) that are left
+    without any codecs after codec manipulation operations (in particular codec
+    stripping) have been performed. By default without this option set, a media
+    section without any codecs would be considered a usage error, and the
+    original list of codecs would be restored so that media flow can be
+    established. With this option set, a media section without any codecs would
+    be considered intentionally so, and would be converted to a rejected or
+    removed media section, that is a media section with a zero port, a dummy
+    format list, and further attributes.
+
 * `allow transcoding`
 
 	This flag is only useful in commands that provide an explicit answer SDP to *rtpengine*
@@ -984,6 +1035,24 @@ Spaces in each string may be replaced by hyphens.
 	direction before sending packets out, which could result in an
 	automated firewall block.
 
+* `new branch`
+
+    If *rtpengine* receives an answer from a to-tag that hasn't previously seen
+    and no corresponding call party is known (created from a previous offer),
+    previously it would treat this is a separate new call branch, create a
+    brand new internal call party, and dissociate the previous one. This may
+    lead to unexpected results as this new call party has been created without
+    the same initialisation as was done for the original one, and so may be
+    left with incorrect or incomplete data (e.g.  SRTP keys, codec information,
+    interface bindings, etc).
+
+    Improve this by treating an unexpected and unseen to-tag as an alias to the
+    already existing to-tag. Going forward both tags can then be used
+    interchangeably to refer to the same monologue.
+
+    This flag suppresses this new behaviour, in case some situation is made
+    worse by it.
+
 * `no port latching`
 
 	Port latching is enabled by default for endpoints which speak
@@ -1018,6 +1087,13 @@ Spaces in each string may be replaced by hyphens.
 
 	Forces *rtpengine* to retain its local ports during a signalling exchange even when the
 	remote endpoint changes its port.
+
+* `provisional`
+
+    Disables special behaviour when operating on a message that was triggered
+    by a SIP response with a non-provisional (>= 200) status code.
+    Specifically, setting this flag allows for changed or updated to-tag even
+    after a final SIP response has been received.
 
 * `record call`
 
@@ -1124,6 +1200,14 @@ Spaces in each string may be replaced by hyphens.
 
 	When this flag is present, kernelize also one-way rtp media.
 
+* `WebRTC`
+
+    Shortcut alias for several other flags that must be set when talking to a
+    WebRTC client. Currently an alias for (subject to change):
+    `transport-protocol=UDP/TLS/RTP/SAVPF` `ICE=force` `tricke-ICE`
+    `rtcp-mux-offer` `rtcp-mux-require` `no-rtcp-attribute` `SDES-off`
+    `generate-mid`
+
 **Optionally included replace-flags are:**
 
 Similar to the usual `flags` list, but this one controls which parts of the SDP body should be rewritten.
@@ -1135,17 +1219,18 @@ Contains zero or more of:
 
 * `origin`
 
-	Replace the address found in the *origin* (o=) line of the SDP body. Corresponds
-	to *rtpproxy* `o` flag.
+	Replace the address found in the *origin* (o=) line of the SDP body.
+
+* `origin-full`
+
+	Replace whole *origin* (o=) line of the SDP body, so that all origin fields
+	in the `o=` line always remain the same in all SDPs going to a
+	particular RTP endpoint. A behavior in relation to the address field is the same
+	as by the `origin` option flag.
 
 * `session name` or `session-name`
 
 	Same as `username` but for the entire contents of the `s=` line.
-
-* `session connection` or `session-connection`
-
-	Replace the address found in the *session-level connection* (c=) line of the SDP body.
-	Corresponds to *rtpproxy* `c` flag.
 
 * `SDP version` or `SDP-version`
 
@@ -1505,7 +1590,7 @@ An example of a complete `offer` request dictionary could be (SDP body abbreviat
 
 	{ "command": "offer", "call-id": "cfBXzDSZqhYNcXM", "from-tag": "mS9rSAn0Cr",
 	"sdp": "v=0\r\no=...", "via-branch": "5KiTRPZHH1nL6",
-	"flags": [ "trust address" ], "replace": [ "origin", "session connection" ],
+	"flags": [ "trust address" ], "replace": [ "origin" ],
 	"address family": "IP6", "received-from": [ "IP4", "10.65.31.43" ],
 	"ICE": "force", "transport protocol": "RTP/SAVPF", "media address": "2001:d8::6f24:65b",
 	"DTLS": "passive" }
@@ -1516,6 +1601,35 @@ SDP body that the SIP proxy should insert into the SIP message.
 Example response:
 
 	{ "result": "ok", "sdp": "v=0\r\no=..." }
+
+**Optionally included SDP media manipulations:**
+
+`sdp-media-remove` contains a list pointing, which media types are to be removed from SDP.
+
+This does affect an outgoing SDP offer. So it's meant to manipulate an SDP body,
+which rtpengine generates during the offer processing. The removed media type will be then
+not taken into consideration during further processing.
+
+When this flag is added, rtpengine will not show concerned media type(s), hence media section(s)
+to the recipient's side. Therefore, later on the recipient side will provide only an answer
+for those media section(s) shown to it.
+
+Upon processing such an answer coming back to the changed SDP offer,
+rtpengine will just add a zeroed media towards the originator's side in order to fulfill RFC
+requirements telling to use a zeroed media for those unaccepted media sections.
+
+Usage syntax:
+
+		"sdp-media-remove" : ["<media-type>", "<media-type>", ...]
+
+Examples:
+
+* Remove all occurences of the video media type:
+
+		"sdp-media-remove" : ["video"]
+
+IANA-registered media types are understood, or the special type `other` can be
+given to remove all media sections with types that are not understood.
 
 ## `answer` Message
 
@@ -1537,6 +1651,14 @@ of zero or more strings. The following flags are defined:
 	(such as unknown call-ID) shall
 	result in an error reply (i.e. `"result": "error"`). The default is to reply with a warning only
 	(i.e. `"result": "ok", "warning": ...`).
+
+* `to-tag`
+
+	This flag controls whether the `"To"` tag's value is honoured or ignored when handling
+	delete messages. Normally, the `"To"` tag's value is always included when present,
+	but can be disregarded for the `"delete"` type of messages.
+	So that, including the `"To-tag"` option flag in the `"delete"` message,
+	forces to honour it and hence allows to be more selective about monologues within a dialog to be torn down.
 
 Other optional keys are:
 
@@ -1947,6 +2069,8 @@ Starts playback of a provided media file to the selected call participant. The f
 can be anything that is supported by *ffmpeg*, for example a `.wav` or `.mp3` file. It will automatically
 be resampled and transcoded to the appropriate sampling rate and codec. The selected participant's first
 listed (preferred) codec that is supported will be chosen for this purpose.
+Encoder parameters such as bit rate can be set via the `codec-set` list
+described above.
 
 Media files can be provided through one of these keys:
 
@@ -1970,6 +2094,17 @@ Media files can be provided through one of these keys:
 * `repeat-times`
 
 	Contains an integer. How many times to repeat playback of the media. Default is 1.
+
+* `repeat-duration`
+
+	Contains an integer. How much time in milliseconds is a playback of the media to be minimally iterated.
+	E.g. if set to 10000ms and the playback's length is 1000ms, then this playback will be iterated
+	10 times due to limitation set to 10000ms.
+	If used together with `repeat-times` then the following logic takes place:
+	if `repeat-duration` hits the trigger earlier, then this playback will be stopped,
+	otherwise if the `repeat-duration` is still positive, but the `repeat-times` counter went down to 1,
+	then still the playback is to be stopped.
+	By default is disabled.
 
 * `start-pos`
 
@@ -2012,6 +2147,97 @@ received during a generated DTMF event will be suppressed.
 The call must be marked for DTMF injection using the `inject DTMF` flag used in both `offer` and `answer`
 messages. Enabling this flag forces all audio to go through the transcoding engine, even if input and output
 codecs are the same (similar to DTMF transcoding, see above).
+
+## Music on hold functionality (MoH)
+
+Only available if compiled with transcoding support.
+
+This functionality is available only for the offer/answer model, hence no other scenarios like
+publish or subscription related are supported with it.
+
+The concept — is that MoH capabilities get advertised always at the beginning of
+the call (original offer/answer exchange) and can be used later on to put the other side on hold.
+
+MoH can be can be added for both sides: offerer and answerer.
+Hence, for the offerer one will advertisde MoH support when calling `rtpengine_offer()` (or `rtpengine_manage()`)
+and for the answerer side when calling `rtpengine_answer()` (or again `rtpengine_manage()`).
+
+The one who advertises its MoH capabilities at the beginning of the call (first offer/answer exchange)
+can later trigger MoH using the `sendonly` state (or alternatively `inactive`) and then unhold the other side
+using `sendrecv` state (or alternatively no state advertised, which is equal to the `sendrecv` one).
+
+MoH covers only audio type of media sessions, hence other media types, such as video, aren't accepted.
+It should also be taken into account that there is no specific selection of media sections
+to be held, thus — if one audio media puts the call on hold, the whole call is held.
+
+During MoH being active, it's not possible to mix the MoH stream (sound file being played) with an audio stream
+coming from the one who puts on hold. In other words, all egress media stream coming from the MoH originator
+will be ignored until the other side gets unheld.
+
+MoH also cannot be mixed with the `play media` functionality, the last one triggered will override previous one.
+Although, in this case the behavior of rtpengine can also get unexpected.
+
+MoH must be unheld to stop the media being sent towards the other side (recipient).
+If MoH isn't unheld explicitly, then it will be stopped by the `moh-max-duration` config option.
+
+To control a duration of MoH to be played, see `moh-max-duration` and `moh-max-repeats` configuration options.
+By default MoH playback is limited to 1800 seconds (half an hour).
+
+MoH stream will also be dropped in case of full dialog termination.
+
+The MoH SDP session can also be marked with a specific (custom) session level attribute.
+For that to enable see the `moh-attr-name` configuration option.
+
+List of parameters to be given when advertising MoH capabilities:
+
+- a sound source : `file`, `blob` or `db-id`.
+
+	At least this parameter must be given.
+
+	`file` — is a full path to a file including name stored on the local file system.
+
+	`blob` — is a blob data (binary data) directly given (in form of string) via option flags to rtpengine.
+
+	`db-id` - an integer which points to a data stored in DB.
+	At least `mysql-host` and `mysql-query` must be configured to let the system read blob data from the DB backend.
+	For more information see `play media` functionality and `mysql-*` configuration options.
+
+- `mode` : `sendonly` or `sendrecv` (by default always `sendonly`).
+
+	Which state gets advertised to the other side, which is being put on hold.
+	In some cases `sendrecv` can be useful for specific client implementations,
+	which don't want to see `sendonly` state in coming SDP.
+
+- `connection` type : `zero` (for now only one type is available).
+
+  If set, then connection information (`c=` field) in the according media session
+  will be set to all zeroes (`0.0.0.0`). So called zeroed-hold.
+  Can be useful for some older client implementations using outdated standards.
+
+Usage syntax:
+
+		"moh" :
+		{
+			"<source>": "<value>",
+			"mode": "<value>",
+			"connection": "<value>"
+		}
+
+Usage example:
+
+		"moh" :
+		{
+			"db-id": "123456789",
+			"mode": "sendrecv",
+			"connection": "zero"
+		}
+
+Another usage example:
+
+		"moh" :
+		{
+			"file": "/tmp/music-on-hold.wav"
+		}
 
 ## `statistics` Message
 
@@ -2199,3 +2425,20 @@ forwarding will start to the endpoint given in the answer SDP.
 
 This message is a counterpart to `subsscribe answer` to stop an established
 subscription. The subscription to be stopped is identified by the `to-tag`.
+
+## `connect` Message
+
+This message makes it posible to directly connect the media of two call parties
+without the need for a full offer/answer exchange. The required keys are
+`call-id` to identify the call, and `from-tag and `to-tag` to identify the two
+call parties to connect. The media will be connected in the same way as it
+would through an offer/answer exchange. Transcoding will automaticaly be
+engaged if needed.
+
+It's also possible to connect two call parties from two different calls
+(different call IDs). To do so, the second call ID must be given as
+`to-call-id`, with the given `to-tag` then being one of the call parties from
+that second call. Internally, both calls will be merged into a single call
+object, with both call IDs then corresponding to the same call. This will be
+visible in certain statistics (e.g. two call IDs appearing in the list, but
+only one call being counted).

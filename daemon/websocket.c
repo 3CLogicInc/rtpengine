@@ -26,8 +26,9 @@ struct websocket_output {
 	ssize_t content_length;
 };
 
+TYPED_DIRECT_FUNCS(janus_session_hash, janus_session_eq, struct janus_session)
 TYPED_GHASHTABLE(janus_sessions_ht, struct janus_session, struct janus_session,
-		g_direct_hash, g_direct_equal, NULL, NULL)
+		janus_session_hash, janus_session_eq, NULL, NULL)
 TYPED_GQUEUE(websocket_message, struct websocket_message)
 TYPED_GQUEUE(websocket_output, struct websocket_output)
 
@@ -383,7 +384,7 @@ static const char *websocket_http_ping(struct websocket_message *wm) {
 }
 
 
-TYPED_GHASHTABLE(metric_types_ht, char, void, g_str_hash, g_str_equal, NULL, NULL)
+TYPED_GHASHTABLE(metric_types_ht, char, void, c_str_hash, c_str_equal, NULL, NULL)
 
 static const char *websocket_http_metrics(struct websocket_message *wm) {
 	ilogs(http, LOG_DEBUG, "Respoding to GET /metrics");
@@ -423,13 +424,15 @@ static const char *websocket_http_metrics(struct websocket_message *wm) {
 
 
 // adds printf string to output buffer without triggering response
-static void websocket_queue_printf(struct cli_writer *cw, const char *fmt, ...) {
+static size_t websocket_queue_printf(struct cli_writer *cw, const char *fmt, ...) {
 	va_list va;
 	va_start(va, fmt);
 	char *s = g_strdup_vprintf(fmt, va);
+	size_t ret = strlen(s);
 	va_end(va);
-	websocket_queue_raw(cw->ptr, s, strlen(s));
+	websocket_queue_raw(cw->ptr, s, ret);
 	g_free(s);
+	return ret;
 }
 
 
@@ -439,7 +442,7 @@ static const char *websocket_http_cli(struct websocket_message *wm) {
 
 	ilogs(http, LOG_DEBUG, "Respoding to GET /cli/%s", uri);
 
-	str uri_cmd = STR_INIT(uri);
+	str uri_cmd = STR(uri);
 
 	struct cli_writer cw = {
 		.cw_printf = websocket_queue_printf,
@@ -454,10 +457,26 @@ static const char *websocket_http_cli(struct websocket_message *wm) {
 }
 
 
+static const char *websocket_http_cli_post(struct websocket_message *wm) {
+	ilogs(http, LOG_DEBUG, "Respoding to POST /cli");
+
+	struct cli_writer cw = {
+		.cw_printf = websocket_queue_printf,
+		.ptr = wm->wc,
+	};
+	cli_handle(&STR_LEN(wm->body->str, wm->body->len), &cw);
+
+	size_t len = websocket_queue_len(wm->wc);
+
+	websocket_http_complete(wm->wc, 200, "text/plain", len, NULL);
+	return NULL;
+}
+
+
 static const char *websocket_cli_process(struct websocket_message *wm) {
 	ilogs(http, LOG_DEBUG, "Processing websocket CLI req '%s'", wm->body->str);
 
-	str uri_cmd = STR_INIT_LEN(wm->body->str, wm->body->len);
+	str uri_cmd = STR_LEN(wm->body->str, wm->body->len);
 
 	struct cli_writer cw = {
 		.cw_printf = websocket_queue_printf,
@@ -495,15 +514,14 @@ static void websocket_ng_send_http(str *cookie, str *body, const endpoint_t *sin
 	websocket_write_http(wc, NULL, true);
 }
 
-static void __ng_buf_free(void *p) {
-	struct websocket_ng_buf *buf = p;
+static void __ng_buf_free(struct websocket_ng_buf *buf) {
 	g_string_free(buf->body, TRUE);
 }
 
 static const char *websocket_ng_process_generic(struct websocket_message *wm,
 		__typeof__(control_ng_process) cb)
 {
-	struct websocket_ng_buf *buf = obj_alloc0("websocket_ng_buf", sizeof(*buf), __ng_buf_free);
+	__auto_type buf = obj_alloc0(struct websocket_ng_buf, __ng_buf_free);
 
 	endpoint_print(&wm->wc->endpoint, buf->addr, sizeof(buf->addr));
 
@@ -512,7 +530,7 @@ static const char *websocket_ng_process_generic(struct websocket_message *wm,
 	// steal body and initialise
 	buf->body = wm->body;
 	wm->body = g_string_new("");
-	str_init_len(&buf->cmd, buf->body->str, buf->body->len);
+	buf->cmd = STR_LEN(buf->body->str, buf->body->len);
 	buf->endpoint = wm->wc->endpoint;
 
 	cb(&buf->cmd, &buf->endpoint, buf->addr, NULL, websocket_ng_send_ws, wm->wc, &buf->obj);
@@ -530,7 +548,7 @@ static const char *websocket_ng_plain_process(struct websocket_message *wm) {
 static const char *websocket_http_ng_generic(struct websocket_message *wm,
 		__typeof__(control_ng_process) cb)
 {
-	struct websocket_ng_buf *buf = obj_alloc0("websocket_ng_buf", sizeof(*buf), __ng_buf_free);
+	__auto_type buf = obj_alloc0(struct websocket_ng_buf, __ng_buf_free);
 
 	endpoint_print(&wm->wc->endpoint, buf->addr, sizeof(buf->addr));
 
@@ -539,7 +557,7 @@ static const char *websocket_http_ng_generic(struct websocket_message *wm,
 	// steal body and initialise
 	buf->body = wm->body;
 	wm->body = g_string_new("");
-	str_init_len(&buf->cmd, buf->body->str, buf->body->len);
+	buf->cmd = STR_LEN(buf->body->str, buf->body->len);
 	buf->endpoint = wm->wc->endpoint;
 
 	if (cb(&buf->cmd, &buf->endpoint, buf->addr, NULL, websocket_ng_send_http, wm->wc,
@@ -620,6 +638,8 @@ static int websocket_http_post(struct websocket_conn *wc) {
 		wm->content_type = CT_JSON;
 	else if (!strcasecmp(ct, "application/x-rtpengine-ng"))
 		wm->content_type = CT_NG;
+	else if (!strcasecmp(ct, "text/plain"))
+		wm->content_type = CT_TEXT;
 	else
 		ilogs(http, LOG_WARN, "Unsupported content-type '%s'", ct);
 
@@ -675,6 +695,8 @@ static int websocket_http_body(struct websocket_conn *wc, const char *body, size
 		handler = websocket_janus_process;
 	else if (!strncmp(uri, "/janus/", 7) && wm->method == M_POST && wm->content_type == CT_JSON)
 		handler = websocket_janus_post;
+	else if (!strcmp(uri, "/cli") && wm->method == M_POST && wm->content_type == CT_TEXT)
+		handler = websocket_http_cli_post;
 	else
 		handler = websocket_http_404;
 

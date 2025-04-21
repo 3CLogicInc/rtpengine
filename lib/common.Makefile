@@ -1,7 +1,10 @@
 include ../lib/lib.Makefile
 
-all:
-	$(MAKE) $(TARGET) $(MANS)
+CFLAGS += -fPIE
+LDFLAGS += -pie
+LDLIBS += -latomic
+
+all:	$(TARGET) $(MANS)
 
 $(TARGET):	$(OBJS) Makefile
 	$(CC) $(LDFLAGS) $(CFLAGS) -o $@ $(OBJS) $(LDLIBS)

@@ -1,5 +1,5 @@
 Name:		ngcp-rtpengine
-Version:	12.4.0.0+0~mr12.4.0.0
+Version:	13.2.1.1+0~mr13.2.1.1
 Release:	1%{?dist}
 Summary:	The Sipwise NGCP rtpengine daemon
 Group:		System Environment/Daemons
@@ -11,16 +11,37 @@ Conflicts:	%{name}-kernel < %{version}-%{release}
 %global with_transcoding 1
 %{?_unitdir:%define has_systemd_dirs 1}
 
-BuildRequires:	gcc make pkgconfig redhat-rpm-config
+%if 0%{?openEuler} >= 1
+%define redhat_rpm_config openEuler-rpm-config
+
+%if 0%{?rhel} == 0
+
+%if 0%{?openEuler} >= 2
+%define rhel 9
+%else
+%define rhel 8
+%endif
+
+%endif
+%else
+%define redhat_rpm_config redhat-rpm-config
+%endif
+
+BuildRequires: gcc make pkgconfig %{redhat_rpm_config}
 BuildRequires:	glib2-devel libcurl-devel openssl-devel pcre-devel
 BuildRequires:	xmlrpc-c-devel zlib-devel hiredis-devel
 BuildRequires:	libpcap-devel libevent-devel json-glib-devel
 BuildRequires:	mosquitto-devel
 BuildRequires:	gperf perl-IPC-Cmd
 BuildRequires:	perl-podlators
+BuildRequires:	libatomic
 BuildRequires:	pkgconfig(libwebsockets)
 BuildRequires:	pkgconfig(spandsp)
 BuildRequires:	pkgconfig(opus)
+%if 0%{?rhel} == 8
+# LTS mr11.5.1 cannot build with gcc 8.5
+BuildRequires: gcc-toolset-13
+%endif
 Requires(pre):	shadow-utils
 %if 0%{?rhel} >= 8
 BuildRequires:	pkgconfig(libmnl) pkgconfig(libnftnl) pandoc ncurses-devel
@@ -47,7 +68,7 @@ drop-in replacement for any of the other available RTP and media proxies.
 %package kernel
 Summary:	NGCP rtpengine in-kernel packet forwarding
 Group:		System Environment/Daemons
-BuildRequires:	gcc make redhat-rpm-config iptables-devel
+BuildRequires:	gcc make %{redhat_rpm_config} iptables-devel
 Requires:	%{name}%{?_isa} = %{version}-%{release}
 Requires:	%{name}-dkms = %{version}-%{release}
 
@@ -59,7 +80,7 @@ Requires:	%{name}-dkms = %{version}-%{release}
 Summary:	Kernel module for NGCP rtpengine in-kernel packet forwarding
 Group:		System Environment/Daemons
 BuildArch:	noarch
-BuildRequires:	redhat-rpm-config
+BuildRequires:	%{redhat_rpm_config}
 Requires:	gcc make
 # Define requires according to the installed kernel.
 %{?rhel:Requires: kernel-devel}
@@ -88,7 +109,7 @@ Requires:	perl-interpreter
 %package recording
 Summary:	The Sipwise NGCP rtpengine recording daemon
 Group:		System Environment/Daemons
-BuildRequires:	gcc make redhat-rpm-config %{mysql_devel_pkg} ffmpeg-devel
+BuildRequires:	gcc make %{redhat_rpm_config} %{mysql_devel_pkg} ffmpeg-devel
 
 %description recording
 The Sipwise rtpengine media proxy has support for exporting media (RTP) packets
@@ -112,6 +133,10 @@ echo ==== CFLAGS = $CFLAGS ====
 echo ==== CXXFLAGS = $CXXFLAGS ====
 echo ==== LDFLAGS = $LDFLAGS ====
 
+%if 0%{?rhel} == 8
+# LTS mr11.5.1 cannot build with gcc 8.5
+. /opt/rh/gcc-toolset-13/enable
+%endif
 %if 0%{?with_transcoding} > 0
 RTPENGINE_VERSION="\"%{version}-%{release}\"" make all
 %else
@@ -174,6 +199,10 @@ install -D -p -m644 kernel-module/xt_RTPENGINE.c \
 	 %{buildroot}%{_usrsrc}/%{name}-%{version}-%{release}/xt_RTPENGINE.c
 install -D -p -m644 kernel-module/xt_RTPENGINE.h \
 	 %{buildroot}%{_usrsrc}/%{name}-%{version}-%{release}/xt_RTPENGINE.h
+install -D -p -m644 kernel-module/common_stats.h \
+	 %{buildroot}%{_usrsrc}/%{name}-%{version}-%{release}/common_stats.h
+install -D -p -m644 kernel-module/*.inc \
+	 %{buildroot}%{_usrsrc}/%{name}-%{version}-%{release}/
 install -D -p -m644 debian/ngcp-rtpengine-kernel-dkms.dkms %{buildroot}%{_usrsrc}/%{name}-%{version}-%{release}/dkms.conf
 sed -i -e "s/#MODULE_VERSION#/%{version}-%{release}/g" %{buildroot}%{_usrsrc}/%{name}-%{version}-%{release}/dkms.conf
 %if 0%{?with_transcoding} > 0

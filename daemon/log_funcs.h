@@ -28,6 +28,8 @@ INLINE void __log_info_release(struct log_info *li) {
 	}
 }
 INLINE void __log_info_push(void) {
+	if (log_info.e == LOG_INFO_NONE)
+		return;
 	struct log_info *copy = g_slice_alloc(sizeof(*copy));
 	*copy = log_info;
 	log_info_stack = g_slist_prepend(log_info_stack, copy);
@@ -40,6 +42,7 @@ INLINE void log_info_pop(void) {
 
 	if (!log_info_stack) {
 		ZERO(log_info);
+		call_memory_arena_release();
 		return;
 	}
 
@@ -62,6 +65,7 @@ INLINE void log_info_pop_until(void *p) {
 INLINE void log_info_reset(void) {
 	__log_info_release(&log_info);
 	ZERO(log_info);
+	call_memory_arena_release();
 
 	while (log_info_stack) {
 		struct log_info *element = log_info_stack->data;
@@ -77,6 +81,7 @@ INLINE void log_info_call(call_t *c) {
 	__log_info_push();
 	log_info.e = LOG_INFO_CALL;
 	log_info.call = obj_get(c);
+	call_memory_arena_set(c);
 }
 INLINE void log_info_stream_fd(stream_fd *sfd) {
 	if (!sfd)
@@ -84,6 +89,7 @@ INLINE void log_info_stream_fd(stream_fd *sfd) {
 	__log_info_push();
 	log_info.e = LOG_INFO_STREAM_FD;
 	log_info.stream_fd = obj_get(sfd);
+	call_memory_arena_set(sfd->call);
 }
 INLINE void log_info_str(const str *s) {
 	if (!s || !s->s)
@@ -104,7 +110,8 @@ INLINE void log_info_ice_agent(struct ice_agent *ag) {
 		return;
 	__log_info_push();
 	log_info.e = LOG_INFO_ICE_AGENT;
-	log_info.ice_agent = obj_get(&ag->tt_obj);
+	log_info.ice_agent = (struct ice_agent *) obj_get(&ag->tt_obj);
+	call_memory_arena_set(ag->call);
 }
 INLINE void log_info_media(struct call_media *m) {
 	if (!m)
@@ -115,6 +122,7 @@ INLINE void log_info_media(struct call_media *m) {
 	log_info.e = LOG_INFO_MEDIA;
 	log_info.call = obj_get(m->call);
 	log_info.media = m;
+	call_memory_arena_set(m->call);
 }
 
 

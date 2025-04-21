@@ -12,8 +12,6 @@
 #include "timerthread.h"
 #include "types.h"
 
-#include "xt_RTPENGINE.h"
-
 struct call_media;
 struct codec_handler;
 struct media_packet;
@@ -78,7 +76,6 @@ struct codec_packet {
 	struct ssrc_ctx *ssrc_out;
 	void (*free_func)(void *);
 	void (*plain_free_func)(void *);
-	struct rtpengine_send_packet_info kernel_send_info;
 };
 
 struct codec_scheduler {
@@ -108,10 +105,13 @@ struct codec_handler *codec_handler_get(struct call_media *, int payload_type, s
 		struct sink_handler *);
 void codec_handlers_free(struct call_media *);
 struct codec_handler *codec_handler_make_playback(const rtp_payload_type *src_pt,
-		const rtp_payload_type *dst_pt, unsigned long ts, struct call_media *, uint32_t ssrc);
+		const rtp_payload_type *dst_pt, unsigned long ts, struct call_media *, uint32_t ssrc,
+		str_case_value_ht codec_set);
 struct codec_handler *codec_handler_make_media_player(const rtp_payload_type *src_pt,
-		const rtp_payload_type *dst_pt, unsigned long ts, struct call_media *, uint32_t ssrc);
-struct codec_handler *codec_handler_make_dummy(const rtp_payload_type *dst_pt, struct call_media *media);
+		const rtp_payload_type *dst_pt, unsigned long ts, struct call_media *, uint32_t ssrc,
+		str_case_value_ht codec_set);
+struct codec_handler *codec_handler_make_dummy(const rtp_payload_type *dst_pt, struct call_media *media,
+		str_case_value_ht codec_set);
 void codec_calc_jitter(struct ssrc_ctx *, unsigned long ts, unsigned int clockrate, const struct timeval *);
 void codec_update_all_handlers(struct call_monologue *ml);
 void codec_update_all_source_handlers(struct call_monologue *ml, const sdp_ng_flags *flags);
@@ -136,13 +136,14 @@ void __codec_store_populate_reuse(struct codec_store *, struct codec_store *, st
 #define codec_store_populate_reuse(dst, src, ...) \
 	__codec_store_populate_reuse(dst, src, (struct codec_store_args) {__VA_ARGS__})
 __attribute__((nonnull(1, 2)))
+void codec_store_copy(struct codec_store *, struct codec_store *);
 void codec_store_add_raw(struct codec_store *cs, rtp_payload_type *pt);
 __attribute__((nonnull(1, 2)))
 void codec_store_strip(struct codec_store *, str_q *strip, str_case_ht except);
 __attribute__((nonnull(1, 2, 3)))
 void codec_store_offer(struct codec_store *, str_q *, struct codec_store *);
-__attribute__((nonnull(1, 2)))
-void codec_store_check_empty(struct codec_store *, struct codec_store *);
+__attribute__((nonnull(1, 2, 3)))
+void codec_store_check_empty(struct codec_store *, struct codec_store *, sdp_ng_flags *);
 __attribute__((nonnull(1, 2)))
 void codec_store_accept(struct codec_store *, str_q *, struct codec_store *);
 __attribute__((nonnull(1, 2)))
@@ -152,7 +153,10 @@ void codec_store_track(struct codec_store *, str_q *);
 __attribute__((nonnull(1, 2, 3)))
 void codec_store_transcode(struct codec_store *, str_q *, struct codec_store *);
 __attribute__((nonnull(1, 2, 3)))
-void codec_store_answer(struct codec_store *dst, struct codec_store *src, sdp_ng_flags *flags);
+void __codec_store_answer(struct codec_store *dst, struct codec_store *src, sdp_ng_flags *flags,
+		struct codec_store_args);
+#define codec_store_answer(dst, src, flags, ...) \
+	__codec_store_answer(dst, src, flags, (struct codec_store_args) {__VA_ARGS__})
 __attribute__((nonnull(1, 2)))
 void codec_store_synthesise(struct codec_store *dst, struct codec_store *opposite);
 __attribute__((nonnull(1, 2)))

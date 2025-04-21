@@ -14,6 +14,9 @@
 #include <netinet/in.h>
 #include <sys/resource.h>
 #include <sys/epoll.h>
+#ifdef HAVE_CODEC_CHAIN
+#include <codec-chain/types.h>
+#endif
 #include "log.h"
 #include "loglib.h"
 
@@ -152,20 +155,42 @@ void config_load_free(struct rtpengine_common_config *cconfig) {
 	g_free(cconfig->pidfile);
 }
 
-G_DEFINE_AUTOPTR_CLEANUP_FUNC(GOptionEntry, free)
+static void load_templates(GKeyFile *kf, const char *template_section, GHashTable *templates) {
+	size_t length;
+	g_autoptr(GError) err = NULL;
+	g_autoptr(char_p) keys = g_key_file_get_keys(kf, template_section, &length, &err);
+	if (err)
+		die("Failed to load templates from given config file section '%s': %s", template_section, err->message);
+	if (!keys)
+		return; // empty config section
 
-void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char *description,
+	for (char **key = keys; *key; key++) {
+		char *val = g_key_file_get_string(kf, template_section, *key, &err);
+		if (err)
+			die("Failed to read template value '%s' from config file: %s", *key, err->message);
+		g_hash_table_insert(templates, g_strdup(*key), val); // hash table takes ownership of both
+	}
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(GOptionEntry, free)
+typedef char *char_p_shallow;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(char_p_shallow, g_free)
+
+void config_load_ext(int *argc, char ***argv, GOptionEntry *app_entries, const char *description,
 		char *default_config, char *default_section,
-		struct rtpengine_common_config *cconfig)
+		struct rtpengine_common_config *cconfig,
+		char * const *template_section, GHashTable *templates)
 {
 	g_autoptr(GOptionContext) c = NULL;
 	g_autoptr(GError) er = NULL;
 	g_autoptr(char) use_section = NULL;
 	const char *use_config;
 	int fatal = 0;
-	g_autoptr(char_p) saved_argv = g_strdupv(*argv);
+	g_autoptr(char_p) saved_argv_arr = g_strdupv(*argv);
+	g_autoptr(char_p_shallow) saved_argv = __g_memdup(saved_argv_arr, sizeof(char *) * (*argc + 1));
 	int saved_argc = *argc;
 	gboolean version = false;
+	g_autoptr(char) opus_application = NULL;
 
 	rtpe_common_config_ptr = cconfig;
 
@@ -175,6 +200,7 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 #else
 	rtpe_common_config_ptr->default_log_level = LOG_DEBUG;
 #endif
+	rtpe_common_config_ptr->codec_chain_opus_complexity = -1;
 
 	g_autoptr(GKeyFile) kf = g_key_file_new();
 
@@ -183,7 +209,7 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 
 	GOptionEntry shared_options[] = {
 		{ "version",		'v', 0, G_OPTION_ARG_NONE,	&version,	"Print build time and exit",		NULL		},
-		{ "config-file",	0,   0, G_OPTION_ARG_STRING,	&rtpe_common_config_ptr->config_file,	"Load config from this file",		"FILE"		},
+		{ "config-file",	0,   0, G_OPTION_ARG_FILENAME,	&rtpe_common_config_ptr->config_file,	"Load config from this file",		"FILE"		},
 		{ "config-section",	0,   0, G_OPTION_ARG_STRING,	&rtpe_common_config_ptr->config_section,"Config file section to use",		"STRING"	},
 		{ "log-facility",	0,   0,	G_OPTION_ARG_STRING,	&rtpe_common_config_ptr->log_facility,	"Syslog facility to use for logging",	"daemon|local0|...|local7"},
 		{ "log-level",		'L', 0, G_OPTION_ARG_INT,	&rtpe_common_config_ptr->default_log_level,"Default log level",			"INT"		},
@@ -199,12 +225,18 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 		{ "foreground",		'f', 0, G_OPTION_ARG_NONE,	&rtpe_common_config_ptr->foreground,	"Don't fork to background",		NULL		},
 		{ "thread-stack",	0,0,	G_OPTION_ARG_INT,	&rtpe_common_config_ptr->thread_stack,	"Thread stack size in kB",		"INT"		},
 		{ "poller-size",	0,0,	G_OPTION_ARG_INT,	&rtpe_common_config_ptr->poller_size,	"Max poller items per iteration",	"INT"		},
+#ifdef HAVE_LIBURING
+		{ "io-uring",		0,0,	G_OPTION_ARG_NONE,	&rtpe_common_config_ptr->io_uring,	"Use io_uring",				NULL },
+		{ "io-uring-buffers",	0,0,	G_OPTION_ARG_INT,	&rtpe_common_config_ptr->io_uring_buffers,"Number of io_uring entries per thread","INT" },
+#endif
 		{ "evs-lib-path",	0,0,	G_OPTION_ARG_FILENAME,	&rtpe_common_config_ptr->evs_lib_path,	"Location of .so for 3GPP EVS codec",	"FILE"		},
 #ifdef HAVE_CODEC_CHAIN
 		{ "codec-chain-lib-path",0,0,	G_OPTION_ARG_FILENAME,	&rtpe_common_config_ptr->codec_chain_lib_path,"Location of libcodec-chain.so",	"FILE"		},
 		{ "codec-chain-runners",0,0,	G_OPTION_ARG_INT,	&rtpe_common_config_ptr->codec_chain_runners,"Number of chain runners per codec","INT"		},
 		{ "codec-chain-concurrency",0,0,G_OPTION_ARG_INT,	&rtpe_common_config_ptr->codec_chain_concurrency,"Max concurrent codec jobs per runner","INT"	},
 		{ "codec-chain-async",0,0,	G_OPTION_ARG_INT,	&rtpe_common_config_ptr->codec_chain_async,"Number of background callback threads","INT"	},
+		{ "codec-chain-opus-application",0,0,G_OPTION_ARG_STRING,&opus_application,			"Opus application",			"default|VoIP|audio|low-delay"	},
+		{ "codec-chain-opus-complexity",0,0,G_OPTION_ARG_INT,	&rtpe_common_config_ptr->codec_chain_opus_complexity,"Opus encoding complexity (0..10)","INT"	},
 #endif
 		{ NULL, }
 	};
@@ -281,6 +313,7 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 				break;
 			}
 
+			case G_OPTION_ARG_FILENAME_ARRAY:
 			case G_OPTION_ARG_STRING_ARRAY: {
 				char ***s = e->arg_data;
 				g_strfreev(*s);
@@ -324,6 +357,7 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 				break;
 			}
 
+			case G_OPTION_ARG_FILENAME_ARRAY:
 			case G_OPTION_ARG_STRING_ARRAY: {
 				char ***s = e->arg_data;
 				if (!*s && e->description)
@@ -345,6 +379,9 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 				break;
 		}
 	}
+
+	if (template_section && *template_section && templates)
+		load_templates(kf, *template_section, templates);
 
 out:
 	// default common values, if not configured
@@ -398,6 +435,30 @@ out:
 
 	if (rtpe_common_config_ptr->codec_chain_async < 0)
 		rtpe_common_config_ptr->codec_chain_async = 0;
+
+	if (rtpe_common_config_ptr->codec_chain_opus_complexity == -1)
+		rtpe_common_config_ptr->codec_chain_opus_complexity = 10;
+	if (rtpe_common_config_ptr->codec_chain_opus_complexity < 0 || rtpe_common_config_ptr->codec_chain_opus_complexity > 10)
+		die("Invalid value for --codec-chain-opus-complexity");
+	if (opus_application) {
+		if (!strcmp(opus_application, "default") || !strcmp(opus_application, ""))
+			rtpe_common_config_ptr->codec_chain_opus_application = 0;
+		else if (!strcmp(opus_application, "voip") || !strcmp(opus_application, "speech"))
+			rtpe_common_config_ptr->codec_chain_opus_application = CC_OPUS_APP_VOIP;
+		else if (!strcmp(opus_application, "audio") || !strcmp(opus_application, "music"))
+			rtpe_common_config_ptr->codec_chain_opus_application = CC_OPUS_APP_AUDIO;
+		else if (!strcmp(opus_application, "low delay") || !strcmp(opus_application, "low-delay") || !strcmp(opus_application, "lowdelay"))
+			rtpe_common_config_ptr->codec_chain_opus_application = CC_OPUS_APP_LOWDELAY;
+		else
+			die("Invalid value for --codec-chain-opus-application");
+	}
+#endif
+
+#if HAVE_LIBURING
+	if (rtpe_common_config_ptr->io_uring_buffers == 0)
+		rtpe_common_config_ptr->io_uring_buffers = 16384;
+	else if (rtpe_common_config_ptr->io_uring_buffers < 0)
+		die("Invalid value for --io-uring-buffers");
 #endif
 
 	return;

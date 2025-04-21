@@ -19,7 +19,6 @@ my @flags = qw(
 	force
 	strict-source
 	media-handover
-	sip-source-address
 	reset
 	port-latching
 	no-rtcp-attribute
@@ -53,12 +52,15 @@ my @flags = qw(
 	block-short
 	recording-vsc
 	block-egress
+	directional
+	allow-no-codec-media
 );
 
 my @string_opts = qw(
 	from-tag
 	to-tag
 	call-id
+	to-call-id
 	transport-protocol
 	media-address
 	ICE
@@ -98,6 +100,7 @@ my @string_opts = qw(
 	vsc-pause-resume-rec
 	vsc-start-pause-resume-rec
 	rtpp-flags
+	body
 );
 
 my @int_opts = qw(

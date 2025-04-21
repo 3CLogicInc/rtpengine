@@ -204,7 +204,7 @@ static output_t *output_new(const char *path, const metafile_t *mf, const char *
 					ilog(LOG_ERR, "Missing ending brace '}' in file name pattern");
 					break;
 				}
-				str fmt = STR_INIT_LEN((char *) p, end - p);
+				str fmt = STR_LEN((char *) p, end - p);
 				p = end; // skip over {...}
 				output_append_str_from_ht(f, mf->metadata_parsed, &fmt);
 				break;
@@ -341,6 +341,20 @@ got_fn:
 	if (av_ret)
 		goto err;
 
+	if (output_chmod)
+		if (chmod(output->filename, output_chmod))
+			ilog(LOG_WARN, "Failed to change file mode of '%s%s%s': %s",
+					FMT_M(output->filename), strerror(errno));
+
+	if (output_chown != -1 || output_chgrp != -1)
+		if (chown(output->filename, output_chown, output_chgrp))
+			ilog(LOG_WARN, "Failed to change file owner/group of '%s%s%s': %s",
+					FMT_M(output->filename), strerror(errno));
+
+	if (flush_packets) {
+		output->fmtctx->flags |= AVFMT_FLAG_FLUSH_PACKETS;
+	}
+
 	db_config_stream(output);
 	ilog(LOG_INFO, "Opened output media file '%s' for writing", full_fn);
 done:
@@ -370,14 +384,6 @@ static bool output_shutdown(output_t *output) {
 		av_write_trailer(output->fmtctx);
 		avio_closep(&output->fmtctx->pb);
 		ret = true;
-		if (output_chmod)
-			if (chmod(output->filename, output_chmod))
-				ilog(LOG_WARN, "Failed to change file mode of '%s%s%s': %s",
-						FMT_M(output->filename), strerror(errno));
-		if (output_chown != -1 || output_chgrp != -1)
-			if (chown(output->filename, output_chown, output_chgrp))
-				ilog(LOG_WARN, "Failed to change file owner/group of '%s%s%s': %s",
-						FMT_M(output->filename), strerror(errno));
 	}
 	avformat_free_context(output->fmtctx);
 
@@ -426,11 +432,11 @@ void output_init(const char *format) {
 	str codec;
 
 	if (!strcmp(format, "wav")) {
-		str_init(&codec, "PCM-S16LE");
+		codec = STR("PCM-S16LE");
 		output_file_format = "wav";
 	}
 	else if (!strcmp(format, "mp3")) {
-		str_init(&codec, "MP3");
+		codec = STR("MP3");
 		output_file_format = "mp3";
 	}
 	else

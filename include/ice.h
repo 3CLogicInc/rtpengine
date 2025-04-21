@@ -14,6 +14,7 @@
 #include "socket.h"
 #include "timerthread.h"
 #include "types.h"
+#include "call.h"
 
 #define MAX_COMPONENTS			2
 #define TIMER_RUN_INTERVAL		20 /* ms */
@@ -168,8 +169,7 @@ int ice_response(stream_fd *, const endpoint_t *src,
 void dequeue_sdp_fragments(struct call_monologue *);
 bool trickle_ice_update(ng_buffer *ngbuf, call_t *call, sdp_ng_flags *flags,
 		sdp_streams_q *streams);
-
-enum thread_looper_action ice_slow_timer(void);
+void ice_fragments_cleanup(fragments_ht ht, bool all);
 
 #include "call.h"
 

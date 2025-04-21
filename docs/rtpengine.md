@@ -151,6 +151,18 @@ at the command line. See the __\-\-config-file__ option below for details.
     In this case, startup of the daemon will fail with an error if this option
     is given.
 
+- __\-\-templates=__*STR*
+
+    Name of the config file section to contain signalling templates. Requires a
+    configuration file to be in use (i.e. not __\-\-config-file=none__).
+    Default value is unset (i.e. no templates supported).
+
+    If set, then each entry within the given config section corresponds to a
+    named signalling template, which can then be used by referencing it via the
+    __template=...__ key in a signalling message to *rtpengine*.
+
+    See section *SIGNALLING TEMPLATES* below.
+
 - __-S__, __\-\-save-interface-ports__
 
     Will bind ports only on the first available local interface, of desired
@@ -498,7 +510,7 @@ call to inject-DTMF won't be sent to __\-\-dtmf-log-dest=__ or __\-\-listen-tcp-
     Note that this leaves the password visible in the process list, posing a
     security risk if untrusted users access the same system.
     As an alternative, the password can also be supplied in the shell
-    environment through the environment variable __RTPENGINE\*REDIS\*AUTH\*PW__.
+    environment through the environment variable __RTPENGINE\_REDIS\_AUTH\_PW__.
 
     On startup, __rtpengine__ will read the contents of this database and
     restore all calls stored therein.
@@ -518,17 +530,37 @@ call to inject-DTMF won't be sent to __\-\-dtmf-log-dest=__ or __\-\-listen-tcp-
     in the database).
 
     For password protected Redis servers, the environment variable for the
-    password is __RTPENGINE\*REDIS\*WRITE\*AUTH\*PW__.
+    password is __RTPENGINE\_REDIS\_WRITE\_AUTH\_PW__.
 
     When both options are given, __rtpengine__ will start and use the Redis
     database regardless of the database's role (master or slave).
 
+- __\-\-redis-subscribe=__\[*PW*@\]*IP*:*PORT*\[/*INT*\]
+
+    Configures a Redis database for subscribing and receiving notifications.
+    This option takes precedence over __\-\-redis__, if configured.
+    When __\-\-subscribe-keyspace__ is also configured, the keyspace part of
+    __\-\-redis-subscribe=__ is not used, the former takes precedence.
+    The keyspace number can also be omitted altogether.
+
+    For password protected Redis servers, the environment variable for the
+    password is __RTPENGINE\_REDIS\_SUBSCRIBE\_AUTH\_PW__.
+
 - __-k__, __\-\-subscribe-keyspace=__*INT*
 
-    List of redis keyspaces to subscribe.
-    If this is not present, no keyspaces are subscribed (default behaviour).
+    List of redis keyspaces to subscribe. When it and __\-\-redis-subscribe=__
+    are not present, no keyspaces are subscribed (default behaviour).
+    In conjunction with __\-\-redis-subscribe=__, __\-\-subscribe-keyspace=__
+    overwrites the keyspaces to subscribe to.
+
     Further subscriptions could be added/removed via __rtpengine-ctl ksadd/ksrm__.
     This may lead to enabling/disabling of the redis keyspace notification feature.
+
+    The list of keyspace subscriptions can initially be left empty, but if any
+    keyspaces are to be added later during runtime, the feature must still be
+    configured at *rtpengine* startup. This can be achieved by either setting
+    __\-\-redis-subscribe=__ to a valid address, or by listing the single value
+    __-1__ under __\-\-subscribe-keyspace=__.
 
 - __\-\-redis-num-threads=__*INT*
 
@@ -599,6 +631,22 @@ call to inject-DTMF won't be sent to __\-\-dtmf-log-dest=__ or __\-\-listen-tcp-
     The default value for the connection timeout is 1000ms.
     This parameter can also be set or listed via __rtpengine-ctl__.
 
+- __\-\-redis-resolve-on-reconnect__
+
+    Enable 'redis resolve on reconnect' functionality: when re-connecting to the
+    remote redis server try to re-resolve if the redis hostname was an FQDN
+    and not IP address. It is a boolean value (either __true__ or __false__).
+
+- __\-\-redis-format=bencode__\|__JSON__
+
+    Selects the format for serialised call data written to Redis or KeyDB. The
+    old default (and previously only option) was as a JSON object. The new
+    default is using *bencode* formatting. Using *bencode* has the benefit of
+    yielding better performance and lower CPU usage, while making the data less
+    human readable.
+
+    Both formats can be restored from, regardless of this setting.
+
 - __-b__, __\-\-b2b-url=__*STRING*
 
     Enables and sets the URI for an XMLRPC callback to be made when a call is
@@ -650,7 +698,7 @@ call to inject-DTMF won't be sent to __\-\-dtmf-log-dest=__ or __\-\-listen-tcp-
 - __\-\-max-recv-iters=__*INT*
 
     This parameter sets maximum continuous reading cycles in UDP poller loop,
-    can help to avoid dropped packets errors on burstly streams (default 50).
+    can help to avoid dropped packets errors on bursty streams (default 50).
 
 - __\-\-homer=__*IP46*:*PORT*
 
@@ -1081,7 +1129,128 @@ call to inject-DTMF won't be sent to __\-\-dtmf-log-dest=__ or __\-\-listen-tcp-
 
     RTP data is cached and retained in memory for the lifetime of the process.
 
-- __audio-buffer-length=__*INT*
+- __\-\-moh-max-duration=__*INT*
+
+    Music-on-hold max possible duration (in ms).
+    When not defined (set to 0), it takes 1800000ms default value (half an hour).
+
+- __\-\-moh-max-repeats=__*INT*
+
+    Music-on-hold max possible repeats.
+    moh-max-duration always takes a precedence over it.
+    By default is always 999 if not defined otherwise.
+
+- __\-\-moh-attr-name=__*STRING*
+
+    Controls the value to be added to the session level of SDP whenever MoH is triggered.
+    If not defined, then not in use.
+
+- __\-\-kernel-player=__*INT*
+- __\-\-kernel-player-media=__*INT*
+
+    Enables and configures the kernel-based media player. Disabled by default
+    and only available if the kernel module is in use, and requires
+    __player-cache__ to also be enabled.
+
+    When enabled, media playback will be handled by a set of kernel threads.
+    The option __kernel-player__ defaults to zero and needs to set to non-zero
+    to enable the feature. The number given to the option is the maximum number
+    of concurrent kernel media players that can be used.
+
+    The option __kernel-player-media__ configures the maximum number of unique
+    media "files" that can be stored for playback in the kernel module. Media
+    files requested for playback are first decoded by the __player-cache__
+    feature, and then given to the kernel module in a pre-encoded format for
+    quick playback. Defaults to 128.
+
+    Both player slots and media slots are shared among all instances of
+    *rtpengine* (using different kernel table IDs) running on a system using
+    the same kernel module. Unused slots use minimal resources.
+
+- __\-\-preload-media-files=__*FILE*
+
+    Enables reading of media files at startup and caching them in memory for
+    playback. Multiple files can be specified. On the command line, the option
+    must be given multiple times to do so, while in the config file the option
+    must be given only once, with the list of files separated by semicolons.
+
+    All listed files will be read into memory at startup and cached there for
+    the lifetime of the daemon. When playback of one such media file is
+    requested, playback will be done from the cached contents instead of
+    opening and reading the file. The file name given in the `play media`
+    request must exactly match the file name given in the config option. If the
+    file name differs (or an entirely different file is requested for playback)
+    then playback will happen from file as usual.
+
+    The special string `on-demand` can be used instead of a file name to enable
+    on-demand loading and caching of media files. Any file requested for
+    playback that wasn't already present in the memory cache will then be read
+    only once and then retained in the cache for the lifetime of the daemon.
+
+- __\-\-media-files-reload=__*SECONDS*
+
+    Spawn a background thread to periodically check and, if needed, update
+    media files kept in the memory cache. Each file's modification timestamp is
+    checked against the last time it was read, and if the file was updated
+    since then, it will be re-read and will replace the previous cached
+    contents.
+
+- __\-\-preload-db-media=__*INT*
+
+    Similar to the __preload-media-files__ option, but preloads media from
+    database instead of reading them from files. Each entry must be an integer
+    corresponding to an index from the database. On-demand loading is also
+    supported by supplying the special string `on-demand` instead of an index
+    number.
+
+- __\-\-db-media-reload=__*SECONDS*
+
+    Similar to the __media-files-reload__ but applicable to media loaded from
+    database. Note that media stored in a database doesn't have a modification
+    timestamp, which means that all media will always be reloaded from the
+    database in the given interval.
+
+- __\-\-db-media-cache=__*PATH*
+
+    Enables filesystem-backed caching of media entries from the database. The
+    given path must be readable and writeable by *rtpengine*.
+
+    Whenever playback of media from the database is requested, *rtpengine*
+    first checks if a corresponding cached file within the given path exists.
+    If it exists, media will be read from that file instead of from the
+    database. If it doesn't exist, media will be read from the database, and
+    then *rtpengine* will create the cache file for the next time the same
+    media is requested.
+
+- __\-\-preload-db-cache=__*INT*
+
+    Similar to __preload-db-media__ but populates the filesystem-backed cache
+    instead of storing the media in memory. On-demand loading is also
+    supported.
+
+- __\-\-cache-media-reload=__*SECONDS*
+
+    Similar to the __db-media-reload__ but applicable to media stored in the
+    filesystem-backed cache.
+
+- __\-\-expiry-timer=__*SECONDS*
+- __\-\-media-files-expire=__*SECONDS*
+- __\-\-db-media-expire=__*SECONDS*
+- __\-\-db-cache-expire=__*SECONDS*
+
+    These options control the automatic removal of entries from the various
+    media caches when and if the entries go unused for a certain amount of
+    time. By default automatic removal is disabled.
+
+    The option `expiry-timer` must be set to non-zero for any automatic removal
+    to happen. It enables creation of a background thread and controls how
+    often this thread should run to check for expired unused cache entries.
+
+    The other options set the maximum allowed age for entries in the respective
+    caches. If an entry was not used for longer than the given time, it will be
+    removed from the cache.
+
+- __\-\-audio-buffer-length=__*INT*
 
     Set the buffer length used by the audio player (see below) in milliseconds. The
     default is 500 milliseconds.
@@ -1094,7 +1263,7 @@ call to inject-DTMF won't be sent to __\-\-dtmf-log-dest=__ or __\-\-listen-tcp-
     kHz __.wav__ files this is 256 ms (2048 samples). Therefore 500 ms is the
     recommended value.
 
-- __audio-buffer-delay=__*INT*
+- __\-\-audio-buffer-delay=__*INT*
 
     Initial delay for new sources contributing to an audio buffer (used by the
     audio player, see below) in milliseconds. The default is 5 ms.
@@ -1104,7 +1273,7 @@ call to inject-DTMF won't be sent to __\-\-dtmf-log-dest=__ or __\-\-listen-tcp-
     gaps in the output audio. If set too high, output audio will have an
     unnecessary latency added to it.
 
-- __audio-player=on-demand__\|__play-media__\|__transcoding__\|__always__
+- __\-\-audio-player=on-demand__\|__play-media__\|__transcoding__\|__always__
 
     Define when to enable the audio player if not explicitly instructed otherwise.
     The default setting is __on-demand__.
@@ -1143,10 +1312,33 @@ call to inject-DTMF won't be sent to __\-\-dtmf-log-dest=__ or __\-\-listen-tcp-
 - __\-\-poller-per-thread__
 
     Enable 'poller per thread' functionality: for every worker thread (see the
-    \\-\-num-threads option) a poller will be created. With this option on, it is
+    \-\-num-threads option) a poller will be created. With this option on, it is
     guaranteed that only a single thread will ever read from a particular socket,
     thus maintaining the order of the packets. Might help when having issues with
     DTMF packets (RFC 2833).
+
+- __\-\-io-uring__
+
+    Enable **experimental** support for `io_uring`. Requires Linux kernel 6.0
+    or later.
+
+    When enabled, instead of the usual polling mechanism each worker thread
+    will set up its own `io_uring` and use it for polling, as well as directly
+    sending and receiving certain network data. In particular userspace media
+    data is sent and received directly via `io_uring`.
+
+    _NOTE: As of the time of writing, worker threads sleeping in an `io_uring`
+    poll are attributed to the host system as _I/O wait_ CPU usage, with up to
+    99% CPU time spent in _I/O wait_ (depending on the number of worker
+    threads), but without being attributed to any process or thread. This is
+    not actual CPU usage but rather indicates time spent waiting for a network
+    event, and so should be considered the same as idle CPU time._
+
+- __\-\-io-uring-buffers=__*INT*
+
+    Number of `io_uring` entries in the buffer allocated from the kernel per
+    thread. Defaults to 16384. Must be large enough so that submission entries
+    and completion entries are always available when needed.
 
 - __\-\-dtls-cert-cipher=prime256v1__\|__RSA__
 
@@ -1245,12 +1437,28 @@ call to inject-DTMF won't be sent to __\-\-dtmf-log-dest=__ or __\-\-listen-tcp-
     with stats for that call media every *interval* milliseconds, plus one message
     every *interval* milliseconds with global stats.
 
-- __\-\-mos=CQ__\|__LQ__
+- __\-\-mos=CQ__\|__LQ__\|__G.107__\|__G.107.2__\|__legacy__
 
-    MOS (Mean Opinion Score) calculation formula. Defaults to __CQ__ (conversational
-    quality) which takes RTT into account and therefore requires peers to correctly
-    send RTCP. If set to __LQ__ (listening quality) RTT is ignored, allowing a MOS to
-    be calculated in the absence of RTCP.
+    Options influencing the MOS (Mean Opinion Score) calculation formula.
+    Multiple options can be listed, using multiple __\-\-mos=...__ arguments at
+    the command line, or using a semicolon-separated list in a single
+    __mos=...__ line in the config file.
+
+    __CQ__ and __LQ__ are mutually exclusive and only one of them can be in
+    effect. Defaults to __CQ__ (conversational quality) which takes RTT into
+    account and therefore requires peers to correctly send RTCP. If set to
+    __LQ__ (listening quality) RTT is ignored, allowing a MOS to be calculated
+    in the absence of RTCP.
+
+    The remaining options select a MOS formula and are mutually exclusive. The
+    default is __G.107__, which uses a simplified version of the G.107 formula.
+    The previous default (and only option) was __legacy__, which uses a custom
+    formula which yields slightly higher MOS values than G.107.
+
+    The option __G.107.2__ uses G.107.2 for fullband audio codecs and the
+    simplified G.107 formula for all other audio codecs. The full G.107.2
+    formula is somewhat math-heavy and yields higher MOS values for fullband
+    audio codecs compared to G.107.
 
 - __\-\-measure-rtp__
 
@@ -1309,6 +1517,8 @@ When using the config file, only use a single __interface__ line,
 but specify multiple values separated by semicolons (e.g.
 *interface = internal/12.23.34.45;external/23.34.45.54*).
 
+### System Network Interfaces
+
 If an interface option is given using a system interface name in place
 of a network address, and if multiple network address are found
 configured on that network interface, then __rtpengine__ behaves as
@@ -1319,6 +1529,8 @@ the option *\-\-interface=ext/eth0* is given, then __rtpengine__ would
 behave as if both options *\-\-interface=ext/192.168.1.120* and
 *\-\-interface=ext/2001:db8:85a3::7334* had been specified.
 
+### Advertised Address
+
 The second IP address after the exclamation point is optional and can
 be used if the address to advertise in outgoing SDP bodies should be
 different from the actual local address.
@@ -1328,6 +1540,8 @@ is the actual local address on the server, but outgoing SDP bodies should
 advertise *192.0.2.4* as the address that endpoints should talk to.
 Note that you may have to escape the exclamation point from your shell
 when using command-line options, e.g. using *\\!*.
+
+### Interface Names
 
 Giving an interface a name (separated from the address by a slash) is
 optional; if omitted, the name __default__ is used.
@@ -1351,6 +1565,8 @@ If multiple logical interfaces are configured, but the __direction__
 option is not given in a particular call, then the first interface
 given on the command line will be used.
 
+### Multiple Addresses per Interface
+
 It is possible to specify multiple addresses for the same logical
 interface (the same name).
 Most commonly this would be one IPv4 addrsess and one IPv6 address,
@@ -1372,6 +1588,8 @@ best possible path to reach the RTP proxy.
 If ICE is not being used, then additional addresses will go unused,
 even though ports would still get allocated on those interfaces.
 
+### Round-Robin Address Selection
+
 Another option is to give interface names in the format *BASE:SUFFIX*.
 This allows interfaces to be used in a round-robin fashion, useful
 for load-balancing the port ranges of multiple interfaces.
@@ -1392,7 +1610,7 @@ multiple addresses for the same interface name.
 An advanced example could be (using config file notation, and omitting
 actual network addresses):
 
-    interface = pub:1/IPv4 pub:1/IPv4 pub:1/IPv6 pub:2/IPv4 pub:2/IPv6 pub:3/IPv6 pub:4/IPv4
+    interface = pub:1/IPv4;pub:1/IPv4;pub:1/IPv6;pub:2/IPv4;pub:2/IPv6;pub:3/IPv6;pub:4/IPv4
 
 In this example, when *direction=pub* is IPv4 is needed as a primary
 address, either *pub:1*, *pub:2*, or *pub:4* might be selected.
@@ -1411,10 +1629,79 @@ If the first given interface has the *BASE:SUFFIX* format then the
 round-robin algorithm is used and will select interfaces with the
 same *BASE* name.
 
+### Alias Names
+
+Interface alias names can be created using the *ALIAS=NAME* syntax. The alias
+must be listed after the primary interface that it references. For example, to
+create an actual logical interface *pub1* and then an alias *pub* for that
+interface:
+
+    interface = pub1/IPv4;pub=pub1
+
+Interface aliases are useful in combination with Redis replication. If an
+interface is referred to via an alias name (e.g. *direction=pub*), then the
+interface's actual name (*pub1* in this example) is propagated into the Redis
+storage and thus to any dependent standby instances. These standby instances
+can then have different address configurations for that interface, which makes
+it possible to facilitate failover with static addressing (for example behind
+an IP load balancer).
+
+### Legacy Protocols
+
 If you are not using the NG protocol but rather the legacy UDP protocol
 used by the __rtpproxy__ module, the interfaces must be named __internal__
 and __external__ corresponding to the __i__ and __e__ flags if you wish to
 use network bridging in this mode.
+
+## SIGNALLING TEMPLATES
+
+Since much of the behaviour of *rtpengine* is controlled by flags and
+keys/values given to it during runtime as part of the signalling control
+protocol that is used for communication between the controlling agent (e.g. a
+SIP proxy) and the *rtpengine* process, there often is a need to repeatedly
+give the same set of default flags and values to *rtpengine* for each message
+sent to it. This can lead to controlling scripts that are hard to maintain or
+hard to read. To alleviate this problem, *rtpengine* supports signalling
+templates that can be configured in its main configuration file and can then be
+referred to by short names.
+
+To use this feature, a configuration file must be in use (by default
+`/etc/rtpengine/rtpengine.conf`) and the configuration key __templates=...__
+must be set to a non-empty string. The value gives the name of the section in
+the configuration file to contain signalling templates. For example, if the
+value is set to __templates=templates__, then the section __[templates]__ will
+be used to read signalling templates.
+
+Each key/value in this file section then corresponds to one signalling
+template, and can be referred to via __template=...__ in any control message.
+
+For example, in order to make an offer to a WebRTC-compliant client, a Kamailio
+or OpenSIPS script may have used:
+
+    rtpengine_offer("transport-protocol=UDP/TLS/RTP/SAVPF ICE=force trickle-ICE rtcp-mux=[offer require] no-rtcp-attribute SDES=off generate-mid");
+
+This entire string of flags can now be converted into a signalling template in
+the config file as such:
+
+    [rtpengine]
+    ...
+    templates = templates
+    ...
+
+    [templates]
+    WebRTC = transport-protocol=UDP/TLS/RTP/SAVPF ICE=force trickle-ICE rtcp-mux=[offer require] no-rtcp-attribute SDES=off generate-mid
+
+The __offer__ command in Kamailio or OpenSIPS can then simply be turned into:
+
+    rtpengine_offer("template=WebRTC");
+
+In addition to named signalling templates, *rtpengine* supports default
+signalling templates that are automatically applied. Default signalling
+templates are templates using a name that matches a signalling command (e.g.
+__offer__ or __start recording__), or the special name __default__ which is a
+template that is applied to all signalling messages. These templates are
+automatically applied without needing to refer to them by name using
+__template=...__ from within the signalling message.
 
 ## EXIT STATUS
 
@@ -1428,11 +1715,11 @@ use network bridging in this mode.
 
 ## ENVIRONMENT
 
-- __RTPENGINE\*REDIS\*AUTH\*PW__
+- __RTPENGINE\_REDIS\_AUTH\_PW__
 
     Redis server password for persistent state storage.
 
-- __RTPENGINE\*REDIS\*WRITE\*AUTH\*PW__
+- __RTPENGINE\_REDIS\_WRITE\_AUTH\_PW__
 
     Redis server password for write operations, if __\-\-redis__ has been
     specified, in which case the one specified in __\-\-redis__ will be used for

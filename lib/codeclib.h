@@ -14,6 +14,8 @@ enum media_type {
 	MT_VIDEO,
 	MT_IMAGE,
 	MT_MESSAGE,
+	MT_TEXT,
+	MT_APPLICATION,
 	MT_OTHER,
 
 	__MT_MAX
@@ -34,6 +36,10 @@ INLINE enum media_type codec_get_type(const str *type) {
 		return MT_IMAGE;
 	if (!str_cmp(type, "message"))
 		return MT_MESSAGE;
+	if (!str_cmp(type, "text"))
+		return MT_TEXT;
+	if (!str_cmp(type, "application"))
+		return MT_APPLICATION;
 	return MT_OTHER;
 }
 
@@ -198,6 +204,13 @@ struct codec_def_s {
 	const int bits_per_sample;
 	const enum media_type media_type;
 	const str silence_pattern;
+	enum {
+		MOS_NB = 0, // default
+		MOS_FB,
+		MOS_LEGACY,
+
+		__MOS_TYPES
+	} mos_type;
 
 	// codec-specific callbacks
 	format_init_f *init;
@@ -273,6 +286,7 @@ struct decoder_s {
 		struct {
 			AVCodecContext *avcctx;
 			AVPacket *avpkt;
+			const enum AVSampleFormat *sample_fmts;
 
 			union {
 				struct {
@@ -313,10 +327,13 @@ struct encoder_s {
 	encoder_callback_t callback;
 	union codec_format_options format_options;
 
+	resample_t resampler;
+
 	union {
 		struct {
 			const AVCodec *codec;
 			AVCodecContext *avcctx;
+			const enum AVSampleFormat *sample_fmts;
 
 			union {
 				struct {
@@ -364,6 +381,11 @@ struct packet_sequencer_s {
 
 extern const GQueue * const codec_supplemental_codecs;
 
+
+// must be set before calling codeclib_init
+extern void (*codeclib_thread_init)(void);
+extern void (*codeclib_thread_cleanup)(void);
+extern void (*codeclib_thread_loop)(void);
 
 void codeclib_init(int);
 void codeclib_free(void);

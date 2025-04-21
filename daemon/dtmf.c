@@ -117,10 +117,10 @@ static void dtmf_bencode_and_notify(struct call_media *media, unsigned int event
 	data = bencode_dictionary_add_dictionary(notify, "data");
 	tags = bencode_dictionary_add_list(data, "tags");
 
-	bencode_dictionary_add_string_len(data, "callid", call->callid.s, call->callid.len);
-	bencode_dictionary_add_string_len(data, "source_tag", ml->tag.s, ml->tag.len);
+	bencode_dictionary_add_str(data, "callid", &call->callid);
+	bencode_dictionary_add_str(data, "source_tag", &ml->tag);
 	if (ml->label.s) {
-		bencode_dictionary_add_string_len(data, "source_label", ml->label.s, ml->label.len);
+		bencode_dictionary_add_str(data, "source_label", &ml->label);
 	}
 
 	tags_ht_iter iter;
@@ -136,7 +136,7 @@ static void dtmf_bencode_and_notify(struct call_media *media, unsigned int event
 	bencode_dictionary_add_integer(data, "duration", ((long long) duration * (1000000LL / clockrate)) / 1000LL);
 	bencode_dictionary_add_integer(data, "volume", volume);
 
-	bencode_collapse_str(notify, &encoded_data);
+	encoded_data = bencode_collapse_str(notify);
 	notify_ng_tcp_clients(&encoded_data);
 	bencode_buffer_free(&bencbuf);
 }
@@ -311,7 +311,7 @@ void dtmf_trigger_set(struct call_monologue *ml, enum dtmf_trigger_type trigger_
 			dtmf_trigger_types[trigger_type],
 			(unsigned int) (state - ml->dtmf_trigger_state), STR_FMT(s));
 
-	call_str_cpy(ml->call, &state->trigger, s);
+	state->trigger = call_str_cpy(s);
 	state->matched = 0;
 	state->inactive = inactive;
 }
@@ -657,7 +657,9 @@ int dtmf_event_payload(str *buf, uint64_t *pts, uint64_t duration, struct dtmf_e
 			// if the start event ts was before *pts we need
 			// to adjust the end event_ts to ensure we're not shortening
 			// the event
-			ilog(LOG_DEBUG, "Delayed send of DTMF, adjusting end event_ts by %lu - %lu = %lu", *pts, cur_event->ts, *pts - cur_event->ts);
+			ilog(LOG_DEBUG, "Delayed send of DTMF, adjusting end event_ts by "
+					"%" PRIu64 " - %" PRIu64 " = %" PRIu64,
+					*pts, cur_event->ts, *pts - cur_event->ts);
 			ev->ts += *pts - cur_event->ts;
 		}
 		cur_event->ts = *pts; // canonicalise start TS

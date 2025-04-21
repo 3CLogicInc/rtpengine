@@ -26,7 +26,7 @@ static void control_udp_incoming(struct obj *obj, struct udp_buffer *udp_buf) {
 	char **out;
 	struct iovec iov[10];
 	unsigned int iovlen;
-	str cookie, *reply = NULL;
+	str cookie, reply = STR_NULL;
 	cache_entry *ce;
 
 	pcre2_match_data *md = pcre2_match_data_create(30, NULL);
@@ -35,6 +35,7 @@ static void control_udp_incoming(struct obj *obj, struct udp_buffer *udp_buf) {
 		ret = pcre2_match(u->fallback_re, (PCRE2_SPTR8) udp_buf->str.s, udp_buf->str.len, 0, 0, md, NULL);
 		if (ret <= 0) {
 			ilogs(control, LOG_WARNING, "Unable to parse command line from udp:%s: %.*s", udp_buf->addr, STR_FMT(&udp_buf->str));
+			pcre2_match_data_free(md);
 			return;
 		}
 
@@ -61,7 +62,7 @@ static void control_udp_incoming(struct obj *obj, struct udp_buffer *udp_buf) {
 
 		socket_sendiov(udp_buf->listener, iov, iovlen, &udp_buf->sin, &udp_buf->local_addr);
 
-		pcre2_substring_list_free((PCRE2_SPTR *) out);
+		pcre2_substring_list_free((SUBSTRING_FREE_ARG) out);
 		pcre2_match_data_free(md);
 
 		return;
@@ -71,12 +72,12 @@ static void control_udp_incoming(struct obj *obj, struct udp_buffer *udp_buf) {
 
 	pcre2_substring_list_get(md, (PCRE2_UCHAR ***) &out, NULL);
 
-	str_init(&cookie, (void *) out[RE_UDP_COOKIE]);
+	cookie = STR(out[RE_UDP_COOKIE]);
 	ce = cookie_cache_lookup(&u->cookie_cache, &cookie);
 	if (ce) {
 		reply = ce->reply;
 		ilogs(control, LOG_INFO, "Detected command from udp:%s as a duplicate", udp_buf->addr);
-		socket_sendto_from(udp_buf->listener, reply->s, reply->len, &udp_buf->sin, &udp_buf->local_addr);
+		socket_sendto_from(udp_buf->listener, reply.s, reply.len, &udp_buf->sin, &udp_buf->local_addr);
 		cache_entry_free(ce);
 		goto out;
 	}
@@ -122,25 +123,24 @@ static void control_udp_incoming(struct obj *obj, struct udp_buffer *udp_buf) {
 		socket_sendiov(udp_buf->listener, iov, iovlen, &udp_buf->sin, &udp_buf->local_addr);
 	}
 
-	if (reply) {
-		socket_sendto_from(udp_buf->listener, reply->s, reply->len, &udp_buf->sin, &udp_buf->local_addr);
+	if (reply.len) {
+		socket_sendto_from(udp_buf->listener, reply.s, reply.len, &udp_buf->sin, &udp_buf->local_addr);
 
 		str callid = STR_NULL;
-		cache_entry new_ce = {.reply = reply, .callid = &callid};
+		cache_entry new_ce = {.reply = reply, .callid = callid};
 		cookie_cache_insert(&u->cookie_cache, &cookie, &new_ce);
-		free(reply);
+		g_free(reply.s);
 	}
 	else
 		cookie_cache_remove(&u->cookie_cache, &cookie);
 
 out:
-	pcre2_substring_list_free((PCRE2_SPTR *) out);
+	pcre2_substring_list_free((SUBSTRING_FREE_ARG) out);
 	pcre2_match_data_free(md);
 	log_info_pop();
 }
 
-void control_udp_free(void *p) {
-	struct control_udp *u = p;
+void control_udp_free(struct control_udp *u) {
 	pcre2_code_free(u->parse_re);
 	pcre2_code_free(u->fallback_re);
 	close_socket(&u->udp_listener);
@@ -152,7 +152,7 @@ struct control_udp *control_udp_new(const endpoint_t *ep) {
 	PCRE2_SIZE erroff;
 	int errcode;
 
-	c = obj_alloc0("control_udp", sizeof(*c), control_udp_free);
+	c = obj_alloc0(struct control_udp, control_udp_free);
 
 	c->parse_re = pcre2_compile(
 			/* cookie cmd flags callid viabranch:5 */

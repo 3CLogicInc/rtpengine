@@ -23,13 +23,13 @@ INLINE int check_session_keys(struct crypto_context *c) {
 		goto error;
 
 	err = "Failed to generate SRTP session keys";
-	str_init_len_assert(&s, c->session_key, c->params.crypto_suite->session_key_len);
+	s = STR_LEN_ASSERT(c->session_key, c->params.crypto_suite->session_key_len);
 	if (crypto_gen_session_key(c, &s, 0x00, 6))
 		goto error;
-	str_init_len_assert(&s, c->session_auth_key, c->params.crypto_suite->srtp_auth_key_len);
+	s = STR_LEN_ASSERT(c->session_auth_key, c->params.crypto_suite->srtp_auth_key_len);
 	if (crypto_gen_session_key(c, &s, 0x01, 6))
 		goto error;
-	str_init_len_assert(&s, c->session_salt, c->params.crypto_suite->session_salt_len);
+	s = STR_LEN_ASSERT(c->session_salt, c->params.crypto_suite->session_salt_len);
 	if (crypto_gen_session_key(c, &s, 0x02, 6))
 		goto error;
 
@@ -43,7 +43,7 @@ error:
 	return -1;
 }
 
-static uint64_t packet_index(struct ssrc_ctx *ssrc_ctx, struct rtp_header *rtp) {
+static unsigned int packet_index(struct ssrc_ctx *ssrc_ctx, struct rtp_header *rtp) {
 	uint16_t seq;
 
 	seq = ntohs(rtp->seq_num);
@@ -52,16 +52,17 @@ static uint64_t packet_index(struct ssrc_ctx *ssrc_ctx, struct rtp_header *rtp) 
 	crypto_debug_printf("SSRC %" PRIx32 ", seq %" PRIu16, ssrc_ctx->parent->h.ssrc, seq);
 
 	/* rfc 3711 section 3.3.1 */
-	if (G_UNLIKELY(!ssrc_ctx->srtp_index))
-		ssrc_ctx->srtp_index = seq;
+	unsigned int srtp_index = atomic_get_na(&ssrc_ctx->stats->ext_seq);
+	if (G_UNLIKELY(!srtp_index))
+		atomic_set_na(&ssrc_ctx->stats->ext_seq, srtp_index = seq);
 
 	/* rfc 3711 appendix A, modified, and sections 3.3 and 3.3.1 */
-	uint16_t s_l = (ssrc_ctx->srtp_index & 0x00000000ffffULL);
-	uint32_t roc = (ssrc_ctx->srtp_index & 0xffffffff0000ULL) >> 16;
+	uint16_t s_l = (srtp_index & 0x00000000ffffULL);
+	uint32_t roc = (srtp_index & 0xffffffff0000ULL) >> 16;
 	uint32_t v = 0;
 
-	crypto_debug_printf(", prev seq %" PRIu64 ", s_l %" PRIu16 ", ROC %" PRIu32,
-			ssrc_ctx->srtp_index, s_l, roc);
+	crypto_debug_printf(", prev seq %u, s_l %" PRIu16 ", ROC %" PRIu32,
+			srtp_index, s_l, roc);
 
 	if (s_l < 0x8000) {
 		if (((seq - s_l) > 0x8000) && roc > 0)
@@ -75,11 +76,12 @@ static uint64_t packet_index(struct ssrc_ctx *ssrc_ctx, struct rtp_header *rtp) 
 			v = roc;
 	}
 
-	ssrc_ctx->srtp_index = (uint64_t)(((v << 16) | seq) & 0xffffffffffffULL);
+	srtp_index = (uint64_t)(((v << 16) | seq) & 0xffffffffffffULL);
+	atomic_set_na(&ssrc_ctx->stats->ext_seq, srtp_index);
 
-	crypto_debug_printf(", v %" PRIu32 ", ext seq %" PRIu64, v, ssrc_ctx->srtp_index);
+	crypto_debug_printf(", v %" PRIu32 ", ext seq %u", v, srtp_index);
 
-	return ssrc_ctx->srtp_index;
+	return srtp_index;
 }
 
 void rtp_append_mki(str *s, struct crypto_context *c) {
@@ -101,7 +103,7 @@ void rtp_append_mki(str *s, struct crypto_context *c) {
 int rtp_avp2savp(str *s, struct crypto_context *c, struct ssrc_ctx *ssrc_ctx) {
 	struct rtp_header *rtp;
 	str payload, to_auth;
-	uint64_t index;
+	unsigned int index;
 
 	if (G_UNLIKELY(!ssrc_ctx))
 		return -1;
@@ -143,7 +145,7 @@ int rtp_avp2savp(str *s, struct crypto_context *c, struct ssrc_ctx *ssrc_ctx) {
 /* rfc 3711, section 3.3 */
 int rtp_savp2avp(str *s, struct crypto_context *c, struct ssrc_ctx *ssrc_ctx) {
 	struct rtp_header *rtp;
-	uint64_t index;
+	unsigned int index;
 	str payload, to_auth, to_decrypt, auth_tag;
 	char hmac[20];
 
@@ -211,9 +213,9 @@ int rtp_savp2avp(str *s, struct crypto_context *c, struct ssrc_ctx *ssrc_ctx) {
 	goto error;
 
 decrypt_idx:
-	ilog(LOG_DEBUG, "Detected unexpected SRTP ROC reset (from %" PRIu64 " to %" PRIu64 ")",
-			ssrc_ctx->srtp_index, index);
-	ssrc_ctx->srtp_index = index;
+	ilog(LOG_DEBUG, "Detected unexpected SRTP ROC reset (from %u to %u)",
+			atomic_get_na(&ssrc_ctx->stats->ext_seq), index);
+	atomic_set_na(&ssrc_ctx->stats->ext_seq, index);
 decrypt:;
 	int prev_len = to_decrypt.len;
 	if (c->params.session_params.unencrypted_srtp)
@@ -247,9 +249,9 @@ decrypt:;
 			return -1;
 		}
 		if (guess != 0) {
-			ilog(LOG_DEBUG, "Detected unexpected SRTP ROC reset (from %" PRIu64 " to %" PRIu64 ")",
-					ssrc_ctx->srtp_index, index);
-			ssrc_ctx->srtp_index = index;
+			ilog(LOG_DEBUG, "Detected unexpected SRTP ROC reset (from %u to %u)",
+					atomic_get_na(&ssrc_ctx->stats->ext_seq), index);
+			atomic_set_na(&ssrc_ctx->stats->ext_seq, index);
 		}
 	}
 
@@ -284,7 +286,7 @@ int srtp_payloads(str *to_auth, str *to_decrypt, str *auth_tag, str *mki,
 		if (to_decrypt->len < auth_len)
 			goto error;
 
-		str_init_len(auth_tag, to_decrypt->s + to_decrypt->len - auth_len, auth_len);
+		*auth_tag = STR_LEN(to_decrypt->s + to_decrypt->len - auth_len, auth_len);
 		to_decrypt->len -= auth_len;
 		to_auth->len -= auth_len;
 	}
@@ -296,7 +298,7 @@ int srtp_payloads(str *to_auth, str *to_decrypt, str *auth_tag, str *mki,
 			goto error;
 
 		if (mki)
-			str_init_len(mki, to_decrypt->s - mki_len, mki_len);
+			*mki = STR_LEN(to_decrypt->s - mki_len, mki_len);
 		to_decrypt->len -= mki_len;
 		to_auth->len -= mki_len;
 	}

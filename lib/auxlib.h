@@ -34,12 +34,17 @@ struct rtpengine_common_config {
 	gboolean foreground;
 	int thread_stack;
 	int poller_size;
+	gboolean io_uring;
+	int io_uring_buffers;
 	int max_log_line_length;
+	int mos_type;				// enum in codec_def_t
 	char *evs_lib_path;
 	char *codec_chain_lib_path;
 	int codec_chain_runners;
 	int codec_chain_concurrency;
 	int codec_chain_async;
+	int codec_chain_opus_application;
+	int codec_chain_opus_complexity;
 };
 
 extern struct rtpengine_common_config *rtpe_common_config_ptr;
@@ -61,9 +66,16 @@ void resources(void);
 void wpidfile(void);
 void service_notify(const char *message);
 void config_load_free(struct rtpengine_common_config *);
-void config_load(int *argc, char ***argv, GOptionEntry *entries, const char *description,
+void config_load_ext(int *argc, char ***argv, GOptionEntry *entries, const char *description,
 		char *default_config, char *default_section,
-		struct rtpengine_common_config *);
+		struct rtpengine_common_config *,
+		char * const *template_section, GHashTable *templates);
+INLINE void config_load(int *argc, char ***argv, GOptionEntry *entries, const char *description,
+		char *default_config, char *default_section,
+		struct rtpengine_common_config *cc)
+{
+	config_load_ext(argc, argv, entries, description, default_config, default_section, cc, NULL, NULL);
+}
 
 char *get_thread_buf(void);
 int thread_create(void *(*func)(void *), void *arg, bool joinable, pthread_t *handle, const char *name);
@@ -95,6 +107,13 @@ INLINE void random_string(unsigned char *buf, int len) {
 	(void) ret;
 }
 
+INLINE unsigned int c_str_hash(const char *s) {
+	return g_str_hash(s);
+}
+INLINE gboolean c_str_equal(const char *a, const char *b) {
+	return g_str_equal(a, b);
+}
+
 
 /*** MUTEX ABSTRACTION ***/
 
@@ -114,7 +133,9 @@ typedef pthread_cond_t cond_t;
 #define rwlock_lock_r(l) __debug_rwlock_lock_r(l, __FILE__, __LINE__)
 #define rwlock_unlock_r(l) __debug_rwlock_unlock_r(l, __FILE__, __LINE__)
 #define rwlock_lock_w(l) __debug_rwlock_lock_w(l, __FILE__, __LINE__)
+#define rwlock_trylock_w(l) __debug_rwlock_trylock_w(l, __FILE__, __LINE__)
 #define rwlock_unlock_w(l) __debug_rwlock_unlock_w(l, __FILE__, __LINE__)
+#define RWLOCK_STATIC_INIT PTHREAD_RWLOCK_INITIALIZER
 
 #define cond_init(c) __debug_cond_init(c, __FILE__, __LINE__)
 #define cond_wait(c,m) __debug_cond_wait(c,m, __FILE__, __LINE__)
@@ -160,6 +181,7 @@ INLINE int __cond_timedwait_tv(cond_t *c, mutex_t *m, const struct timeval *tv) 
 #define __debug_rwlock_lock_r(l, F, L) pthread_rwlock_rdlock(l)
 #define __debug_rwlock_unlock_r(l, F, L) pthread_rwlock_unlock(l)
 #define __debug_rwlock_lock_w(l, F, L) pthread_rwlock_wrlock(l)
+#define __debug_rwlock_trylock_w(l, F, L) pthread_rwlock_trywrlock(l)
 #define __debug_rwlock_unlock_w(l, F, L) pthread_rwlock_unlock(l)
 
 #define __debug_cond_init(c, F, L) pthread_cond_init(c, NULL)
@@ -222,6 +244,13 @@ INLINE int __debug_rwlock_lock_w(rwlock_t *m, const char *file, unsigned int lin
 	write_log(LOG_DEBUG, "rwlock_lock_w(%p) at %s:%u ...", m, file, line);
 	ret = pthread_rwlock_wrlock(m);
 	write_log(LOG_DEBUG, "rwlock_lock_w(%p) at %s:%u returning %i", m, file, line, ret);
+	return ret;
+}
+INLINE int __debug_rwlock_trylock_w(rwlock_t *m, const char *file, unsigned int line) {
+	int ret;
+	write_log(LOG_DEBUG, "rwlock_trylock_w(%p) at %s:%u ...", m, file, line);
+	ret = pthread_rwlock_trywrlock(m);
+	write_log(LOG_DEBUG, "rwlock_trylock_w(%p) at %s:%u returning %i", m, file, line, ret);
 	return ret;
 }
 INLINE int __debug_rwlock_unlock_r(rwlock_t *m, const char *file, unsigned int line) {
@@ -430,13 +459,6 @@ INLINE gboolean g_hash_table_steal_extended(GHashTable *ht, gconstpointer lookup
 }
 #endif
 
-#if !(GLIB_CHECK_VERSION(2,60,0))
-INLINE void g_queue_clear_full(GQueue *q, GDestroyNotify free_func) {
-	void *p;
-	while ((p = g_queue_pop_head(q)))
-		free_func(p);
-}
-#endif
 
 
 /*** MISC ***/
@@ -461,6 +483,13 @@ INLINE pid_t gettid(void) {
 	return syscall(SYS_gettid);
 }
 #endif
+
+INLINE unsigned int int64_hash(const uint64_t *s) {
+	return g_int64_hash(s);
+}
+INLINE gboolean int64_eq(const uint64_t *a, const uint64_t *b) {
+	return *a == *b;
+}
 
 
 
@@ -542,7 +571,7 @@ INLINE void atomic64_local_copy_zero(atomic64 *dst, atomic64 *src) {
 
 INLINE void atomic64_min(atomic64 *min, uint64_t val) {
 	do {
-		uint64_t old = atomic64_get(min);
+		uint64_t old = atomic64_get_na(min);
 		if (old && old <= val)
 			break;
 		if (atomic64_set_if(min, val, old))
@@ -551,7 +580,7 @@ INLINE void atomic64_min(atomic64 *min, uint64_t val) {
 }
 INLINE void atomic64_max(atomic64 *max, uint64_t val) {
 	do {
-		uint64_t old = atomic64_get(max);
+		uint64_t old = atomic64_get_na(max);
 		if (old && old >= val)
 			break;
 		if (atomic64_set_if(max, val, old))
@@ -560,37 +589,38 @@ INLINE void atomic64_max(atomic64 *max, uint64_t val) {
 }
 
 INLINE void atomic64_calc_rate_from_diff(long long run_diff_us, uint64_t diff, atomic64 *rate_var) {
-	atomic64_set(rate_var, run_diff_us ? diff * 1000000LL / run_diff_us : 0);
+	atomic64_set_na(rate_var, run_diff_us ? diff * 1000000LL / run_diff_us : 0);
 }
 INLINE void atomic64_calc_rate(const atomic64 *ax_var, long long run_diff_us,
 		atomic64 *intv_var, atomic64 *rate_var)
 {
-	uint64_t ax = atomic64_get(ax_var);
-	uint64_t old_intv = atomic64_get(intv_var);
-	atomic64_set(intv_var, ax);
+	uint64_t ax = atomic64_get_na(ax_var);
+	uint64_t old_intv = atomic64_get_na(intv_var);
+	atomic64_set_na(intv_var, ax);
 	atomic64_calc_rate_from_diff(run_diff_us, ax - old_intv, rate_var);
 }
 INLINE void atomic64_calc_diff(const atomic64 *ax_var, atomic64 *intv_var, atomic64 *diff_var) {
-	uint64_t ax = atomic64_get(ax_var);
-	uint64_t old_intv = atomic64_get(intv_var);
-	atomic64_set(intv_var, ax);
-	atomic64_set(diff_var, ax - old_intv);
+	uint64_t ax = atomic64_get_na(ax_var);
+	uint64_t old_intv = atomic64_get_na(intv_var);
+	atomic64_set_na(intv_var, ax);
+	atomic64_set_na(diff_var, ax - old_intv);
 }
 INLINE void atomic64_mina(atomic64 *min, atomic64 *inp) {
-	atomic64_min(min, atomic64_get(inp));
+	atomic64_min(min, atomic64_get_na(inp));
 }
 INLINE void atomic64_maxa(atomic64 *max, atomic64 *inp) {
-	atomic64_max(max, atomic64_get(inp));
+	atomic64_max(max, atomic64_get_na(inp));
 }
 INLINE double atomic64_div(const atomic64 *n, const atomic64 *d) {
-	int64_t dd = atomic64_get(d);
+	int64_t dd = atomic64_get_na(d);
 	if (!dd)
 		return 0.;
-	return (double) atomic64_get(n) / (double) dd;
+	return (double) atomic64_get_na(n) / (double) dd;
 }
 
 #define atomic_get_na(x) __atomic_load_n(x, __ATOMIC_RELAXED)
 #define atomic_set_na(x,y) __atomic_store_n(x, y, __ATOMIC_RELAXED)
+#define atomic_inc_na(x) __atomic_fetch_add(x, 1, __ATOMIC_RELAXED);
 
 
 /*** ATOMIC BITFIELD OPERATIONS ***/

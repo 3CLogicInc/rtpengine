@@ -60,13 +60,14 @@ static int control_stream_parse(struct streambuf_stream *s, char *line) {
 	int ret;
 	char **out;
 	struct control_tcp *c = (void *) s->parent;
-	str *output = NULL;
+	str output = STR_NULL;
 
 	pcre2_match_data *md = pcre2_match_data_create(20, NULL);
 	ret = pcre2_match(c->parse_re, (PCRE2_SPTR8) line, PCRE2_ZERO_TERMINATED,
 			0, 0, md, NULL);
 	if (ret <= 0) {
 		ilogs(control, LOG_WARNING, "Unable to parse command line from %s: %s", s->addr, line);
+		pcre2_match_data_free(md);
 		return -1;
 	}
 
@@ -96,12 +97,12 @@ static int control_stream_parse(struct streambuf_stream *s, char *line) {
 	else if (!strcmp(out[RE_TCP_DIV_CMD], "quit") || !strcmp(out[RE_TCP_DIV_CMD], "exit"))
 		{}
 
-	if (output) {
-		streambuf_write_str(s->outbuf, output);
-		free(output);
+	if (output.len) {
+		streambuf_write_str(s->outbuf, &output);
+		free(output.s);
 	}
 
-	pcre2_substring_list_free((PCRE2_SPTR *) out);
+	pcre2_substring_list_free((SUBSTRING_FREE_ARG) out);
 	pcre2_match_data_free(md);
 	log_info_pop();
 	return 1;
@@ -141,8 +142,7 @@ static void control_incoming(struct streambuf_stream *s) {
 }
 
 
-static void control_tcp_free(void *p) {
-	struct control_tcp *c = p;
+static void control_tcp_free(struct control_tcp *c) {
 	streambuf_listener_shutdown(&c->listener);
 	pcre2_code_free(c->parse_re);
 }
@@ -150,7 +150,7 @@ static void control_tcp_free(void *p) {
 struct control_tcp *control_tcp_new(const endpoint_t *ep) {
 	struct control_tcp *c;
 
-	c = obj_alloc0("control", sizeof(*c), control_tcp_free);
+	c = obj_alloc0(struct control_tcp, control_tcp_free);
 
 	if (streambuf_listener_init(&c->listener, ep,
 				control_incoming, control_stream_readable,

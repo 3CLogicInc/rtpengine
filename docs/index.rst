@@ -2,21 +2,37 @@
 .. _Sipwise: https://www.sipwise.com
 .. _Kamailio: https://www.kamailio.org/
 
-What is rtpengine?
-=====================================
-
-The `Sipwise`_ NGCP rtpengine is a proxy for RTP traffic and other UDP based media traffic.
-It's meant to be used with the `Kamailio`_ SIP proxy and forms a drop-in replacement for any of the other available RTP and media proxies.
-
-Currently the only supported platform is GNU/Linux.
+Welcome to the Rtpengine Project Documentation
+==============================================
 
 .. toctree::
    :maxdepth: 4
 
-   overview
-   rtpengine
-   rtpengine-recording
+   Overview <overview>
+
+==============================================
+
+.. toctree::
+   :maxdepth: 1
+
+   usage
+   Option flags (NG control protocol) <ng_control_protocol>
+
+==============================================
+
+.. toctree::
+   :maxdepth: 1
+
+   Daemon manual page: start and configuration options <rtpengine>
+   Recording daemon manual page: start and configuration options <rtpengine-recording>
+
+==============================================
+
+.. toctree::
+   :maxdepth: 2
+
    architecture
    tests
    troubleshooting
+   transcoding
    glossary

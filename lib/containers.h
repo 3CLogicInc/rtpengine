@@ -5,6 +5,13 @@
 #include <glib.h>
 #include <assert.h>
 
+#if !(GLIB_CHECK_VERSION(2,60,0))
+static inline void g_queue_clear_full(GQueue *q, GDestroyNotify free_func) {
+	void *p;
+	while ((p = g_queue_pop_head(q)))
+		free_func(p);
+}
+#endif
 
 #define TYPED_GHASHTABLE_PROTO(type_name, key_type, value_type) \
 	typedef union { \
@@ -106,7 +113,9 @@
 
 #define TYPED_GHASHTABLE_IMPL(type_name, hash_func, eq_func, key_free_func, value_free_func) \
 	static inline type_name type_name##_new(void) { \
-		GHashTable *ht = g_hash_table_new_full(hash_func, eq_func, \
+		unsigned int (*__hash_func)(__typeof__(((type_name *)0)->__ckey)) = hash_func; \
+		gboolean (*__eq_func)(__typeof__(((type_name *)0)->__ckey), __typeof__(((type_name *)0)->__ckey)) = eq_func; \
+		GHashTable *ht = g_hash_table_new_full((GHashFunc) __hash_func, (GEqualFunc) __eq_func, \
 				(GDestroyNotify) key_free_func, \
 				(GDestroyNotify) value_free_func); \
 		return (type_name) { ht }; \
@@ -132,6 +141,14 @@
 		return r; \
 	}
 
+#define TYPED_DIRECT_FUNCS(hash_name, eq_name, type) \
+	static inline unsigned int hash_name(const type *a) { \
+		return g_direct_hash(a); \
+	} \
+	static inline gboolean eq_name(const type *a, const type *b) { \
+		return a == b; \
+	}
+
 
 #define TYPED_GQUEUE(type_name, contained_type) \
 	typedef union type_name##_slist type_name##_slist; \
@@ -152,7 +169,10 @@
 	union type_name##_list { \
 		GList l; \
 		struct { \
-			contained_type *data; \
+			union { \
+				contained_type *data; \
+				const contained_type *__ct; \
+			}; \
 			type_name##_list *next; \
 			type_name##_list *prev; \
 		}; \
@@ -278,6 +298,13 @@
 		int (*__f)(__typeof__((Q)->__ct), const void *) = f; \
 		GList *__l = g_queue_find_custom(&(Q)->q, e, (GCompareFunc) __f); \
 		__typeof__((Q)->head) __ret = (__typeof__((Q)->head)) __l; \
+		__ret; \
+	})
+
+#define t_list_find_custom(L, e, f) ({ \
+		int (*__f)(__typeof__((L)->__ct), const void *) = f; \
+		GList *__l = g_list_find_custom(&(L)->l, e, (GCompareFunc) __f); \
+		__typeof__(L) __ret = (__typeof__(L)) __l; \
 		__ret; \
 	})
 

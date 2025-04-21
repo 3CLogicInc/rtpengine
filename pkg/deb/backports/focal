@@ -13,6 +13,8 @@ cp -r debian ${DIST}
 
 # No libbcg729-dev package
 sed -i -e '/libbcg729-dev/d' ${DIST}/control
+# No liburing-dev package
+sed -i -e '/liburing-dev/d' ${DIST}/control
 
 # Update for focal debhelper
 sed -i -e 's/debhelper-compat.*/debhelper-compat (= 12),/' ${DIST}/control
@@ -20,6 +22,13 @@ sed -i -e 's/debhelper-compat.*/debhelper-compat (= 12),/' ${DIST}/control
 sed -i -e 's/^execute_after_dh_installsystemd:/override_dh_installsystemd:\n\tdh_installsystemd/' ${DIST}/rules
 sed -i -e 's/^execute_before_dh_auto_install-indep:/override_dh_auto_install-indep:/' ${DIST}/rules
 sed -i -e '/^\tgzip -9 < README.md/a\\n\tdh_auto_install' ${DIST}/rules
+
+# fix links
+sed -i -e 's#${env:deb_systemdsystemunitdir}#/lib/systemd/system/#g' \
+  ${DIST}/rtpengine-recording-daemon.links
+sed -i -e 's#${env:deb_systemdsystemunitdir}#/lib/systemd/system/#g' \
+  ${DIST}/rtpengine-daemon.links
+
 # Add dwz override
 cat >> ${DIST}/rules <<'EOF'
 
@@ -54,7 +63,7 @@ sed -i 's;^override_dh_auto_install-indep:;override_dh_auto_install-indep:\
 \t# Create the directories to install the source into\
 \tdh_installdirs -p$(pdkms)    usr/src/$(sname)-$(sversion)\
 \t# Copy only the driver source to the proper locations\
-\tcd kernel-module \&\& cp Makefile *.c *.h ../debian/$(pdkms)/usr/src/$(sname)-$(sversion)\
+\tcd kernel-module \&\& cp Makefile *.c *.h *.inc ../debian/$(pdkms)/usr/src/$(sname)-$(sversion)\
 \t# Prepare dkms.conf from the dkms.conf.in template\
 \tsed "s/__VERSION__/$(sversion)/g" debian/dkms.conf.in > debian/$(pdkms)/usr/src/$(sname)-$(sversion)/dkms.conf\
 ;' "${DIST}"/rules

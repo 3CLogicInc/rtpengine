@@ -26,93 +26,23 @@ static const char *transports[] = {
  * Helpers.
  */
 
-static int get_ip_type(char *str_addr)
+/* parsing of key and val from string */
+static bool get_key_val(str * key, str * val, str *in_out)
 {
-	struct addrinfo hint, *info = NULL;
-	int ret;
-
-	memset(&hint, '\0', sizeof hint);
-	hint.ai_family = PF_UNSPEC;
-	hint.ai_flags = AI_NUMERICHOST;
-
-	ret = getaddrinfo(str_addr, NULL, &hint, &info);
-	if(ret) {
-		/* Invalid ip addinfos */
-		return -1;
-	}
-
-	if(info->ai_family == AF_INET) {
-		ilogs(control, LOG_DEBUG, "%s is an ipv4 addinfos", str_addr);
-	} else if(info->ai_family == AF_INET6) {
-		ilogs(control, LOG_DEBUG, "%s is an ipv6 addinfos", str_addr);
-	} else {
-		ilogs(control, LOG_DEBUG, "%s is an unknown addinfos format AF=%d", str_addr,
-				info->ai_family);
-		freeaddrinfo(info);
-		return -1;
-	}
-
-	ret = info->ai_family;
-
-	freeaddrinfo(info);
-
-	return ret;
-}
-
-/* parsing of key and val from pure char array */
-static bool get_key_val(str * key, str * val, const char * start, char ** eptr)
-{
-	key->s = (void *)start;
-	val->len = key->len = -1;
-	val->s = NULL;
-
-	*eptr = strpbrk(key->s, " =");
-	if(!*eptr) {
-		*eptr = key->s + strlen(key->s);
-	}
-	/* for those flags with key=value syntax */
-	else if(**eptr == '=') {
-		key->len = *eptr - key->s;
-		val->s = *eptr + 1;
-		*eptr = strchr(val->s, ' ');
-		if(!*eptr)
-			*eptr = val->s + strlen(val->s);
-		val->len = *eptr - val->s;
-	}
-
-	if(key->len == -1)
-		key->len = *eptr - key->s;
-	if(!key->len)
+	if (!str_token_sep(key, in_out, ' '))
 		return false;
-
+	// key=value ?
+	str k;
+	*val = STR_NULL;
+	if (!str_token_sep(&k, key, '='))
+		return true;
+	*val = *key;
+	*key = k;
 	return true;
 }
 
-static inline int str_eq(const str *p, const char *q)
-{
-	int l = strlen(q);
-	if(p->len != l)
-		return 0;
-	if(memcmp(p->s, q, l))
-		return 0;
-	return 1;
-}
-
-static inline int str_prefix(const str *p, const char *q, str *out)
-{
-	int l = strlen(q);
-	if(p->len < l)
-		return 0;
-	if(memcmp(p->s, q, l))
-		return 0;
-	*out = *p;
-	out->s += l;
-	out->len -= l;
-	return 1;
-}
-
 /* handle either "foo-bar" or "foo=bar" from flags */
-static int str_key_val_prefix(const str * p, const char * q,
+static bool str_key_val_prefix(const str * p, const char * q,
 		const str * v, str * out)
 {
 	if(str_eq(p, q)) {
@@ -120,52 +50,210 @@ static int str_key_val_prefix(const str * p, const char * q,
 			return 0;
 
 		*out = *v;
-		return 1;
-	}
-	if(!str_prefix(p, q, out))
-		return 0;
-	if(out->len < 2)
-		return 0;
-	if(*out->s != '-')
-		return 0;
-	out->s++;
-	out->len--;
-	return 1;
-}
-
-/**
- * Work with bencode objects.
- */
-
-/* parse `received-from` */
-static bool parse_received_from(str * key, str * val, bencode_buffer_t * buf,
-		sdp_ng_flags * out, enum call_opmode opmode)
-{
-	bencode_item_t * item;
-	int ip_af = AF_UNSPEC;
-	str ipfamily, s;
-
-	if(str_key_val_prefix(key, "received-from", val, &s)) {
-		item = bencode_list(buf);
-
-		ip_af = get_ip_type(s.s);
-		ipfamily.len = 3;
-		ipfamily.s = (ip_af == AF_INET) ? "IP4" : "IP6";
-		bencode_list_add_str(item, &ipfamily);
-
-		bencode_list_add_str(item, &s);
-		call_ng_main_flags(out, &STR_CONST_INIT("received-from"), item, opmode);
 		return true;
 	}
+	*out = *p;
+	if (str_shift_cmp(out, q))
+		return false;
+	if(out->len < 2)
+		return false;
+	if(*out->s != '-')
+		return false;
+	out->s++;
+	out->len--;
+	return true;
+}
+
+static inline bool skip_char(str *s, char c) {
+	if (s->len == 0 || s->s[0] != c)
+		return false;
+	str_shift(s, 1);
+	return true;
+}
+static inline void skip_chars(str *s, char c) {
+	while (skip_char(s, c));
+}
+
+static int rtpp_is_dict_list(rtpp_pos *a) {
+	str list = a->cur;
+	if (!skip_char(&list, '['))
+		return 0;
+	// check contents
+	if (list.len == 0)
+		list = a->remainder; // could be just leading spaces?
+	if (list.len == 0)
+		return 0; // unexpected end of string
+	if (list.s[0] == '[')
+		return 1; // contains sub-list, must be a list
+	// inspect first element for 'key='
+	str key, val;
+	if (!get_key_val(&key, &val, &list))
+		return 0; // nothing to read
+	if (val.len)
+		return 2; // is a dict
+	return 1; // is a list
+}
+
+static bool rtpp_is_list(rtpp_pos *a) {
+	return rtpp_is_dict_list(a) == 1;
+}
+static bool rtpp_is_dict(rtpp_pos *a) {
+	return rtpp_is_dict_list(a) == 2;
+}
+static str *rtpp_get_str(rtpp_pos *a, str *b) {
+	if (rtpp_is_dict_list(a) != 0)
+		return NULL;
+	if (a->cur.len == 0)
+		return NULL;
+	*b = a->cur;
+	return b;
+}
+static long long rtpp_get_int_str(rtpp_pos *a, long long def) {
+	str s;
+	if (!rtpp_get_str(a, &s))
+		return def;
+	return str_to_i(&s, def);
+}
+static bool rtpp_dict_list_end_rewind(rtpp_pos *pos) {
+	// check for dict/list end, which is only valid if it doesn't also start one
+	if (pos->cur.len == 0 || pos->cur.s[0] == '[' || pos->cur.s[pos->cur.len - 1] != ']')
+		return false;
+
+	pos->cur.len--;
+	// remove any extra closing bracket, and return them to the remainder for
+	// the upper level function to parse
+	while (pos->cur.len && pos->cur.s[pos->cur.len - 1] == ']') {
+		pos->cur.len--;
+		pos->remainder.s--;
+		pos->remainder.len++;
+		// we might be on a space or something - go to the actual bracket, which must
+		// be there somewhere
+		while (pos->remainder.s[0] != ']') {
+			pos->remainder.s--;
+			pos->remainder.len++;
+		}
+	}
+
+	return true;
+}
+static bool rtpp_dict_list_closing(rtpp_pos *pos) {
+	if (pos->cur.s[0] != ']')
+		return false;
+
+	str_shift(&pos->cur, 1);
+	// anything left in the string, return it to the remainder
+	pos->remainder.len += pos->remainder.s - pos->cur.s;
+	pos->remainder.s = pos->cur.s;
+
+	return true;
+}
+static void rtpp_list_iter(const ng_parser_t *parser, rtpp_pos *pos,
+		void (*str_callback)(str *key, unsigned int, helper_arg),
+		void (*item_callback)(const ng_parser_t *, parser_arg, helper_arg), helper_arg arg)
+{
+	// list opener
+	if (!skip_char(&pos->cur, '['))
+		return;
+
+	unsigned int idx = 0;
+
+	while (true) {
+		skip_chars(&pos->cur, ' ');
+		if (!pos->cur.len)
+			goto next; // empty token?
+
+		// list closing?
+		if (rtpp_dict_list_closing(pos))
+			break;
+
+		// does it start another list or dict?
+		if (pos->cur.s[0] == '[') {
+			if (item_callback)
+				item_callback(parser, pos, arg);
+			goto next;
+		}
+
+		// guess it's a string token
+		// does it end the list?
+		bool end = rtpp_dict_list_end_rewind(pos);
+
+		if (pos->cur.len == 0)
+			break; // nothing left
+
+		if (str_callback)
+			str_callback(&pos->cur, idx++, arg);
+		if (end)
+			break;
+		goto next;
+
+next:
+		// find next token in remainder, put in `cur`
+		if (!str_token_sep(&pos->cur, &pos->remainder, ' '))
+			break;
+	}
+}
+static bool rtpp_dict_iter(const ng_parser_t *parser, rtpp_pos *pos,
+		void (*callback)(const ng_parser_t *, str *, parser_arg, helper_arg),
+		helper_arg arg)
+{
+	// list opener
+	if (!skip_char(&pos->cur, '['))
+		return false;
+
+	while (true) {
+		skip_chars(&pos->cur, ' ');
+		if (!pos->cur.len)
+			goto next; // empty token?
+
+		// dict closing?
+		if (rtpp_dict_list_closing(pos))
+			break;
+
+		str key;
+		if (!str_token(&key, &pos->cur, '=')) {
+			ilog(LOG_ERR, "Entry in dictionary without equals sign ('" STR_FORMAT "'), aborting",
+					STR_FMT(&pos->cur));
+			break;
+		}
+
+		// guess it's a string token
+		// does it end the dict?
+		bool end = rtpp_dict_list_end_rewind(pos);
+
+		if (pos->cur.len == 0)
+			break; // nothing left
+
+		callback(parser, &key, pos, arg);
+		if (end)
+			break;
+		goto next;
+
+next:
+		// find next token in remainder, put in `cur`
+		if (!str_token_sep(&pos->cur, &pos->remainder, ' '))
+			break;
+	}
+
+	return true;
+}
+static bool rtpp_is_int(rtpp_pos *pos) {
 	return false;
 }
 
+const ng_parser_t dummy_parser = {
+	.is_list = rtpp_is_list,
+	.is_dict = rtpp_is_dict,
+	.is_int = rtpp_is_int,
+	.list_iter = rtpp_list_iter,
+	.dict_iter = rtpp_dict_iter,
+	.get_str = rtpp_get_str,
+	.get_int_str = rtpp_get_int_str,
+};
+
 static bool parse_codec_to_dict(str * key, str * val, const char *cmp1, const char *cmp2,
-		const char * dictstr, sdp_ng_flags * out, bencode_buffer_t * buf,
-		enum call_opmode opmode)
+		const char * dictstr, sdp_ng_flags *flags)
 {
 	str s;
-	bencode_item_t * dictp;
 
 	if(!str_key_val_prefix(key, cmp1, val, &s)) {
 		if(!cmp2)
@@ -174,31 +262,27 @@ static bool parse_codec_to_dict(str * key, str * val, const char *cmp1, const ch
 			return false;
 	}
 
-	dictp = bencode_list(buf);
-	bencode_list_add_str(dictp, &s);
-	call_ng_codec_flags(out, &STR_INIT(dictstr), dictp, opmode);
+	call_ng_codec_flags(&dummy_parser, STR_PTR(dictstr), &(rtpp_pos) {.cur = s}, flags);
 
 	return true;
 }
 
 /* parse codec related flags */
-static bool parse_codecs(enum call_opmode opmode, sdp_ng_flags * out,
-		bencode_buffer_t * buf, str * key, str * val)
-{
+static bool parse_codecs(sdp_ng_flags *flags, str * key, str * val) {
 	if (parse_codec_to_dict(key, val, "transcode",
-				"codec-transcode", "transcode", out, buf, opmode) ||
+				"codec-transcode", "transcode", flags) ||
 		parse_codec_to_dict(key, val, "codec-strip",
-				NULL, "strip", out, buf, opmode) ||
+				NULL, "strip", flags) ||
 		parse_codec_to_dict(key, val, "codec-offer",
-				NULL, "offer", out, buf, opmode) ||
+				NULL, "offer", flags) ||
 		parse_codec_to_dict(key, val, "codec-mask",
-				NULL, "mask", out, buf, opmode) ||
+				NULL, "mask", flags) ||
 		parse_codec_to_dict(key, val, "codec-set",
-				NULL, "set", out, buf, opmode) ||
+				NULL, "set", flags) ||
 		parse_codec_to_dict(key, val, "codec-accept",
-				NULL, "accept", out, buf, opmode) ||
+				NULL, "accept", flags) ||
 		parse_codec_to_dict(key, val, "codec-except",
-				NULL, "except", out, buf, opmode))
+				NULL, "except", flags))
 	{
 		return true;
 	}
@@ -207,28 +291,25 @@ static bool parse_codecs(enum call_opmode opmode, sdp_ng_flags * out,
 }
 
 /* prase transport, such as for example RTP/AVP */
-static void parse_transports(sdp_ng_flags *out, bencode_buffer_t *buf,
-		enum call_opmode opmode, unsigned int transport)
+static void parse_transports(unsigned int transport, sdp_ng_flags *out)
 {
 	const char * val = transports[transport & 0x007];
 	if (!val)
 		return;
-	call_ng_main_flags(out, &STR_CONST_INIT("transport-protocol"), bencode_string(buf, val), opmode);
+	call_ng_main_flags(&dummy_parser, &STR_CONST("transport-protocol"),
+			&(rtpp_pos) {.cur = STR(val), .remainder = STR_NULL}, out);
 }
 
-#if 0
-static bool parse_str_flag(str * key, str * val, const char * name,
-		bencode_item_t * root_dict)
-{
-	if(str_eq(key, name)) {
-		if (val->s) {
-			bencode_dictionary_str_add_str(root_dict, key, val);
-			return true;
-		}
+
+static void rtpp_direction_flag(sdp_ng_flags *flags, unsigned int *flagnum, str *val) {
+	static const str keys[2] = {STR_CONST("from-interface"), STR_CONST("to-interface")};
+	if (*flagnum >= G_N_ELEMENTS(keys)) {
+		ilog(LOG_WARN, "Too many 'direction=...' flags encountered");
+		return;
 	}
-	return false;
+	str key = keys[(*flagnum)++];
+	call_ng_main_flags(&dummy_parser, &key, &(rtpp_pos) {.cur = *val}, flags);
 }
-#endif
 
 /**
  * Parse flags from bencode string into given bencode dictionary.
@@ -237,42 +318,28 @@ static bool parse_str_flag(str * key, str * val, const char * name,
  * @param rtpp_flags - raw str rtpp_flags
  * @param dict - root dict to store encoded flags
  */
-void parse_rtpp_flags(const str * rtpp_flags, bencode_buffer_t * buf,
-		enum call_opmode opmode, sdp_ng_flags * out)
+void parse_rtpp_flags(const str * rtpp_flags, sdp_ng_flags *out)
 {
-	char * start, * end, * eptr, c;
-	str key, val;
-	bencode_item_t * direction;
+	str remainder, key, val;
+	unsigned int direction_flag = 0;
 	unsigned int transport = 0;
 
 	if (!rtpp_flags->s)
 		return;
 
-	/* ensure rtpp_flags always null terminated */
-	c = rtpp_flags->s[rtpp_flags->len];
-	rtpp_flags->s[rtpp_flags->len] = '\0';
+	remainder = *rtpp_flags;
 
-	start = rtpp_flags->s;
-	end = rtpp_flags->s + rtpp_flags->len;
-
-	direction = bencode_list(buf);
-
-	while (start < end)
+	while (remainder.len)
 	{
 		/* skip spaces */
-		while(*start == ' ')
-			start++;
+		skip_chars(&remainder, ' ');
 
 		/* set key and val */
-		if (!get_key_val(&key, &val, start, &eptr))
+		if (!get_key_val(&key, &val, &remainder))
 			break;
 
-		/* specific received-from parsing */
-		if (parse_received_from(&key, &val, buf, out, opmode))
-			goto next;
-
 		/* codecs have own specific parsing as well */
-		if (parse_codecs(opmode, out, buf, &key, &val))
+		if (parse_codecs(out, &key, &val))
 			goto next;
 
 		/* parse other generic flags */
@@ -324,7 +391,7 @@ void parse_rtpp_flags(const str * rtpp_flags, bencode_buffer_t * buf,
 				}
 				/* direction */
 				else if (str_eq(&key, "internal") || str_eq(&key, "external"))
-					bencode_list_add_str(direction, &key);
+					rtpp_direction_flag(out, &direction_flag, &key);
 				/* other non-defined flags */
 				else
 					goto generic;
@@ -335,16 +402,9 @@ void parse_rtpp_flags(const str * rtpp_flags, bencode_buffer_t * buf,
 				if (!val.s && str_eq(&key, "RTP/SAVPF"))
 					transport = 0x103;
 				/* direction */
-				else if (str_eq(&key, "direction"))
-					bencode_list_add_str(direction, &val);
+				else if (str_eq(&key, "direction") && rtpp_is_dict_list(&(rtpp_pos) {.cur=val}) == 0)
+					rtpp_direction_flag(out, &direction_flag, &val);
 				else
-					goto generic;
-				goto next;
-				break;
-			case 12:
-				if (val.s && str_eq(&key, "delete-delay")) {
-					call_ng_main_flags(out, &key, bencode_integer(buf, atoi(val.s)), opmode);
-				} else
 					goto generic;
 				goto next;
 				break;
@@ -368,23 +428,19 @@ void parse_rtpp_flags(const str * rtpp_flags, bencode_buffer_t * buf,
 
 generic:
 		/* generic one key flags */
-		if (!val.s)
-			call_ng_flags_flags(out, &key, NULL);
+		if (!val.len)
+			call_ng_flags_flags(&key, 0, out);
 		/* generic flags with value, but no particular processing */
-		else
-			call_ng_main_flags(out, &key, bencode_str(buf, &val), opmode);
+		else {
+			rtpp_pos pos = { .cur = val, .remainder = remainder };
+			call_ng_main_flags(&dummy_parser, &key, &pos, out);
+			remainder = pos.remainder;
+		}
 
-next:
-		start = eptr;
+next:;
 	}
 
 	/* define transport */
 	if (transport)
-		parse_transports(out, buf, opmode, transport);
-
-	/* add directions to the root dict */
-	if (direction && direction->child)
-		call_ng_direction_flag(out, direction);
-
-	rtpp_flags->s[rtpp_flags->len] = c;
+		parse_transports(transport, out);
 }

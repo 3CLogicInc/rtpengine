@@ -12,6 +12,10 @@
 
 #include "log.h"
 #include "main.h"
+#include "bufferpool.h"
+#include "media_socket.h"
+#include "uring.h"
+#include "poller.h"
 
 #if 0
 #define BSDB(x...) fprintf(stderr, x)
@@ -193,6 +197,11 @@ void thread_waker_del(struct thread_waker *wk) {
 static void thread_detach_cleanup(void *dtp) {
 	struct detach_thread *dt = dtp;
 	g_slice_free1(sizeof(*dt), dt);
+	bufferpool_destroy(media_bufferpool);
+#ifdef HAVE_LIBURING
+	if (rtpe_config.common.io_uring)
+		uring_thread_cleanup();
+#endif
 	thread_join_me();
 }
 
@@ -245,6 +254,12 @@ static void *thread_detach_func(void *d) {
 					dt->priority, strerror(errno));
 	}
 
+	media_bufferpool = bufferpool_new(g_malloc, g_free, 64 * 65536);
+#ifdef HAVE_LIBURING
+	if (rtpe_config.common.io_uring)
+		uring_thread_init();
+#endif
+
 	thread_cleanup_push(thread_detach_cleanup, dt);
 	dt->func(dt->data);
 	thread_cleanup_pop(true);
@@ -289,6 +304,11 @@ static void thread_looper_helper(void *fp) {
 
 		enum thread_looper_action ret = lh.f();
 
+		uring_thread_loop();
+
+		if (ret == TLA_BREAK)
+			break;
+
 		struct timeval stop;
 		gettimeofday(&stop, NULL);
 		long long duration_us = timeval_diff(&stop, &rtpe_now);
@@ -299,9 +319,6 @@ static void thread_looper_helper(void *fp) {
 					duration_us / 1000000, duration_us % 1000000,
 					warn_limit_pct,
 					warn_limit_us / 1000000, warn_limit_us % 1000000);
-
-		if (ret == TLA_BREAK)
-			break;
 
 		struct timespec sleeptime = interval_ts;
 		struct timespec remtime;

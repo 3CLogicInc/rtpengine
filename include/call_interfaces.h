@@ -4,7 +4,6 @@
 #include <glib.h>
 
 #include "str.h"
-#include "bencode.h"
 #include "socket.h"
 #include "call.h"
 #include "sdp.h"
@@ -14,30 +13,42 @@ struct call_stats;
 struct streambuf_stream;
 struct sockaddr_in6;
 
-typedef union {
-	const struct sdp_attr_helper *attr_helper;
-	str_q *q;
-	str_case_ht *sct;
-	str_case_value_ht *svt;
-	void **generic;
-} helper_arg  __attribute__ ((__transparent_union__));
+#define RTPE_NG_FLAGS_STR_Q_PARAMS \
+	X(from_tags) \
+	X(codec_strip) \
+	X(codec_offer) \
+	X(codec_transcode) \
+	X(codec_mask) \
+	X(codec_accept) \
+	X(codec_consume) \
+	X(sdes_order)		/* the order, in which crypto suites are being added to the SDP */ \
+	X(sdes_offerer_pref)	/* preferred crypto suites to be selected for the offerer */
+
+#define RTPE_NG_FLAGS_SDP_ATTR_Q_PARAMS \
+	X(generic_attributes)	/* top-level (not part of an m= section) SDP session attributes */ \
+	X(all_attributes)	/* top-level (not part of an m= section) SDP session attributes */
+
+#define RTPE_NG_FLAGS_STR_CASE_HT_PARAMS \
+	X(codec_except) \
+	X(sdes_no)		/* individual crypto suites which are excluded */ \
+	X(sdes_only)		/* individual crypto suites which are only accepted */
 
 struct sdp_ng_flags {
-	enum call_opmode opmode;
+	enum ng_opmode opmode;
 	enum message_type message_type;
+	unsigned int code;
 	str call_id;
+	str to_call_id;
 	str from_tag;
-	str_q from_tags;
 	str to_tag;
 	str via_branch;
 	str sdp;
 	str received_from_family;
 	str received_from_address;
-	str media_address;
 	str address_family_str;
 	const struct transport_protocol *transport_protocol;
 	sockaddr_t parsed_received_from;
-	sockaddr_t parsed_media_address;
+	sockaddr_t media_address;
 	str direction[2];
 	str interface;
 	sockfamily_t *address_family;
@@ -53,25 +64,23 @@ struct sdp_ng_flags {
 	str address;
 	sockaddr_t xmlrpc_callback;
 	endpoint_t dtmf_log_dest;
-	str_q codec_strip;
-	str_case_ht codec_except;
-	str_q codec_offer;
-	str_q codec_transcode;
-	str_q codec_mask;
-	str_q codec_accept;
-	str_q codec_consume;
 	str_case_value_ht codec_set;
 	int ptime,
 	    rev_ptime;
-	str_case_ht sdes_no;		/* individual crypto suites which are excluded */
-	str_case_ht sdes_only;		/* individual crypto suites which are only accepted */
-	str_q sdes_order;		/* the order, in which crypto suites are being added to the SDP */
-	str_q sdes_offerer_pref;	/* preferred crypto suites to be selected for the offerer */
 	str dtls_fingerprint;
-	sdp_attr_q session_attributes;	// top-level (not part of an m= section) SDP session attributes
+
+	/* keep session level attributes for internal proper parsing */
+	sdp_origin session_sdp_orig;
+	str session_sdp_name;
+
+	str session_timing; /* t= line */
+	struct session_bandwidth session_bandwidth;
+	str session_group;	/* a=group: e.g. BUNDLE */
 
 	/* commands to manipulate attr lines in SDP */
 	struct sdp_manipulations * sdp_manipulations[__MT_MAX];
+	/* types of medias to be removed by media lvl manipulations */
+	bool sdp_media_remove[__MT_MAX];
 
 	enum {
 		ICE_DEFAULT = 0,
@@ -120,10 +129,18 @@ struct sdp_ng_flags {
 	int trigger_end_digits;
 	int trigger_end_ms;
 	int dtmf_delay;
+	int media_rec_slot_offer;
+	int media_rec_slot_answer;
+	int media_rec_slots;
 	int repeat_times;
+	long long repeat_duration;
+	int delete_delay;
 	str file;
+	str moh_file;
 	str blob;
+	str moh_blob;
 	long long db_id;
+	long long moh_db_id;
 	long long duration;
 	long long pause;
 	long long start_pos;
@@ -134,6 +151,18 @@ struct sdp_ng_flags {
 	str vsc_pause_resume_rec;
 	str vsc_start_pause_resume_rec;
 
+#define X(x) str_q x;
+RTPE_NG_FLAGS_STR_Q_PARAMS
+#undef X
+
+#define X(x) sdp_attr_q x;
+RTPE_NG_FLAGS_SDP_ATTR_Q_PARAMS
+#undef X
+
+#define X(x) str_case_ht x;
+RTPE_NG_FLAGS_STR_CASE_HT_PARAMS
+#undef X
+
 	unsigned int asymmetric:1,
 	             protocol_accept:1,
 	             no_redis_update:1,
@@ -142,7 +171,7 @@ struct sdp_ng_flags {
 	             port_latching:1,
 	             no_port_latching:1,
 	             replace_origin:1,
-	             replace_sess_conn:1,
+	             replace_origin_full:1,
 	             replace_sdp_version:1,
 	             force_inc_sdp_ver:1,
 	             replace_username:1,
@@ -187,6 +216,7 @@ struct sdp_ng_flags {
 	             single_codec:1,
 		     reuse_codec:1,
 		     static_codecs:1,
+		     allow_no_codec_media:1,
 		     allow_transcoding:1,
 		     allow_asymmetric_codecs:1,
 		     early_media:1,
@@ -227,91 +257,114 @@ struct sdp_ng_flags {
 	             disable_jb:1,
 		     nat_wait:1,
 		     pierce_nat:1,
-		     directional:1;
+		     directional:1,
+		     fatal:1,
+		     new_branch:1,
+		     provisional:1,
+		     /* to_tag is used especially by delete handling */
+		     to_tag_flag:1,
+		     moh_zero_connection:1,
+		     /* by default sendonly */
+		     moh_sendrecv:1;
 };
 
 
 extern bool trust_address_def;
 extern bool dtls_passive_def;
+extern str_case_value_ht rtpe_signalling_templates;
+extern str rtpe_default_signalling_templates[OP_COUNT + 1];
 
-str *call_request_tcp(char **);
-str *call_lookup_tcp(char **);
+str call_request_tcp(char **);
+str call_lookup_tcp(char **);
 void call_delete_tcp(char **);
 void calls_status_tcp(struct streambuf_stream *);
 
-str *call_update_udp(char **, const char*, const endpoint_t *);
-str *call_lookup_udp(char **);
-str *call_delete_udp(char **);
-str *call_query_udp(char **);
+str call_update_udp(char **, const char*, const endpoint_t *);
+str call_lookup_udp(char **);
+str call_delete_udp(char **);
+str call_query_udp(char **);
 
-const char *call_offer_ng(ng_buffer *, bencode_item_t *, bencode_item_t *, const char*,
+const char *call_offer_ng(ng_command_ctx_t *, const char*,
 		const endpoint_t *);
-const char *call_answer_ng(ng_buffer *, bencode_item_t *, bencode_item_t *);
-const char *call_delete_ng(bencode_item_t *, bencode_item_t *);
-const char *call_query_ng(bencode_item_t *, bencode_item_t *);
-const char *call_list_ng(bencode_item_t *, bencode_item_t *);
-const char *call_start_recording_ng(bencode_item_t *, bencode_item_t *);
-const char *call_stop_recording_ng(bencode_item_t *, bencode_item_t *);
-const char *call_pause_recording_ng(bencode_item_t *, bencode_item_t *);
-const char *call_start_forwarding_ng(bencode_item_t *, bencode_item_t *);
-const char *call_stop_forwarding_ng(bencode_item_t *, bencode_item_t *);
-const char *call_block_dtmf_ng(bencode_item_t *, bencode_item_t *);
-const char *call_unblock_dtmf_ng(bencode_item_t *, bencode_item_t *);
-const char *call_block_media_ng(bencode_item_t *, bencode_item_t *);
-const char *call_unblock_media_ng(bencode_item_t *, bencode_item_t *);
-const char *call_silence_media_ng(bencode_item_t *, bencode_item_t *);
-const char *call_unsilence_media_ng(bencode_item_t *, bencode_item_t *);
-const char *call_play_media_ng(bencode_item_t *, bencode_item_t *);
-const char *call_stop_media_ng(bencode_item_t *, bencode_item_t *);
-const char *call_play_dtmf_ng(bencode_item_t *, bencode_item_t *);
-void ng_call_stats(call_t *call, const str *fromtag, const str *totag, bencode_item_t *output,
+const char *call_answer_ng(ng_command_ctx_t *);
+const char *call_delete_ng(ng_command_ctx_t *);
+const char *call_query_ng(ng_command_ctx_t *);
+const char *call_list_ng(ng_command_ctx_t *);
+const char *call_start_recording_ng(ng_command_ctx_t *);
+const char *call_stop_recording_ng(ng_command_ctx_t *);
+const char *call_pause_recording_ng(ng_command_ctx_t *);
+const char *call_start_forwarding_ng(ng_command_ctx_t *);
+const char *call_stop_forwarding_ng(ng_command_ctx_t *);
+const char *call_block_dtmf_ng(ng_command_ctx_t *);
+const char *call_unblock_dtmf_ng(ng_command_ctx_t *);
+const char *call_block_media_ng(ng_command_ctx_t *);
+const char *call_unblock_media_ng(ng_command_ctx_t *);
+const char *call_silence_media_ng(ng_command_ctx_t *);
+const char *call_unsilence_media_ng(ng_command_ctx_t *);
+const char *call_play_media_ng(ng_command_ctx_t *);
+const char *call_stop_media_ng(ng_command_ctx_t *);
+const char *call_play_dtmf_ng(ng_command_ctx_t *);
+void ng_call_stats(ng_command_ctx_t *, call_t *call, const str *fromtag, const str *totag,
 		struct call_stats *totals);
-const char *call_publish_ng(ng_buffer *, bencode_item_t *, bencode_item_t *, const char *,
+const char *call_publish_ng(ng_command_ctx_t *, const char *,
 		const endpoint_t *);
-const char *call_subscribe_request_ng(bencode_item_t *, bencode_item_t *);
-const char *call_subscribe_answer_ng(ng_buffer *, bencode_item_t *, bencode_item_t *);
-const char *call_unsubscribe_ng(bencode_item_t *, bencode_item_t *);
+const char *call_subscribe_request_ng(ng_command_ctx_t *);
+const char *call_subscribe_answer_ng(ng_command_ctx_t *);
+const char *call_unsubscribe_ng(ng_command_ctx_t *);
+const char *call_connect_ng(ng_command_ctx_t *);
 
 void add_media_to_sub_list(subscription_q *q, struct call_media *media, struct call_monologue *ml);
 
 void save_last_sdp(struct call_monologue *ml, str *sdp, sdp_sessions_q *parsed, sdp_streams_q *streams);
-void call_ng_flags_init(sdp_ng_flags *out, enum call_opmode opmode);
+void call_ng_flags_init(sdp_ng_flags *out, enum ng_opmode opmode);
 void call_ng_free_flags(sdp_ng_flags *flags);
 void call_unlock_release(call_t *c);
 
 G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(sdp_ng_flags, call_ng_free_flags)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(call_t, call_unlock_release)
 
-int call_interfaces_init(void);
+int call_interfaces_init(GHashTable *);
 void call_interfaces_free(void);
 void call_interfaces_timer(void);
 
-void call_ng_flags_flags(sdp_ng_flags *out, str *s, helper_arg dummy);
-void call_ng_main_flags(sdp_ng_flags *out, str *key, bencode_item_t *value,
-	enum call_opmode opmode);
-void call_ng_codec_flags(sdp_ng_flags *out, str *key, bencode_item_t *value,
-	enum call_opmode opmode);
-void call_ng_direction_flag(sdp_ng_flags *out, bencode_item_t *value);
+void call_ng_flags_flags(str *s, unsigned int, helper_arg arg);
+void call_ng_main_flags(const ng_parser_t *, str *key, parser_arg value, helper_arg);
+void call_ng_codec_flags(const ng_parser_t *, str *key, parser_arg value, helper_arg);
+void call_ng_direction_flag(const ng_parser_t *, sdp_ng_flags *, parser_arg value);
 
-INLINE struct sdp_manipulations *sdp_manipulations_get_by_id(const sdp_ng_flags *f, enum media_type id) {
-	if (id < 0 || id >= G_N_ELEMENTS(f->sdp_manipulations))
+INLINE struct sdp_manipulations *sdp_manipulations_get_by_id(struct sdp_manipulations * const array[__MT_MAX], enum media_type id)
+{
+	if (id < 0 || id >= __MT_MAX)
 		return NULL;
-	return f->sdp_manipulations[id];
+	return array[id];
 }
-INLINE struct sdp_manipulations *sdp_manipulations_get_create_by_id(sdp_ng_flags *f, enum media_type id) {
-	if (id < 0 || id >= G_N_ELEMENTS(f->sdp_manipulations))
+INLINE struct sdp_manipulations *sdp_manipulations_get_create_by_id(struct sdp_manipulations * array[__MT_MAX], enum media_type id)
+{
+	if (id < 0 || id >= __MT_MAX)
 		return NULL;
-	if (!f->sdp_manipulations[id])
-		f->sdp_manipulations[id] = g_slice_alloc0(sizeof(*f->sdp_manipulations[id]));
-	return f->sdp_manipulations[id];
+	if (!array[id])
+		array[id] = g_slice_alloc0(sizeof(*array[id]));
+	return array[id];
 }
-INLINE struct sdp_manipulations *sdp_manipulations_get_by_name(sdp_ng_flags *f, const str *s) {
+INLINE struct sdp_manipulations *sdp_manipulations_get_by_name(struct sdp_manipulations * array[__MT_MAX], const str *s) {
 	if (!str_cmp(s, "none") || !str_cmp(s, "global"))
-		return sdp_manipulations_get_create_by_id(f, MT_UNKNOWN);
+		return sdp_manipulations_get_create_by_id(array, MT_UNKNOWN);
 	enum media_type id = codec_get_type(s);
 	if (id == MT_OTHER)
 		return NULL;
-	return sdp_manipulations_get_create_by_id(f, id);
+	return sdp_manipulations_get_create_by_id(array, id);
+}
+
+// set all WebRTC-specific attributes
+INLINE void ng_flags_webrtc(sdp_ng_flags *f) {
+	f->transport_protocol = &transport_protocols[PROTO_UDP_TLS_RTP_SAVPF];
+	f->ice_option = ICE_FORCE;
+	f->trickle_ice = 1;
+	f->rtcp_mux_offer = 1;
+	f->rtcp_mux_require = 1;
+	f->no_rtcp_attr = 1;
+	f->sdes_off = 1;
+	f->generate_mid = 1;
 }
 
 

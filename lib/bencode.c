@@ -7,12 +7,11 @@
 #include <assert.h>
 #include <string.h>
 #include <ctype.h>
-#include <json-glib/json-glib.h>
 
 #include "helpers.h"
 
 /* set to 0 for alloc debugging, e.g. through valgrind */
-#define BENCODE_MIN_BUFFER_PIECE_LEN	512
+#define BENCODE_MIN_BUFFER_PIECE_LEN	4096
 
 #define BENCODE_HASH_BUCKETS		31 /* prime numbers work best */
 
@@ -20,14 +19,9 @@
 
 struct __bencode_buffer_piece {
 	char *tail;
-	unsigned int left;
+	size_t left;
 	struct __bencode_buffer_piece *next;
 	char buf[0];
-};
-struct __bencode_free_list {
-	void *ptr;
-	free_func_t func;
-	struct __bencode_free_list *next;
 };
 struct __bencode_hash {
 	struct bencode_item *buckets[BENCODE_HASH_BUCKETS];
@@ -81,17 +75,17 @@ static void __bencode_list_init(bencode_item_t *list) {
 	__bencode_container_init(list);
 }
 
-static struct __bencode_buffer_piece *__bencode_piece_new(unsigned int size) {
+static struct __bencode_buffer_piece *__bencode_piece_new(size_t size) {
 	struct __bencode_buffer_piece *ret;
 
-	if (size < BENCODE_MIN_BUFFER_PIECE_LEN)
-		size = BENCODE_MIN_BUFFER_PIECE_LEN;
-	ret = BENCODE_MALLOC(sizeof(*ret) + size + BENCODE_ALLOC_ALIGN);
+	size_t alloc_size = size + sizeof(*ret) + BENCODE_ALLOC_ALIGN;
+	alloc_size = MAX(alloc_size, BENCODE_MIN_BUFFER_PIECE_LEN);
+	ret = BENCODE_MALLOC(alloc_size);
 	if (!ret)
 		return NULL;
 
 	ret->tail = ret->buf;
-	ret->left = size;
+	ret->left = alloc_size - sizeof(*ret) - BENCODE_ALLOC_ALIGN;
 	ret->next = NULL;
 
 	return ret;
@@ -101,15 +95,14 @@ int bencode_buffer_init(bencode_buffer_t *buf) {
 	buf->pieces = __bencode_piece_new(0);
 	if (!buf->pieces)
 		return -1;
-	buf->free_list = NULL;
 	buf->error = 0;
 	return 0;
 }
 
-void *bencode_buffer_alloc(bencode_buffer_t *buf, unsigned int size) {
+void *bencode_buffer_alloc(bencode_buffer_t *buf, size_t size) {
 	struct __bencode_buffer_piece *piece;
 	void *ret;
-	unsigned int align_size = ((size + BENCODE_ALLOC_ALIGN - 1) / BENCODE_ALLOC_ALIGN) * BENCODE_ALLOC_ALIGN;
+	size_t align_size = ((size + BENCODE_ALLOC_ALIGN - 1) / BENCODE_ALLOC_ALIGN) * BENCODE_ALLOC_ALIGN;
 
 	if (!buf)
 		return NULL;
@@ -142,11 +135,10 @@ alloc:
 }
 
 void bencode_buffer_free(bencode_buffer_t *buf) {
-	struct __bencode_free_list *fl;
 	struct __bencode_buffer_piece *piece, *next;
 
-	for (fl = buf->free_list; fl; fl = fl->next)
-		fl->func(fl->ptr);
+	if (!buf)
+		return;
 
 	for (piece = buf->pieces; piece; piece = next) {
 		next = piece->next;
@@ -154,7 +146,13 @@ void bencode_buffer_free(bencode_buffer_t *buf) {
 	}
 }
 
-static bencode_item_t *__bencode_item_alloc(bencode_buffer_t *buf, unsigned int payload) {
+void bencode_buffer_merge(bencode_buffer_t *to, bencode_buffer_t *from) {
+	from->pieces->next = to->pieces;
+	to->pieces = from->pieces;
+	from->pieces = NULL;
+}
+
+static bencode_item_t *__bencode_item_alloc(bencode_buffer_t *buf, size_t payload) {
 	bencode_item_t *ret;
 
 	ret = bencode_buffer_alloc(buf, sizeof(struct bencode_item) + payload);
@@ -687,20 +685,6 @@ bencode_item_t *bencode_dictionary_get_len(bencode_item_t *dict, const char *key
 	return NULL;
 }
 
-void bencode_buffer_destroy_add(bencode_buffer_t *buf, free_func_t func, void *p) {
-	struct __bencode_free_list *li;
-
-	if (!p)
-		return;
-	li = bencode_buffer_alloc(buf, sizeof(*li));
-	if (!li)
-		return;
-	li->ptr = p;
-	li->func = func;
-	li->next = buf->free_list;
-	buf->free_list = li;
-}
-
 static ssize_t __bencode_string(const char *s, ssize_t offset, size_t len) {
 	size_t pos;
 	unsigned long sl;
@@ -808,172 +792,4 @@ static ssize_t __bencode_next(const char *s, ssize_t offset, size_t len) {
 
 ssize_t bencode_valid(const char *s, size_t len) {
 	return __bencode_next(s, 0, len);
-}
-
-
-
-static bencode_item_t *bencode_convert_json_node(bencode_buffer_t *buf, JsonNode *node);
-
-static bencode_item_t *bencode_convert_json_dict(bencode_buffer_t *buf, JsonNode *node) {
-	JsonObject *obj = json_node_get_object(node);
-	if (!obj)
-		return NULL;
-	bencode_item_t *dict = bencode_dictionary(buf);
-	if (!dict)
-		return NULL;
-
-	JsonObjectIter iter;
-	json_object_iter_init(&iter, obj);
-	const char *key;
-	JsonNode *value;
-	while (json_object_iter_next(&iter, &key, &value)) {
-		if (!key || !value)
-			return NULL;
-		bencode_item_t *b_val = bencode_convert_json_node(buf, value);
-		if (!b_val)
-			return NULL;
-		bencode_dictionary_add(dict, key, b_val);
-	}
-	return dict;
-}
-
-static bencode_item_t *bencode_convert_json_array(bencode_buffer_t *buf, JsonNode *node) {
-	JsonArray *arr = json_node_get_array(node);
-	if (!arr)
-		return NULL;
-	bencode_item_t *list = bencode_list(buf);
-	if (!list)
-		return NULL;
-	guint len = json_array_get_length(arr);
-	for (guint i = 0; i < len; i++) {
-		JsonNode *el = json_array_get_element(arr, i);
-		if (!el)
-			return NULL;
-		bencode_item_t *it = bencode_convert_json_node(buf, el);
-		if (!it)
-			return NULL;
-		bencode_list_add(list, it);
-	}
-	return list;
-}
-
-static bencode_item_t *bencode_convert_json_value(bencode_buffer_t *buf, JsonNode *node) {
-	GType type = json_node_get_value_type(node);
-	switch (type) {
-		case G_TYPE_STRING:;
-			const char *s = json_node_get_string(node);
-			if (!s)
-				return NULL;
-			return bencode_string(buf, s);
-		case G_TYPE_INT:
-		case G_TYPE_UINT:
-		case G_TYPE_LONG:
-		case G_TYPE_ULONG:
-		case G_TYPE_INT64:
-		case G_TYPE_UINT64:
-		case G_TYPE_BOOLEAN:;
-			gint64 i = json_node_get_int(node);
-			return bencode_integer(buf, i);
-		// everything else is unsupported
-	}
-	return NULL;
-}
-
-static bencode_item_t *bencode_convert_json_node(bencode_buffer_t *buf, JsonNode *node) {
-	JsonNodeType type = json_node_get_node_type(node);
-	switch (type) {
-		case JSON_NODE_OBJECT:
-			return bencode_convert_json_dict(buf, node);
-		case JSON_NODE_ARRAY:
-			return bencode_convert_json_array(buf, node);
-		case JSON_NODE_VALUE:
-			return bencode_convert_json_value(buf, node);
-		default:
-			return NULL;
-	}
-}
-
-bencode_item_t *bencode_convert_json(bencode_buffer_t *buf, JsonParser *json) {
-	JsonNode *root = json_parser_get_root(json);
-	if (!root)
-		return NULL;
-	return bencode_convert_json_node(buf, root);
-}
-
-
-
-gboolean bencode_collapse_json_item(bencode_item_t *item, JsonBuilder *builder);
-
-gboolean bencode_collapse_json_list(bencode_item_t *item, JsonBuilder *builder) {
-	json_builder_begin_array(builder);
-	for (bencode_item_t *el = item->child; el; el = el->sibling) {
-		if (!bencode_collapse_json_item(el, builder))
-			return FALSE;
-	}
-	json_builder_end_array(builder);
-	return TRUE;
-}
-
-gboolean bencode_collapse_json_string(bencode_item_t *item, JsonBuilder *builder) {
-	char buf[item->iov[1].iov_len + 1];
-	memcpy(buf, item->iov[1].iov_base, item->iov[1].iov_len);
-	buf[item->iov[1].iov_len] = '\0';
-	json_builder_add_string_value(builder, buf);
-	return TRUE;
-}
-
-gboolean bencode_collapse_json_dict(bencode_item_t *item, JsonBuilder *builder) {
-	json_builder_begin_object(builder);
-	bencode_item_t *val;
-	for (bencode_item_t *key = item->child; key; key = val->sibling) {
-		val = key->sibling;
-		if (key->type != BENCODE_STRING)
-			return FALSE;
-
-		char buf[key->iov[1].iov_len + 1];
-		memcpy(buf, key->iov[1].iov_base, key->iov[1].iov_len);
-		buf[key->iov[1].iov_len] = '\0';
-
-		json_builder_set_member_name(builder, buf);
-
-		if (!bencode_collapse_json_item(val, builder))
-			return FALSE;
-	}
-	json_builder_end_object(builder);
-	return TRUE;
-}
-
-gboolean bencode_collapse_json_int(bencode_item_t *item, JsonBuilder *builder) {
-	json_builder_add_int_value(builder, item->value);
-	return TRUE;
-}
-
-gboolean bencode_collapse_json_item(bencode_item_t *item, JsonBuilder *builder) {
-	switch (item->type) {
-		case BENCODE_LIST:
-			return bencode_collapse_json_list(item, builder);
-		case BENCODE_STRING:
-			return bencode_collapse_json_string(item, builder);
-		case BENCODE_DICTIONARY:
-			return bencode_collapse_json_dict(item, builder);
-		case BENCODE_INTEGER:
-			return bencode_collapse_json_int(item, builder);
-		default:
-			return FALSE;
-	}
-}
-
-str *bencode_collapse_str_json(bencode_item_t *root, str *out) {
-	JsonBuilder *builder = json_builder_new();
-	if (!bencode_collapse_json_item(root, builder))
-		goto err;
-	char *result = glib_json_print(builder);
-	out->s = result;
-	out->len = strlen(result);
-	bencode_buffer_destroy_add(root->buffer, free, result);
-	return out;
-
-err:
-	g_object_unref(builder);
-	return NULL;
 }

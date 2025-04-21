@@ -6,16 +6,19 @@
 
 #include "helpers.h"
 #include "str.h"
+#include "control_ng.h"
+#include "bencode.h"
 
 struct cookie_cache_state {
+	bencode_buffer_t buffer;
 	GHashTable *in_use;
 	GHashTable *cookies;
 };
 
 typedef struct cache_entry {
-	str *reply;
-	str *callid;
-	int command;
+	str reply;
+	str callid;
+	enum ng_opmode command;
 } cache_entry;
 
 INLINE cache_entry *cache_entry_dup(const cache_entry *s) {
@@ -23,17 +26,17 @@ INLINE cache_entry *cache_entry_dup(const cache_entry *s) {
 		return NULL;
 	cache_entry *r;
 	r = malloc(sizeof(*r));
-	r->reply = str_dup(s->reply);
+	r->reply = str_dup_str(&s->reply);
 	r->command = s->command;
-	r->callid = str_dup(s->callid);
+	r->callid = str_dup_str(&s->callid);
 	return r;
 }
 INLINE void cache_entry_free(void *p) {
 	cache_entry *s = p;
 	if (!s)
 		return;
-	free(s->reply);
-	free(s->callid);
+	free(s->reply.s);
+	free(s->callid.s);
 	free(s);
 }
 struct cookie_cache {

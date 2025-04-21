@@ -85,3 +85,7 @@ mix_in_x64_avx512bw.S
 mix_in_x64_sse2.S
 test-amr-decode
 test-amr-encode
+bufferpool.c
+uring.c
+aead-decrypt
+arena.c

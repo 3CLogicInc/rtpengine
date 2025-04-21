@@ -15,6 +15,7 @@
 #include "types.h"
 
 #include "xt_RTPENGINE.h"
+#include "common_stats.h"
 
 struct media_packet;
 struct transport_protocol;
@@ -96,6 +97,7 @@ struct intf_config {
 	str				name; // full name (before the '/' separator in config)
 	str				name_base; // if name is "foo:bar", this is "foo"
 	str				name_rr_spec; // if name is "foo:bar", this is "bar"
+	str				alias; // if interface is "foo=bar", this is "bar"
 	struct intf_address		local_address;
 	struct intf_address		advertised_address;
 	unsigned int			port_min, port_max;
@@ -103,36 +105,6 @@ struct intf_config {
 struct intf_spec {
 	struct intf_address		local_address;
 	struct port_pool		port_pool;
-};
-struct interface_counter_stats_dir {
-#define F(n) atomic64 n;
-#include "interface_counter_stats_fields_dir.inc"
-#undef F
-};
-struct interface_counter_stats {
-#define F(n) atomic64 n;
-#include "interface_counter_stats_fields.inc"
-#undef F
-};
-struct interface_sampled_stats_fields {
-#define F(n) atomic64 n;
-#include "interface_sampled_stats_fields.inc"
-#undef F
-};
-struct interface_sampled_stats {
-	struct interface_sampled_stats_fields sums;
-	struct interface_sampled_stats_fields sums_squared;
-	struct interface_sampled_stats_fields counts;
-};
-struct interface_sampled_stats_avg {
-	struct interface_sampled_stats_fields avg;
-	struct interface_sampled_stats_fields stddev;
-};
-struct interface_stats_block {
-	struct interface_counter_stats_dir	in,
-						out;
-	struct interface_counter_stats		s;
-	struct interface_sampled_stats		sampled;
 };
 struct interface_sampled_rate_stats {
 	GHashTable *ht;
@@ -184,10 +156,10 @@ struct local_intf {
 	struct intf_spec		*spec;
 	struct intf_address		advertised_address;
 	unsigned int			unique_id; /* starting with 0 - serves as preference */
-	const struct logical_intf	*logical;
+	struct logical_intf		*logical;
 	str				ice_foundation;
 
-	struct interface_stats_block	stats;
+	struct interface_stats_block	*stats;
 };
 struct socket_intf_list {
 	struct local_intf		*local_intf;
@@ -287,9 +259,10 @@ struct media_packet {
 
 extern GQueue all_local_interfaces; // read-only during runtime
 
+extern __thread struct bufferpool *media_bufferpool;
 
 
-void interfaces_init(GQueue *interfaces);
+void interfaces_init(intf_config_q *interfaces);
 void interfaces_free(void);
 
 struct logical_intf *get_logical_interface(const str *name, sockfamily_t *fam, int num_ports);
@@ -324,7 +297,6 @@ void unkernelize(struct packet_stream *, const char *);
 void __stream_unconfirm(struct packet_stream *, const char *);
 void __reset_sink_handlers(struct packet_stream *);
 
-void media_update_stats(struct call_media *m);
 int __hunt_ssrc_ctx_idx(uint32_t ssrc, struct ssrc_ctx *list[RTPE_NUM_SSRC_TRACKING],
 		unsigned int start_idx);
 struct ssrc_ctx *__hunt_ssrc_ctx(uint32_t ssrc, struct ssrc_ctx *list[RTPE_NUM_SSRC_TRACKING],
@@ -339,8 +311,6 @@ int media_packet_encrypt(rewrite_func encrypt_func, struct packet_stream *out, s
 const struct transport_protocol *transport_protocol(const str *s);
 //void play_buffered(struct packet_stream *sink, struct codec_packet *cp, int buffered);
 void play_buffered(struct jb_packet *cp);
-
-enum thread_looper_action kernel_stats_updater(void);
 
 INLINE int proto_is_rtp(const struct transport_protocol *protocol) {
 	// known to be RTP? therefore unknown is not RTP

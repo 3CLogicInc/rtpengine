@@ -2,6 +2,7 @@
 
 #include "helpers.h"
 #include "log_funcs.h"
+#include "poller.h"
 
 
 static int tt_obj_cmp(const void *a, const void *b) {
@@ -93,6 +94,7 @@ static void timerthread_run(void *p) {
 		obj_put(tt_obj);
 
 		log_info_reset();
+		uring_thread_loop();
 
 		mutex_lock(&tt->lock);
 		continue;
@@ -252,7 +254,7 @@ void *timerthread_queue_new(const char *type, size_t size,
 		void (*free_func)(void *),
 		void (*entry_free_func)(void *))
 {
-	struct timerthread_queue *ttq = obj_alloc0(type, size, __timerthread_queue_free);
+	struct timerthread_queue *ttq = obj_alloc0_gen(type, size, __timerthread_queue_free);
 	ttq->type = type;
 	ttq->tt_obj.tt = tt;
 	assert(tt->func == timerthread_queue_run);

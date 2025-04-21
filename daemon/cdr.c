@@ -21,16 +21,11 @@ static const char * const __tag_type_texts[] = {
 	[FROM_TAG] = "FROM_TAG",
 	[TO_TAG] = "TO_TAG",
 };
-static const char *const __opmode_texts[] = {
-	[OP_OFFER] = "offer",
-	[OP_ANSWER] = "answer",
-};
-
 const char * get_tag_type_text(enum tag_type t) {
 	return get_enum_array_text(__tag_type_texts, t, "UNKNOWN");
 }
-const char *get_opmode_text(enum call_opmode m) {
-	return get_enum_array_text(__opmode_texts, m, "other");
+const char *get_opmode_text(enum ng_opmode m) {
+	return get_enum_array_text(ng_command_strings, m, "other");
 }
 
 static const char * get_term_reason_text(enum termination_reason t) {
@@ -142,15 +137,15 @@ void cdr_update_entry(call_t * c) {
 						cdrlinecnt, md->index, protocol, local_addr,
 						cdrlinecnt, md->index, protocol, ps->last_local_endpoint.port,
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.packets),
+						atomic64_get_na(&ps->stats_in->packets),
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.bytes),
+						atomic64_get_na(&ps->stats_in->bytes),
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.errors),
+						atomic64_get_na(&ps->stats_in->errors),
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->last_packet),
+						packet_stream_last_packet(ps),
 						cdrlinecnt, md->index, protocol,
-						ps->in_tos_tclass);
+						atomic_get_na(&ps->stats_in->tos));
 				    } else {
 					g_string_append_printf(cdr,
 						"ml%i_midx%u_%s_endpoint_ip=%s, "
@@ -167,15 +162,15 @@ void cdr_update_entry(call_t * c) {
 						cdrlinecnt, md->index, protocol, local_addr,
 						cdrlinecnt, md->index, protocol, ps->last_local_endpoint.port,
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.packets),
+						atomic64_get_na(&ps->stats_in->packets),
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.bytes),
+						atomic64_get_na(&ps->stats_in->bytes),
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.errors),
+						atomic64_get_na(&ps->stats_in->errors),
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->last_packet),
+						packet_stream_last_packet(ps),
 						cdrlinecnt, md->index, protocol,
-						ps->in_tos_tclass);
+						atomic_get_na(&ps->stats_in->tos));
 				    }
 				}
 

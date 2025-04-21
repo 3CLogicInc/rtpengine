@@ -13,7 +13,6 @@
 
 
 
-
 enum socket_families {
 	SF_IP4 = 0,
 	SF_IP6,
@@ -134,6 +133,15 @@ INLINE char *sockaddr_print_buf(const sockaddr_t *a) {
 	sockaddr_print(a, buf, THREAD_BUF_SIZE);
 	return buf;
 }
+INLINE int sockaddr_print_gstring(GString *s, const sockaddr_t *a) {
+	if (!a->family)
+		return 0;
+	char buf[THREAD_BUF_SIZE];
+	if (sockaddr_print(a, buf, THREAD_BUF_SIZE))
+		return -1;
+	g_string_append(s, buf);
+	return 0;
+}
 INLINE int sockaddr_print_p(const sockaddr_t *a, char *buf, size_t len) {
 	if (!a->family) {
 		buf[0] = '\0';
@@ -161,11 +169,22 @@ INLINE char *sockaddr_print_port_buf(const sockaddr_t *a, unsigned int port) {
 	sockaddr_print_port(a, port, buf, THREAD_BUF_SIZE);
 	return buf;
 }
+INLINE int sockaddr_print_port_gstring(GString *s, const sockaddr_t *a, unsigned int port) {
+	char buf[THREAD_BUF_SIZE];
+	if (sockaddr_print_port(a, port, buf, THREAD_BUF_SIZE))
+		return -1;
+	g_string_append(s, buf);
+	return 0;
+
+}
 INLINE int endpoint_print(const endpoint_t *ep, char *buf, size_t len) {
 	return sockaddr_print_port(&ep->address, ep->port, buf, len);
 }
 INLINE char *endpoint_print_buf(const endpoint_t *ep) {
 	return sockaddr_print_port_buf(&ep->address, ep->port);
+}
+INLINE int endpoint_print_gstring(GString *s, const endpoint_t *ep) {
+	return sockaddr_print_port_gstring(s, &ep->address, ep->port);
 }
 INLINE int is_addr_unspecified(const sockaddr_t *a) {
 	if (!a || !a->family)
@@ -294,9 +313,7 @@ guint sockaddr_t_hash(gconstpointer); // for glib
 gint sockaddr_t_eq(gconstpointer, gconstpointer); // true/false, for glib
 
 unsigned int endpoint_hash(const endpoint_t *);
-bool endpoint_eq(const endpoint_t *, const endpoint_t *); /* true/false */
-guint endpoint_t_hash(gconstpointer); // for glib
-gint endpoint_t_eq(gconstpointer, gconstpointer); // true/false, for glib
+gboolean endpoint_eq(const endpoint_t *, const endpoint_t *); /* true/false */
 
 INLINE sockfamily_t *get_socket_family_enum(enum socket_families i) {
 	if (i >= __SF_LAST)

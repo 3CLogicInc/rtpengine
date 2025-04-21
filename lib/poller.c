@@ -17,7 +17,7 @@
 #include "obj.h"
 #include "log_funcs.h"
 #include "auxlib.h"
-
+#include "uring.h"
 
 
 
@@ -34,6 +34,14 @@ struct poller {
 	mutex_t				lock;
 	GPtrArray			*items;
 };
+
+bool (*rtpe_poller_add_item)(struct poller *, struct poller_item *) = poller_add_item;
+bool (*rtpe_poller_del_item)(struct poller *, int) = poller_del_item;
+bool (*rtpe_poller_del_item_callback)(struct poller *, int, void (*)(void *), void *) = poller_del_item_callback;
+void (*rtpe_poller_blocked)(struct poller *, void *) = poller_blocked;
+bool (*rtpe_poller_isblocked)(struct poller *, void *) = poller_isblocked;
+void (*rtpe_poller_error)(struct poller *, void *) = poller_error;
+
 
 static void poller_free_item(struct poller_item_int *ele) {
 	if (ele)
@@ -82,8 +90,7 @@ static int epoll_events(struct poller_item *it, struct poller_item_int *ii) {
 }
 
 
-static void poller_item_free(void *p) {
-	struct poller_item_int *i = p;
+static void poller_item_free(struct poller_item_int *i) {
 	obj_put_o(i->item.obj);
 }
 
@@ -119,7 +126,7 @@ bool poller_add_item(struct poller *p, struct poller_item *i) {
 	if (i->fd >= p->items->len)
 		g_ptr_array_set_size(p->items, i->fd + 1);
 
-	ip = obj_alloc0("poller_item_int", sizeof(*ip), poller_item_free);
+	ip = obj_alloc0(struct poller_item_int, poller_item_free);
 	memcpy(&ip->item, i, sizeof(*i));
 	obj_hold_o(ip->item.obj); /* new ref in *ip */
 	p->items->pdata[i->fd] = obj_get(ip);
@@ -292,6 +299,38 @@ void poller_error(struct poller *p, void *fdp) {
 	it->blocked = 1;
 }
 
+#ifdef HAVE_LIBURING
+
+static unsigned int __uring_thread_loop_dummy(void) { return 0; }
+
+__thread unsigned int (*uring_thread_loop)(void) = __uring_thread_loop_dummy;
+
+#endif
+
+bool poller_isblocked(struct poller *p, void *fdp) {
+	int fd = GPOINTER_TO_INT(fdp);
+	int ret;
+
+	if (!p || fd < 0)
+		return false;
+
+	LOCK(&p->lock);
+
+	ret = -1;
+	if (fd >= p->items->len)
+		goto out;
+	struct poller_item_int *it;
+	if (!(it = p->items->pdata[fd]))
+		goto out;
+	if (!it->item.writeable)
+		goto out;
+
+	ret = !!it->blocked;
+
+out:
+	return ret;
+}
+
 void poller_loop(void *d) {
 	struct poller *p = d;
 	int poller_size = rtpe_common_config_ptr->poller_size;
@@ -305,6 +344,7 @@ void poller_loop(void *d) {
 		int ret = poller_poll(p, thread_sleep_time, evs, poller_size);
 		if (ret < 0)
 			usleep(20 * 1000);
+		uring_thread_loop();
 	}
 
 	thread_cleanup_pop(true);

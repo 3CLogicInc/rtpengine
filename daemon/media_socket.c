@@ -31,6 +31,7 @@
 #include "dtmf.h"
 #include "mqtt.h"
 #include "janus.h"
+#include "bufferpool.h"
 
 #include "xt_RTPENGINE.h"
 
@@ -44,25 +45,13 @@
 #define MAX_RECV_LOOP_STRIKES 5
 #endif
 
-#define DS_io(x, ps, ke, io) do {						\
-		uint64_t ks_val;						\
-		ks_val = atomic64_get(&ps->kernel_stats_ ## io.x);		\
-		if ((ke)->x < ks_val)						\
-			diff_ ## x ## _ ## io = 0;				\
-		else								\
-			diff_ ## x ## _ ## io = (ke)->x - ks_val;		\
-		atomic64_add(&ps->stats_ ## io.x, diff_ ## x ## _ ## io);	\
-		if (ps->selected_sfd) \
-			atomic64_add(&ps->selected_sfd->local_intf->stats.io.x, diff_ ## x ## _ ## io); \
-		RTPE_STATS_ADD(x ## _kernel, diff_ ## x ## _ ## io);		\
-	} while (0)
 
-#define DS(x) DS_io(x, ps, &ke->stats_in, in)
-#define DSo(x) DS_io(x, sink, stats_o, out)
-
-
+struct intf_key {
+	str name;
+	sockfamily_t *preferred_family;
+};
 struct intf_rr {
-	struct logical_intf hash_key;
+	struct intf_key hash_key;
 	mutex_t lock;
 	GQueue logical_intfs;
 	struct logical_intf *singular; // set iff only one is present in the list - no lock needed
@@ -429,18 +418,27 @@ static const struct rtpengine_srtp __res_null = {
 static GQueue *__interface_list_for_family(sockfamily_t *fam);
 
 
-static GHashTable *__logical_intf_name_family_hash; // name + family -> struct logical_intf
-static GHashTable *__logical_intf_name_family_rr_hash; // name + family -> struct intf_rr
+static unsigned int __name_family_hash(const struct intf_key *p);
+static int __name_family_eq(const struct intf_key *a, const struct intf_key *b);
+
+TYPED_GHASHTABLE(intf_lookup, struct intf_key, struct logical_intf, __name_family_hash, __name_family_eq,
+		g_free, NULL)
+TYPED_GHASHTABLE(intf_rr_lookup, struct intf_key, struct intf_rr, __name_family_hash, __name_family_eq,
+		NULL, NULL)
+
+static intf_lookup __logical_intf_name_family_hash; // name + family -> struct logical_intf
+static intf_rr_lookup __logical_intf_name_family_rr_hash; // name + family -> struct intf_rr
 static GHashTable *__intf_spec_addr_type_hash; // addr + type -> struct intf_spec
 static GHashTable *__local_intf_addr_type_hash; // addr + type -> GList of struct local_intf
 static GQueue __preferred_lists_for_family[__SF_LAST];
 
 GQueue all_local_interfaces = G_QUEUE_INIT;
 
-TYPED_GHASHTABLE(local_sockets_ht, endpoint_t, stream_fd, endpoint_t_hash, endpoint_t_eq, NULL, stream_fd_put)
-static rwlock_t local_media_socket_endpoints_lock;
+TYPED_GHASHTABLE(local_sockets_ht, endpoint_t, stream_fd, endpoint_hash, endpoint_eq, NULL, stream_fd_put)
+static rwlock_t local_media_socket_endpoints_lock = RWLOCK_STATIC_INIT;
 static local_sockets_ht local_media_socket_endpoints;
 
+__thread struct bufferpool *media_bufferpool;
 
 
 /* checks for free no_ports on a local interface */
@@ -579,7 +577,7 @@ got_some:
 	}
 
 	// check if round-robin is desired
-	struct logical_intf key;
+	struct intf_key key;
 
 	if (rr_use_default_intf)
 		key.name = log->name_base;
@@ -587,12 +585,12 @@ got_some:
 		key.name = *name;
 	key.preferred_family = fam;
 
-	struct intf_rr *rr = g_hash_table_lookup(__logical_intf_name_family_rr_hash, &key);
+	struct intf_rr *rr = t_hash_table_lookup(__logical_intf_name_family_rr_hash, &key);
 	if (!rr) {
 		// try other socket families
 		for (int i = 0; i < __SF_LAST; i++) {
 			key.preferred_family = get_socket_family_enum(i);
-			rr = g_hash_table_lookup(__logical_intf_name_family_rr_hash, &key);
+			rr = t_hash_table_lookup(__logical_intf_name_family_rr_hash, &key);
 			if (rr)
 				break;
 		}
@@ -618,12 +616,13 @@ got_some:
 	return __get_logical_interface(name, fam);
 }
 static struct logical_intf *__get_logical_interface(const str *name, sockfamily_t *fam) {
-	struct logical_intf d, *log = NULL;
+	struct intf_key d;
+	struct logical_intf *log = NULL;
 
 	d.name = *name;
 	d.preferred_family = fam;
 
-	log = g_hash_table_lookup(__logical_intf_name_family_hash, &d);
+	log = t_hash_table_lookup(__logical_intf_name_family_hash, &d);
 	if (log) {
 		__C_DBG("Choose logical interface " STR_FORMAT " because of direction " STR_FORMAT,
 			STR_FMT(&log->name),
@@ -636,12 +635,10 @@ static struct logical_intf *__get_logical_interface(const str *name, sockfamily_
 	return log;
 }
 
-static unsigned int __name_family_hash(const void *p) {
-	const struct logical_intf *lif = p;
+static unsigned int __name_family_hash(const struct intf_key *lif) {
 	return str_hash(&lif->name) ^ g_direct_hash(lif->preferred_family);
 }
-static int __name_family_eq(const void *a, const void *b) {
-	const struct logical_intf *A = a, *B = b;
+static int __name_family_eq(const struct intf_key *A, const struct intf_key *B) {
 	return str_equal(&A->name, &B->name) && A->preferred_family == B->preferred_family;
 }
 
@@ -750,15 +747,15 @@ static void __append_free_ports_to_int(struct intf_spec *spec) {
 }
 // called during single-threaded startup only
 static void __add_intf_rr_1(struct logical_intf *lif, str *name_base, sockfamily_t *fam) {
-	struct logical_intf key = {0,};
+	struct intf_key key = {0,};
 	key.name = *name_base;
 	key.preferred_family = fam;
-	struct intf_rr *rr = g_hash_table_lookup(__logical_intf_name_family_rr_hash, &key);
+	struct intf_rr *rr = t_hash_table_lookup(__logical_intf_name_family_rr_hash, &key);
 	if (!rr) {
 		rr = g_slice_alloc0(sizeof(*rr));
 		rr->hash_key = key;
 		mutex_init(&rr->lock);
-		g_hash_table_insert(__logical_intf_name_family_rr_hash, &rr->hash_key, rr);
+		t_hash_table_insert(__logical_intf_name_family_rr_hash, &rr->hash_key, rr);
 	}
 	g_queue_push_tail(&rr->logical_intfs, lif);
 	rr->singular = (rr->logical_intfs.length == 1) ? lif : NULL;
@@ -766,7 +763,7 @@ static void __add_intf_rr_1(struct logical_intf *lif, str *name_base, sockfamily
 }
 static void __add_intf_rr(struct logical_intf *lif, str *name_base, sockfamily_t *fam) {
 	__add_intf_rr_1(lif, name_base, fam);
-	static str legacy_rr_str = STR_CONST_INIT("round-robin-calls");
+	static str legacy_rr_str = STR_CONST("round-robin-calls");
 	__add_intf_rr_1(lif, &legacy_rr_str, fam);
 }
 static GQueue *__interface_list_for_family(sockfamily_t *fam) {
@@ -782,7 +779,25 @@ static void __interface_append(struct intf_config *ifa, sockfamily_t *fam, bool 
 	lif = __get_logical_interface(&ifa->name, fam);
 
 	if (!lif) {
-		if (!create)
+		if (!create) {
+			// alias?
+			if (!ifa->alias.len)
+				return;
+
+			struct logical_intf *alias = __get_logical_interface(&ifa->alias, fam);
+			if (!alias)
+				return;
+
+			struct intf_key *key = g_new0(__typeof(*key), 1);
+			key->name = ifa->name;
+			key->preferred_family = fam;
+
+			t_hash_table_insert(__logical_intf_name_family_hash, key, alias);
+
+			return;
+		}
+
+		if (ifa->alias.len) // handled in second run
 			return;
 
 		lif = g_slice_alloc0(sizeof(*lif));
@@ -790,8 +805,13 @@ static void __interface_append(struct intf_config *ifa, sockfamily_t *fam, bool 
 		lif->name = ifa->name;
 		lif->name_base = ifa->name_base;
 		lif->preferred_family = fam;
-		lif->rr_specs = g_hash_table_new(str_hash, str_equal);
-		g_hash_table_insert(__logical_intf_name_family_hash, lif, lif);
+		lif->rr_specs = g_hash_table_new((GHashFunc) str_hash, (GEqualFunc) str_equal);
+
+		struct intf_key *key = g_new0(__typeof(*key), 1);
+		key->name = ifa->name;
+		key->preferred_family = fam;
+
+		t_hash_table_insert(__logical_intf_name_family_hash, key, lif);
 		if (ifa->local_address.addr.family == fam) {
 			q = __interface_list_for_family(fam);
 			g_queue_push_tail(q, lif);
@@ -820,6 +840,7 @@ static void __interface_append(struct intf_config *ifa, sockfamily_t *fam, bool 
 	ifc->advertised_address = ifa->advertised_address;
 	ifc->spec = spec;
 	ifc->logical = lif;
+	ifc->stats = bufferpool_alloc0(shm_bufferpool, sizeof(*ifc->stats));
 
 	g_queue_push_tail(&all_local_interfaces, ifc);
 
@@ -828,15 +849,14 @@ static void __interface_append(struct intf_config *ifa, sockfamily_t *fam, bool 
 }
 
 // called during single-threaded startup only
-void interfaces_init(GQueue *interfaces) {
+void interfaces_init(intf_config_q *interfaces) {
 	int i;
-	GList *l;
 	struct intf_config *ifa;
 	sockfamily_t *fam;
 
 	/* init everything */
-	__logical_intf_name_family_hash = g_hash_table_new(__name_family_hash, __name_family_eq);
-	__logical_intf_name_family_rr_hash = g_hash_table_new(__name_family_hash, __name_family_eq);
+	__logical_intf_name_family_hash = intf_lookup_new();
+	__logical_intf_name_family_rr_hash = intf_rr_lookup_new();
 	__intf_spec_addr_type_hash = g_hash_table_new(__addr_type_hash, __addr_type_eq);
 	__local_intf_addr_type_hash = g_hash_table_new(__addr_type_hash, __addr_type_eq);
 
@@ -844,7 +864,7 @@ void interfaces_init(GQueue *interfaces) {
 		g_queue_init(&__preferred_lists_for_family[i]);
 
 	/* build primary lists first */
-	for (l = interfaces->head; l; l = l->next) {
+	for (__auto_type l = interfaces->head; l; l = l->next) {
 		ifa = l->data;
 		__interface_append(ifa, ifa->local_address.addr.family, true);
 	}
@@ -852,7 +872,7 @@ void interfaces_init(GQueue *interfaces) {
 	/* then append to each other as lower-preference alternatives */
 	for (i = 0; i < __SF_LAST; i++) {
 		fam = get_socket_family_enum(i);
-		for (l = interfaces->head; l; l = l->next) {
+		for (__auto_type l = interfaces->head; l; l = l->next) {
 			ifa = l->data;
 			if (ifa->local_address.addr.family == fam)
 				continue;
@@ -861,7 +881,6 @@ void interfaces_init(GQueue *interfaces) {
 	}
 
 	local_media_socket_endpoints = local_sockets_ht_new();
-	rwlock_init(&local_media_socket_endpoints_lock);
 }
 
 void interfaces_exclude_port(unsigned int port) {
@@ -1364,10 +1383,6 @@ static int __k_srtp_crypt(struct rtpengine_srtp *s, struct crypto_context *c,
 		.rtp_auth_tag_len= c->params.crypto_suite->srtp_auth_tag,
 		.rtcp_auth_tag_len= c->params.crypto_suite->srtcp_auth_tag,
 	};
-	for (unsigned int i = 0; i < RTPE_NUM_SSRC_TRACKING; i++) {
-		s->last_rtp_index[i] = ssrc_ctx[i] ? ssrc_ctx[i]->srtp_index : 0;
-		s->last_rtcp_index[i] = ssrc_ctx[i] ? ssrc_ctx[i]->srtcp_index : 0;
-	}
 	if (c->params.mki_len)
 		memcpy(s->mki, c->params.mki, c->params.mki_len);
 	memcpy(s->master_key, c->params.master_key, c->params.crypto_suite->master_key_len);
@@ -1403,18 +1418,6 @@ static int __rtp_stats_pt_sort(const void *ap, const void *bp) {
 	if (a->payload_type > b->payload_type)
 		return 1;
 	return 0;
-}
-
-
-static void reset_ps_kernel_stats(struct packet_stream *ps) {
-	if (bf_clear(&ps->stats_flags, PS_STATS_KERNEL_COUNTED))
-		RTPE_GAUGE_DEC(kernel_only_streams);
-	if (bf_clear(&ps->stats_flags, PS_STATS_USERSPACE_COUNTED))
-		RTPE_GAUGE_DEC(userspace_streams);
-	if (bf_clear(&ps->stats_flags, PS_STATS_MIXED_COUNTED))
-		RTPE_GAUGE_DEC(kernel_user_streams);
-
-	bf_clear(&ps->stats_flags, PS_STATS_KERNEL | PS_STATS_USERSPACE);
 }
 
 
@@ -1484,6 +1487,8 @@ static const char *kernelize_one(struct rtpengine_target_info *reti, GQueue *out
 	}
 
 	__re_address_translate_ep(&reti->local, &stream->selected_sfd->socket.local);
+	reti->iface_stats = stream->selected_sfd->local_intf->stats;
+	reti->stats = stream->stats_in;
 	reti->rtcp_mux = MEDIA_ISSET(media, RTCP_MUX);
 	reti->rtcp = PS_ISSET(stream, RTCP);
 	reti->dtls = MEDIA_ISSET(media, DTLS);
@@ -1499,14 +1504,15 @@ static const char *kernelize_one(struct rtpengine_target_info *reti, GQueue *out
 
 	reti->track_ssrc = 1;
 	for (unsigned int u = 0; u < G_N_ELEMENTS(stream->ssrc_in); u++) {
-		if (stream->ssrc_in[u])
+		if (stream->ssrc_in[u]) {
 			reti->ssrc[u] = htonl(stream->ssrc_in[u]->parent->h.ssrc);
+			reti->ssrc_stats[u] = stream->ssrc_in[u]->stats;
+		}
 	}
-
-	ZERO(stream->kernel_stats_in);
 
 	if (proto_is_rtp(media->protocol)) {
 		reti->rtp = 1;
+		reti->ssrc_req = 1;
 		if (!MEDIA_ISSET(media, TRANSCODING)) {
 			reti->rtcp_fw = 1;
 			if (media->protocol->avpf)
@@ -1514,7 +1520,7 @@ static const char *kernelize_one(struct rtpengine_target_info *reti, GQueue *out
 		}
 	}
 
-	if (reti->rtp && sinks && sinks->length) {
+	if (reti->rtp && sinks && sinks->length && payload_types) {
 		GList *l;
 		struct rtp_stats *rs;
 
@@ -1523,20 +1529,18 @@ static const char *kernelize_one(struct rtpengine_target_info *reti, GQueue *out
 		*payload_types = g_hash_table_get_values(stream->rtp_stats);
 		*payload_types = g_list_sort(*payload_types, __rtp_stats_pt_sort);
 		for (l = *payload_types; l; ) {
-			if (reti->num_payload_types >= G_N_ELEMENTS(reti->pt_input)) {
+			if (reti->num_payload_types >= G_N_ELEMENTS(reti->pt_stats)) {
 				ilog(LOG_WARNING | LOG_FLAG_LIMIT, "Too many RTP payload types for kernel module");
 				break;
 			}
 			rs = l->data;
 			// only add payload types that are passthrough for all sinks
 			bool can_kernelize = true;
-			unsigned int clockrate = 0;
 			for (__auto_type k = sinks->head; k; k = k->next) {
 				struct sink_handler *ksh = k->data;
 				struct packet_stream *ksink = ksh->sink;
 				struct codec_handler *ch = codec_handler_get(media, rs->payload_type,
 						ksink->media, ksh);
-				clockrate = ch->source_pt.clock_rate;
 				if (ch->kernelize)
 					continue;
 				can_kernelize = false;
@@ -1552,9 +1556,8 @@ static const char *kernelize_one(struct rtpengine_target_info *reti, GQueue *out
 				continue;
 			}
 
-			struct rtpengine_pt_input *rpt = &reti->pt_input[reti->num_payload_types++];
-			rpt->pt_num = rs->payload_type;
-			rpt->clock_rate = clockrate;
+			reti->pt_stats[reti->num_payload_types] = rs;
+			reti->num_payload_types++;
 
 			l = l->next;
 		}
@@ -1619,11 +1622,16 @@ output:
 
 	__re_address_translate_ep(&redi->output.dst_addr, &sink->endpoint);
 	__re_address_translate_ep(&redi->output.src_addr, &sink->selected_sfd->socket.local);
+	redi->output.iface_stats = sink->selected_sfd->local_intf->stats;
+	redi->output.stats = sink->stats_out;
 
 	if (reti->track_ssrc) {
 		for (unsigned int u = 0; u < G_N_ELEMENTS(stream->ssrc_in); u++) {
-			if (sink->ssrc_out[u])
+			if (sink->ssrc_out[u]) {
+				// XXX order can be different from ingress?
 				redi->output.seq_offset[u] = sink->ssrc_out[u]->parent->seq_diff;
+				redi->output.ssrc_stats[u] = sink->ssrc_out[u]->stats;
+			}
 
 			if (redi->output.ssrc_subst && stream->ssrc_in[u])
 				redi->output.ssrc_out[u] = htonl(stream->ssrc_in[u]->ssrc_map_out);
@@ -1669,8 +1677,6 @@ void kernelize(struct packet_stream *stream) {
 
 	if (PS_ISSET(stream, KERNELIZED))
 		return;
-
-	reset_ps_kernel_stats(stream);
 
 	if (call->recording != NULL && !selected_recording_method->kernel_support)
 		goto no_kernel;
@@ -1779,104 +1785,8 @@ struct ssrc_ctx *__hunt_ssrc_ctx(uint32_t ssrc, struct ssrc_ctx *list[RTPE_NUM_S
 }
 
 
-static void __stream_consume_stats(struct packet_stream *ps, const struct rtpengine_stats_info *stats_info) {
-	for (unsigned int u = 0; u < G_N_ELEMENTS(stats_info->ssrc); u++) {
-		// check for the right SSRC association
-		if (!stats_info->ssrc[u]) // end of list
-			break;
-		uint32_t ssrc = ntohl(stats_info->ssrc[u]);
-		struct ssrc_ctx *ssrc_ctx = __hunt_ssrc_ctx(ssrc, ps->ssrc_in, u);
-		if (!ssrc_ctx)
-			continue;
-		struct ssrc_entry_call *parent = ssrc_ctx->parent;
-
-		if (!stats_info->ssrc_stats[u].basic_stats.packets) // no change
-			continue;
-
-		atomic64_add(&ssrc_ctx->packets, stats_info->ssrc_stats[u].basic_stats.packets);
-		atomic64_add(&ssrc_ctx->octets, stats_info->ssrc_stats[u].basic_stats.bytes);
-		parent->packets_lost += stats_info->ssrc_stats[u].total_lost; // XXX should be atomic?
-		atomic64_set(&ssrc_ctx->last_seq, stats_info->ssrc_stats[u].ext_seq);
-		parent->jitter = stats_info->ssrc_stats[u].jitter;
-
-		// update TS only if ahead or very different
-		uint64_t ts = atomic64_get(&ssrc_ctx->last_ts);
-		uint64_t diff = ts - stats_info->ssrc_stats[u].timestamp;
-		if (diff > 1000000)
-			atomic64_set(&ssrc_ctx->last_ts, stats_info->ssrc_stats[u].timestamp);
-
-		RTPE_STATS_ADD(packets_lost, stats_info->ssrc_stats[u].total_lost);
-		atomic64_add(&ps->selected_sfd->local_intf->stats.s.packets_lost,
-				stats_info->ssrc_stats[u].total_lost);
-
-		uint32_t ssrc_map_out = ssrc_ctx->ssrc_map_out;
-
-		// update opposite outgoing SSRC
-		for (__auto_type l = ps->rtp_sinks.head; l; l = l->next) {
-			struct sink_handler *sh = l->data;
-			struct packet_stream *sink = sh->sink;
-
-			if (mutex_trylock(&sink->out_lock))
-				continue; // will have to skip this
-
-			ssrc_ctx = __hunt_ssrc_ctx(ssrc, sink->ssrc_out, u);
-			if (!ssrc_ctx)
-				ssrc_ctx = __hunt_ssrc_ctx(ssrc_map_out, sink->ssrc_out, u);
-
-			if (ssrc_ctx) {
-				parent = ssrc_ctx->parent;
-				atomic64_add(&ssrc_ctx->packets, stats_info->ssrc_stats[u].basic_stats.packets);
-				atomic64_add(&ssrc_ctx->octets, stats_info->ssrc_stats[u].basic_stats.bytes);
-			}
-
-			mutex_unlock(&sink->out_lock);
-		}
-
-		for (__auto_type l = ps->rtcp_sinks.head; l; l = l->next) {
-			struct sink_handler *sh = l->data;
-			struct packet_stream *sink = sh->sink;
-
-			if (mutex_trylock(&sink->out_lock))
-				continue; // will have to skip this
-
-			ssrc_ctx = __hunt_ssrc_ctx(ssrc, sink->ssrc_out, u);
-			if (!ssrc_ctx)
-				ssrc_ctx = __hunt_ssrc_ctx(ssrc_map_out, sink->ssrc_out, u);
-
-			if (ssrc_ctx) {
-				if (sh->kernel_output_idx >= 0) {
-					ssrc_ctx->srtcp_index
-						= stats_info->last_rtcp_index[sh->kernel_output_idx][u];
-				}
-			}
-
-			mutex_unlock(&sink->out_lock);
-		}
-	}
-}
-
-
-// must be called with appropriate locks (master lock and/or in_lock)
-static void __stream_update_stats(struct packet_stream *ps) {
-	mutex_lock(&ps->in_lock);
-
-	struct rtpengine_command_stats stats_info;
-	__re_address_translate_ep(&stats_info.local, &ps->selected_sfd->socket.local);
-	if (!kernel_update_stats(&stats_info)) {
-		mutex_unlock(&ps->in_lock);
-		return;
-	}
-
-	__stream_consume_stats(ps, &stats_info.stats);
-
-	mutex_unlock(&ps->in_lock);
-}
-
-
 /* must be called with in_lock held or call->master_lock held in W */
 void __unkernelize(struct packet_stream *p, const char *reason) {
-	reset_ps_kernel_stats(p);
-
 	if (!p->selected_sfd)
 		return;
 
@@ -1887,10 +1797,9 @@ void __unkernelize(struct packet_stream *p, const char *reason) {
 		ilog(LOG_INFO, "Removing media stream from kernel: local %s (%s)",
 				endpoint_print_buf(&p->selected_sfd->socket.local),
 				reason);
-		struct rtpengine_command_del_target_stats cmd;
+		struct rtpengine_command_del_target cmd = {0};
 		__re_address_translate_ep(&cmd.local, &p->selected_sfd->socket.local);
-		if (kernel_del_stream_stats(&cmd))
-			__stream_consume_stats(p, &cmd.stats);
+		kernel_del_stream(&cmd);
 	}
 
 	PS_CLEAR(p, KERNELIZED);
@@ -1939,29 +1848,6 @@ void unkernelize(struct packet_stream *ps, const char *reason) {
 	__unkernelize(ps, reason);
 	mutex_unlock(&ps->in_lock);
 }
-
-// master lock held in R
-void media_update_stats(struct call_media *m) {
-	if (!proto_is_rtp(m->protocol))
-		return;
-	if (!kernel.is_open)
-		return;
-
-	for (__auto_type l = m->streams.head; l; l = l->next) {
-		struct packet_stream *ps = l->data;
-		if (!PS_ISSET(ps, RTP))
-			continue;
-		if (!PS_ISSET(ps, KERNELIZED))
-			continue;
-		if (PS_ISSET(ps, NO_KERNEL_SUPPORT))
-			continue;
-		if (!ps->selected_sfd)
-			continue;
-
-		__stream_update_stats(ps);
-	}
-}
-
 
 
 // `out_media` can be NULL
@@ -2148,6 +2034,11 @@ static int media_demux_protocols(struct packet_handler_ctx *phc) {
 
 		mutex_lock(&phc->mp.stream->in_lock);
 		int ret = dtls(phc->mp.sfd, &phc->s, &phc->mp.fsin);
+		if (ret == 1) {
+			phc->unkernelize = "DTLS connected";
+			phc->unkernelize_subscriptions = true;
+			ret = 0;
+		}
 		mutex_unlock(&phc->mp.stream->in_lock);
 		if (!ret)
 			return 0;
@@ -2277,8 +2168,8 @@ static void media_packet_rtp_in(struct packet_handler_ctx *phc)
 					"RTP packet with unknown payload type %u received from %s%s%s",
 					phc->payload_type,
 					FMT_M(endpoint_print_buf(&phc->mp.fsin)));
-			atomic64_inc(&phc->mp.stream->stats_in.errors);
-			atomic64_inc(&phc->mp.sfd->local_intf->stats.in.errors);
+			atomic64_inc_na(&phc->mp.stream->stats_in->errors);
+			atomic64_inc_na(&phc->mp.sfd->local_intf->stats->in.errors);
 			RTPE_STATS_INC(errors_user);
 		}
 		else {
@@ -2375,8 +2266,9 @@ int media_packet_encrypt(rewrite_func encrypt_func, struct packet_stream *out, s
 	for (__auto_type l = mp->packets_out.head; l; l = l->next) {
 		struct codec_packet *p = l->data;
 		if (mp->call->recording && rtpe_config.rec_egress) {
-			str_init_dup_str(&p->plain, &p->s);
-			p->plain_free_func = free;
+			p->plain = STR_LEN(bufferpool_alloc(media_bufferpool, p->s.len), p->s.len);
+			memcpy(p->plain.s, p->s.s, p->s.len);
+			p->plain_free_func = bufferpool_unref;
 		}
 		int encret = encrypt_func(&p->s, out, mp->ssrc_out);
 		if (encret == 1)
@@ -2390,15 +2282,8 @@ int media_packet_encrypt(rewrite_func encrypt_func, struct packet_stream *out, s
 	return ret;
 }
 
-// return: -1 = error, 0 = ok, 1 = pass to kernel for sending
+// return: -1 = error, 0 = ok
 static int __media_packet_encrypt(struct packet_handler_ctx *phc, struct sink_handler *sh) {
-	if (phc->rtcp) {
-		// can the kernel handle this for us?
-		if (PS_ISSET(phc->mp.stream, KERNELIZED) && !PS_ISSET(phc->mp.stream, NO_KERNEL_SUPPORT)
-				&& sh->kernel_output_idx >= 0)
-			return 1;
-	}
-
 	int ret = media_packet_encrypt(phc->encrypt_func, phc->out_srtp, &phc->mp);
 	if (ret & 0x02)
 		phc->update = true;
@@ -2486,8 +2371,8 @@ static bool media_packet_address_check(struct packet_handler_ctx *phc)
 					FMT_M(sockaddr_print_buf(&endpoint.address), endpoint.port),
 					FMT_M(sockaddr_print_buf(&ps_endpoint->address),
 					ps_endpoint->port));
-				atomic64_inc(&phc->mp.stream->stats_in.errors);
-				atomic64_inc(&phc->mp.sfd->local_intf->stats.in.errors);
+				atomic64_inc_na(&phc->mp.stream->stats_in->errors);
+				atomic64_inc_na(&phc->mp.sfd->local_intf->stats->in.errors);
 				ret = true;
 			}
 		}
@@ -2697,55 +2582,6 @@ static int media_packet_queue_dup(codec_packet_q *q) {
 }
 
 /**
- * reverse of count_stream_stats_kernel()
- */
-static void count_stream_stats_userspace(struct packet_stream *ps) {
-	if (!PS_ISSET(ps, RTP))
-		return;
-	if (bf_set(&ps->stats_flags, PS_STATS_USERSPACE))
-		return; // flag was already set, nothing to do
-
-	if (bf_isset(&ps->stats_flags, PS_STATS_KERNEL)) {
-		// mixed stream. count as only mixed stream.
-		if (bf_clear(&ps->stats_flags, PS_STATS_USERSPACE_COUNTED))
-			RTPE_GAUGE_DEC(userspace_streams);
-		if (bf_clear(&ps->stats_flags, PS_STATS_KERNEL_COUNTED))
-			RTPE_GAUGE_DEC(kernel_only_streams);
-		if (!bf_set(&ps->stats_flags, PS_STATS_MIXED_COUNTED))
-			RTPE_GAUGE_INC(kernel_user_streams);
-	}
-	else {
-		// userspace-only (for now). count it.
-		if (!bf_set(&ps->stats_flags, PS_STATS_USERSPACE_COUNTED))
-			RTPE_GAUGE_INC(userspace_streams);
-	}
-}
-/**
- * reverse of count_stream_stats_userspace()
- */
-static void count_stream_stats_kernel(struct packet_stream *ps) {
-	if (!PS_ISSET(ps, RTP))
-		return;
-	if (bf_set(&ps->stats_flags, PS_STATS_KERNEL))
-		return; // flag was already set, nothing to do
-
-	if (bf_isset(&ps->stats_flags, PS_STATS_USERSPACE)) {
-		// mixed stream. count as only mixed stream.
-		if (bf_clear(&ps->stats_flags, PS_STATS_KERNEL_COUNTED))
-			RTPE_GAUGE_DEC(kernel_only_streams);
-		if (bf_clear(&ps->stats_flags, PS_STATS_USERSPACE_COUNTED))
-			RTPE_GAUGE_DEC(userspace_streams);
-		if (!bf_set(&ps->stats_flags, PS_STATS_MIXED_COUNTED))
-			RTPE_GAUGE_INC(kernel_user_streams);
-	}
-	else {
-		// kernel-only (for now). count it.
-		if (!bf_set(&ps->stats_flags, PS_STATS_KERNEL_COUNTED))
-			RTPE_GAUGE_INC(kernel_only_streams);
-	}
-}
-
-/**
  * Packet handling starts in stream_packet().
  * 
  * This operates on the originating stream_fd (fd which received the packet)
@@ -2853,20 +2689,20 @@ static int stream_packet(struct packet_handler_ctx *phc) {
 
 	// SSRC receive stats
 	if (phc->mp.ssrc_in && phc->mp.rtp) {
-		atomic64_inc(&phc->mp.ssrc_in->packets);
-		atomic64_add(&phc->mp.ssrc_in->octets, phc->s.len);
+		atomic64_inc_na(&phc->mp.ssrc_in->stats->packets);
+		atomic64_add_na(&phc->mp.ssrc_in->stats->bytes, phc->s.len);
 		// no real sequencing, so this is rudimentary
-		uint64_t old_seq = atomic64_get(&phc->mp.ssrc_in->last_seq);
-		uint64_t new_seq = ntohs(phc->mp.rtp->seq_num) | (old_seq & 0xffff0000UL);
+		unsigned int old_seq = atomic_get_na(&phc->mp.ssrc_in->stats->ext_seq);
+		unsigned int new_seq = ntohs(phc->mp.rtp->seq_num) | (old_seq & 0xffff0000UL);
 		// XXX combine this with similar code elsewhere
-		long seq_diff = new_seq - old_seq;
+		int seq_diff = new_seq - old_seq;
 		while (seq_diff < -60000) {
 			new_seq += 0x10000;
 			seq_diff += 0x10000;
 		}
 		if (seq_diff > 0 || seq_diff < -10) {
-			atomic64_set(&phc->mp.ssrc_in->last_seq, new_seq);
-			atomic64_set(&phc->mp.ssrc_in->last_ts, ntohl(phc->mp.rtp->timestamp));
+			atomic_set_na(&phc->mp.ssrc_in->stats->ext_seq, new_seq);
+			atomic_set_na(&phc->mp.ssrc_in->stats->timestamp, ntohl(phc->mp.rtp->timestamp));
 		}
 	}
 
@@ -2884,22 +2720,19 @@ static int stream_packet(struct packet_handler_ctx *phc) {
 
 	phc->mp.raw = phc->s;
 
-	if (atomic64_inc(&phc->mp.stream->stats_in.packets) == 0) {
+	if (atomic64_inc_na(&phc->mp.stream->stats_in->packets) == 0) {
 		if (phc->mp.stream->component == 1) {
 			if (phc->mp.media->index == 1)
 				janus_rtc_up(phc->mp.media->monologue);
 			janus_media_up(phc->mp.media);
 		}
 	}
-	atomic64_add(&phc->mp.stream->stats_in.bytes, phc->s.len);
-	atomic64_inc(&phc->mp.sfd->local_intf->stats.in.packets);
-	atomic64_add(&phc->mp.sfd->local_intf->stats.in.bytes, phc->s.len);
+	atomic64_add_na(&phc->mp.stream->stats_in->bytes, phc->s.len);
+	atomic64_inc_na(&phc->mp.sfd->local_intf->stats->in.packets);
+	atomic64_add_na(&phc->mp.sfd->local_intf->stats->in.bytes, phc->s.len);
 	atomic64_set(&phc->mp.stream->last_packet, rtpe_now.tv_sec);
 	RTPE_STATS_INC(packets_user);
 	RTPE_STATS_ADD(bytes_user, phc->s.len);
-
-	if (!PS_ISSET(phc->mp.stream, KERNELIZED) || rtpe_now.tv_sec > phc->mp.stream->kernel_time + 1)
-		count_stream_stats_userspace(phc->mp.stream);
 
 	///////////////// EGRESS HANDLING
 
@@ -2925,7 +2758,7 @@ static int stream_packet(struct packet_handler_ctx *phc) {
 			if (sh_link->next) {
 				if (!orig_raw.s)
 					orig_raw = phc->mp.raw;
-				char *buf = g_malloc(orig_raw.len + RTP_BUFFER_TAIL_ROOM);
+				char *buf = bufferpool_alloc(media_bufferpool, orig_raw.len + RTP_BUFFER_TAIL_ROOM);
 				memcpy(buf, orig_raw.s, orig_raw.len);
 				phc->mp.raw.s = buf;
 				g_queue_push_tail(&free_list, buf);
@@ -3030,19 +2863,6 @@ next_mirror:
 		if (ret == -1)
 			goto err_next;
 
-		if (ret == 1) {
-			for (__auto_type l = phc->mp.packets_out.head; l; l = l->next) {
-				struct codec_packet *p = l->data;
-				__re_address_translate_ep(&p->kernel_send_info.local,
-						&phc->mp.stream->selected_sfd->socket.local);
-				__re_address_translate_ep(&p->kernel_send_info.src_addr,
-						&sh->sink->selected_sfd->socket.local);
-				__re_address_translate_ep(&p->kernel_send_info.dst_addr,
-						&sh->sink->endpoint);
-				p->kernel_send_info.destination_idx = sh->kernel_output_idx;
-			}
-		}
-
 		mutex_lock(&sink->out_lock);
 
 		if (!sink->advertised_endpoint.port
@@ -3065,9 +2885,9 @@ next_mirror:
 
 err_next:
 		ilog(LOG_DEBUG | LOG_FLAG_LIMIT ,"Error when sending message. Error: %s", strerror(errno));
-		atomic64_inc(&sink->stats_in.errors);
+		atomic64_inc_na(&sink->stats_in->errors);
 		if (sink->selected_sfd)
-			atomic64_inc(&sink->selected_sfd->local_intf->stats.out.errors);
+			atomic64_inc_na(&sink->selected_sfd->local_intf->stats->out.errors);
 		RTPE_STATS_INC(errors_user);
 		goto next;
 
@@ -3117,8 +2937,8 @@ out:
 	}
 
 	if (handler_ret < 0) {
-		atomic64_inc(&phc->mp.stream->stats_in.errors);
-		atomic64_inc(&phc->mp.sfd->local_intf->stats.in.errors);
+		atomic64_inc_na(&phc->mp.stream->stats_in->errors);
+		atomic64_inc_na(&phc->mp.sfd->local_intf->stats->in.errors);
 		RTPE_STATS_INC(errors_user);
 	}
 
@@ -3129,15 +2949,42 @@ out:
 
 	ssrc_ctx_put(&phc->mp.ssrc_in);
 	rtcp_list_free(&phc->rtcp_list);
-	g_queue_clear_full(&free_list, g_free);
+	g_queue_clear_full(&free_list, bufferpool_unref);
 
 	return ret;
 }
 
 
+static void __stream_fd_readable(struct packet_handler_ctx *phc) {
+	struct stream_fd *sfd = phc->mp.sfd;
+
+	if (phc->mp.tv.tv_sec < 0) {
+		// kernel-handled RTCP
+		phc->kernel_handled = true;
+		// restore original actual timestamp
+		if (G_UNLIKELY(phc->mp.tv.tv_usec == 0))
+			phc->mp.tv.tv_sec = -phc->mp.tv.tv_sec;
+		else {
+			phc->mp.tv.tv_sec = -phc->mp.tv.tv_sec - 1;
+			phc->mp.tv.tv_usec = 1000000 - phc->mp.tv.tv_usec;
+		}
+	}
+
+	int ret;
+	if (sfd->stream && sfd->stream->jb) {
+		ret = buffer_packet(&phc->mp, &phc->s);
+		if (ret == 1)
+			ret = stream_packet(phc);
+	}
+	else
+		ret = stream_packet(phc);
+
+	if (G_UNLIKELY(ret < 0))
+		ilog(LOG_WARNING | LOG_FLAG_LIMIT, "Write error on media socket: %s", strerror(-ret));
+}
+
 static void stream_fd_readable(int fd, void *p) {
 	stream_fd *sfd = p;
-	char buf[RTP_BUFFER_SIZE];
 	int ret, iters;
 	bool update = false;
 	call_t *ca;
@@ -3187,6 +3034,9 @@ restart:
 				goto done;
 			}
 		}
+
+		g_autoptr(bp_char) buf = bufferpool_alloc(media_bufferpool, RTP_BUFFER_SIZE);
+
 		ret = socket_recvfrom_ts(&sfd->socket, buf + RTP_BUFFER_HEAD_ROOM, MAX_RTP_PACKET_SIZE,
 				&phc.mp.fsin, &phc.mp.tv);
 		if (ca)
@@ -3203,32 +3053,11 @@ restart:
 		if (ret >= MAX_RTP_PACKET_SIZE)
 			ilog(LOG_WARNING | LOG_FLAG_LIMIT, "UDP packet possibly truncated");
 
-		if (phc.mp.tv.tv_sec < 0) {
-			// kernel-handled RTCP
-			phc.kernel_handled = true;
-			// restore original actual timestamp
-			if (G_UNLIKELY(phc.mp.tv.tv_usec == 0))
-				phc.mp.tv.tv_sec = -phc.mp.tv.tv_sec;
-			else {
-				phc.mp.tv.tv_sec = -phc.mp.tv.tv_sec - 1;
-				phc.mp.tv.tv_usec = 1000000 - phc.mp.tv.tv_usec;
-			}
-		}
+		phc.s = STR_LEN(buf + RTP_BUFFER_HEAD_ROOM, ret);
 
-		str_init_len(&phc.s, buf + RTP_BUFFER_HEAD_ROOM, ret);
+		__stream_fd_readable(&phc);
 
-		if (sfd->stream && sfd->stream->jb) {
-			ret = buffer_packet(&phc.mp, &phc.s);
-			if (ret == 1)
-				ret = stream_packet(&phc);
-		}
-		else
-			ret = stream_packet(&phc);
-
-		if (G_UNLIKELY(ret < 0))
-			ilog(LOG_WARNING | LOG_FLAG_LIMIT, "Write error on media socket: %s", strerror(-ret));
-		else if (phc.update)
-			update = true;
+		update += phc.update;
 	}
 
 	// -1 active read events. If it's non-zero, another thread has received a read event,
@@ -3249,11 +3078,42 @@ done:
 	log_info_pop();
 }
 
+static void stream_fd_recv(struct obj *obj, char *buf, size_t len, struct sockaddr *sa, struct timeval *tv) {
+	struct stream_fd *sfd = (struct stream_fd *) obj;
+	call_t *ca = sfd->call;
+	if (!ca)
+		goto out;
+
+	rwlock_lock_r(&ca->master_lock);
+
+	if (sfd->socket.fd == -1) {
+		rwlock_unlock_r(&ca->master_lock);
+		goto out;
+	}
+
+	log_info_stream_fd(sfd);
+
+	rwlock_unlock_r(&ca->master_lock);
+
+	struct packet_handler_ctx phc;
+	ZERO(phc);
+	phc.mp.sfd = sfd;
+	sfd->socket.family->sockaddr2endpoint(&phc.mp.fsin, sa);
+	phc.s = STR_LEN(buf, len);
+
+	__stream_fd_readable(&phc);
+
+	if (phc.update)
+		redis_update_onekey(ca, rtpe_redis_write);
+
+out:
+	log_info_pop();
+	bufferpool_unref(buf);
+}
 
 
 
-static void stream_fd_free(void *p) {
-	stream_fd *f = p;
+static void stream_fd_free(stream_fd *f) {
 	release_port(&f->socket, f->local_intf->spec);
 	crypto_cleanup(&f->crypto);
 	dtls_connection_cleanup(&f->dtls);
@@ -3265,7 +3125,7 @@ stream_fd *stream_fd_new(socket_t *fd, call_t *call, struct local_intf *lif) {
 	stream_fd *sfd;
 	struct poller_item pi;
 
-	sfd = obj_alloc0("stream_fd", sizeof(*sfd), stream_fd_free);
+	sfd = obj_alloc0(stream_fd, stream_fd_free);
 	sfd->unique_id = t_queue_get_length(&call->stream_fds);
 	sfd->socket = *fd;
 	sfd->call = obj_get(call);
@@ -3279,6 +3139,7 @@ stream_fd *stream_fd_new(socket_t *fd, call_t *call, struct local_intf *lif) {
 	pi.fd = sfd->socket.fd;
 	pi.obj = &sfd->obj;
 	pi.readable = stream_fd_readable;
+	pi.recv = stream_fd_recv;
 	pi.closed = stream_fd_closed;
 
 	if (sfd->socket.fd != -1) {
@@ -3357,18 +3218,11 @@ void interfaces_free(void) {
 
 	while ((ifc = g_queue_pop_head(&all_local_interfaces))) {
 		free(ifc->ice_foundation.s);
+		bufferpool_unref(ifc->stats);
 		g_slice_free1(sizeof(*ifc), ifc);
 	}
 
-	ll = g_hash_table_get_values(__logical_intf_name_family_hash);
-	for (GList *l = ll; l; l = l->next) {
-		struct logical_intf *lif = l->data;
-		g_hash_table_destroy(lif->rr_specs);
-		g_queue_clear(&lif->list);
-		g_slice_free1(sizeof(*lif), lif);
-	}
-	g_list_free(ll);
-	g_hash_table_destroy(__logical_intf_name_family_hash);
+	t_hash_table_destroy(__logical_intf_name_family_hash);
 
 	ll = g_hash_table_get_values(__local_intf_addr_type_hash);
 	for (GList *l = ll; l; l = l->next) {
@@ -3392,21 +3246,27 @@ void interfaces_free(void) {
 	g_list_free(ll);
 	g_hash_table_destroy(__intf_spec_addr_type_hash);
 
-	ll = g_hash_table_get_values(__logical_intf_name_family_rr_hash);
-	for (GList *l = ll; l; l = l->next) {
-		struct intf_rr *rr = l->data;
+	intf_rr_lookup_iter r_iter;
+	t_hash_table_iter_init(&r_iter, __logical_intf_name_family_rr_hash);
+	struct intf_rr *rr;
+	while (t_hash_table_iter_next(&r_iter, NULL, &rr)) {
 		g_queue_clear(&rr->logical_intfs);
 		g_slice_free1(sizeof(*rr), rr);
 	}
-	g_list_free(ll);
-	g_hash_table_destroy(__logical_intf_name_family_rr_hash);
+	t_hash_table_destroy(__logical_intf_name_family_rr_hash);
 
-	for (int i = 0; i < G_N_ELEMENTS(__preferred_lists_for_family); i++)
-		g_queue_clear(&__preferred_lists_for_family[i]);
+	for (int i = 0; i < G_N_ELEMENTS(__preferred_lists_for_family); i++) {
+		GQueue *q = &__preferred_lists_for_family[i];
+		struct logical_intf *lif;
+		while ((lif = g_queue_pop_head(q))) {
+			g_hash_table_destroy(lif->rr_specs);
+			g_queue_clear(&lif->list);
+			g_slice_free1(sizeof(*lif), lif);
+		}
+	}
 
 	t_hash_table_destroy(local_media_socket_endpoints);
 	local_media_socket_endpoints = local_sockets_ht_null();
-	rwlock_destroy(&local_media_socket_endpoints_lock);
 }
 
 
@@ -3437,174 +3297,4 @@ struct interface_stats_block *interface_sampled_rate_stats_get(struct interface_
 		*time_diff_us = 0;
 	ret->last_run = rtpe_now;
 	return &ret->stats;
-}
-
-
-/**
- * Ports iterations (stats update from the kernel) functionality.
- */
-enum thread_looper_action kernel_stats_updater(void) {
-	struct rtpengine_list_entry *ke;
-	struct packet_stream *ps;
-	int j;
-	struct rtp_stats *rs;
-	unsigned int pt;
-	endpoint_t ep;
-
-	/* TODO: should we realy check the count of call timers? `call_timer_iterator()` */
-	__auto_type kl = kernel_get_list();
-	while (kl) {
-		ke = kl->data;
-		kernel2endpoint(&ep, &ke->target.local);
-		g_autoptr(stream_fd) sfd = stream_fd_lookup(&ep);
-
-		if (!sfd)
-			goto next;
-
-		log_info_stream_fd(sfd);
-
-		rwlock_lock_r(&sfd->call->master_lock);
-		ps = sfd->stream;
-		if (!ps || ps->selected_sfd != sfd) {
-			rwlock_unlock_r(&sfd->call->master_lock);
-			goto next;
-		}
-
-		uint64_t diff_packets_in, diff_bytes_in, diff_errors_in;
-		uint64_t diff_packets_out, diff_bytes_out, diff_errors_out;
-
-		DS(packets);
-		DS(bytes);
-		DS(errors);
-
-		if (ke->stats_in.packets != atomic64_get(&ps->kernel_stats_in.packets)) {
-			atomic64_set(&ps->last_packet, rtpe_now.tv_sec);
-			count_stream_stats_kernel(ps);
-		}
-
-		ps->in_tos_tclass = ke->stats_in.tos;
-
-		atomic64_set(&ps->kernel_stats_in.bytes, ke->stats_in.bytes);
-		atomic64_set(&ps->kernel_stats_in.packets, ke->stats_in.packets);
-		atomic64_set(&ps->kernel_stats_in.errors, ke->stats_in.errors);
-
-		uint64_t max_diff = 0;
-		int max_pt = -1;
-		for (j = 0; j < ke->target.num_payload_types; j++) {
-			pt = ke->target.pt_input[j].pt_num;
-			rs = g_hash_table_lookup(ps->rtp_stats, GINT_TO_POINTER(pt));
-			if (!rs)
-				continue;
-			if (ke->rtp_stats[j].packets > atomic64_get(&rs->packets)) {
-				uint64_t diff = ke->rtp_stats[j].packets - atomic64_get(&rs->packets);
-				atomic64_add(&rs->packets, diff);
-				if (diff > max_diff) {
-					max_diff = diff;
-					max_pt = pt;
-				}
-			}
-			if (ke->rtp_stats[j].bytes > atomic64_get(&rs->bytes))
-				atomic64_add(&rs->bytes,
-						ke->rtp_stats[j].bytes - atomic64_get(&rs->bytes));
-			atomic64_set(&rs->kernel_packets, ke->rtp_stats[j].packets);
-			atomic64_set(&rs->kernel_bytes, ke->rtp_stats[j].bytes);
-		}
-
-		bool update = false;
-
-		if (diff_packets_in)
-			CALL_CLEAR(sfd->call, FOREIGN_MEDIA);
-
-		if (!ke->target.non_forwarding && diff_packets_in) {
-			for (__auto_type l = ps->rtp_sinks.head; l; l = l->next) {
-				struct sink_handler *sh = l->data;
-				struct packet_stream *sink = sh->sink;
-
-				if (sh->kernel_output_idx < 0
-						|| sh->kernel_output_idx >= ke->target.num_destinations)
-					continue;
-
-				struct rtpengine_output_info *o = &ke->outputs[sh->kernel_output_idx];
-				struct rtpengine_stats *stats_o = &ke->stats_out[sh->kernel_output_idx];
-
-				DSo(bytes);
-				DSo(packets);
-				DSo(errors);
-
-				atomic64_set(&sink->kernel_stats_out.bytes, stats_o->bytes);
-				atomic64_set(&sink->kernel_stats_out.packets, stats_o->packets);
-				atomic64_set(&sink->kernel_stats_out.errors, stats_o->errors);
-
-				mutex_lock(&sink->out_lock);
-				for (unsigned int u = 0; u < G_N_ELEMENTS(ke->target.ssrc); u++) {
-					if (!ke->target.ssrc[u]) // end of list
-						break;
-					uint32_t out_ssrc = o->ssrc_out[u];
-					if (!out_ssrc)
-						out_ssrc = ke->target.ssrc[u];
-					struct ssrc_ctx *ctx = __hunt_ssrc_ctx(ntohl(out_ssrc),
-							sink->ssrc_out, 0);
-					if (!ctx)
-						continue;
-					if (max_pt != -1)
-						payload_tracker_add(&ctx->tracker, max_pt);
-					if (sink->crypto.params.crypto_suite
-							&& o->encrypt.last_rtp_index[u] - ctx->srtp_index > 0x4000)
-					{
-						ilog(LOG_DEBUG, "Updating SRTP encryption index from %" PRIu64
-								" to %" PRIu64,
-								ctx->srtp_index,
-								o->encrypt.last_rtp_index[u]);
-						ctx->srtp_index = o->encrypt.last_rtp_index[u];
-						update = true;
-					}
-					if (ctx->srtcp_index != o->encrypt.last_rtcp_index[u]) {
-						ctx->srtcp_index = o->encrypt.last_rtcp_index[u];
-						update = true;
-					}
-				}
-				mutex_unlock(&sink->out_lock);
-			}
-
-			mutex_lock(&ps->in_lock);
-
-			for (unsigned int u = 0; u < G_N_ELEMENTS(ke->target.ssrc); u++) {
-				if (!ke->target.ssrc[u]) // end of list
-					break;
-				struct ssrc_ctx *ctx = __hunt_ssrc_ctx(ntohl(ke->target.ssrc[u]),
-						ps->ssrc_in, 0);
-				if (!ctx)
-					continue;
-				// TODO: add in SSRC stats similar to __stream_update_stats
-				atomic64_set(&ctx->last_seq, ke->target.decrypt.last_rtp_index[u]);
-
-				if (max_pt != -1)
-					payload_tracker_add(&ctx->tracker, max_pt);
-
-				if (sfd->crypto.params.crypto_suite
-						&& ke->target.decrypt.last_rtp_index[u]
-						- ctx->srtp_index > 0x4000) {
-					ilog(LOG_DEBUG, "Updating SRTP decryption index from %" PRIu64
-							" to %" PRIu64,
-							ctx->srtp_index,
-							ke->target.decrypt.last_rtp_index[u]);
-					ctx->srtp_index = ke->target.decrypt.last_rtp_index[u];
-					update = true;
-				}
-			}
-			mutex_unlock(&ps->in_lock);
-		}
-
-		rwlock_unlock_r(&sfd->call->master_lock);
-
-		if (update)
-			redis_update_onekey(ps->call, rtpe_redis_write);
-
-next:
-		g_slice_free1(sizeof(*ke), ke);
-		kl = t_slist_delete_link(kl, kl);
-		log_info_pop();
-	}
-
-	return TLA_CONTINUE;
 }

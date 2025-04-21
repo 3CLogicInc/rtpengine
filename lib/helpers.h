@@ -29,8 +29,12 @@
 typedef bool (*parse_func)(char **, void **, void *);
 
 int pcre2_multi_match(pcre2_code *, const char *, unsigned int, parse_func, void *, GQueue *);
-INLINE void strmove(char **, char **);
-INLINE void strdupfree(char **, const char *);
+
+#if PCRE2_MAJOR > 10 || (PCRE2_MAJOR == 10 && PCRE2_MINOR >= 43)
+#define SUBSTRING_FREE_ARG PCRE2_UCHAR **
+#else
+#define SUBSTRING_FREE_ARG PCRE2_SPTR *
+#endif
 
 
 
@@ -102,6 +106,12 @@ INLINE char *glib_json_print(JsonBuilder *builder) {
 
 	return result;
 }
+INLINE void glib_json_builder_add_str(JsonBuilder *builder, str *s) {
+	char ori = s->s[s->len];
+	s->s[s->len] = '\0';
+	json_builder_add_string_value(builder, s->s);
+	s->s[s->len] = ori;
+}
 
 
 /* GQUEUE */
@@ -132,28 +142,6 @@ INLINE GQueue *g_hash_table_lookup_queue_new(GHashTable *ht, void *key, GDestroy
 
 
 /*** STRING HELPERS ***/
-
-INLINE void strmove(char **d, char **s) {
-	if (*d)
-		free(*d);
-	*d = *s;
-	*s = strdup("");
-}
-
-INLINE void strdupfree(char **d, const char *s) {
-	if (*d)
-		free(*d);
-	*d = strdup(s);
-}
-
-INLINE int strmemcmp(const void *mem, int len, const char *s) {
-	int l = strlen(s);
-	if (l < len)
-		return -1;
-	if (l > len)
-		return 1;
-	return memcmp(mem, s, len);
-}
 
 INLINE const char *__get_enum_array_text(const char * const *array, unsigned int idx,
 		unsigned int len, const char *deflt)

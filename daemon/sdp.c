@@ -20,6 +20,7 @@
 #include "call_interfaces.h"
 #include "rtplib.h"
 #include "codec.h"
+#include "media_player.h"
 
 enum attr_id {
 	ATTR_OTHER = 0,
@@ -61,32 +62,12 @@ enum attr_id {
 	* and needs later processing in `sdp_create()`.	*/
 	ATTR_T38MAXBITRATE,
 	ATTR_T38FAXMAXBUFFER,
-	ATTR_XG726BITORDER,
 	ATTR_MAXPTIME,
-	ATTR_DIRECTION,
-	ATTR_LABEL,
 	ATTR_TLS_ID,
 	ATTR_END_OF_CANDIDATES,
 };
 // make sure g_int_hash can be used
 static_assert(sizeof(gint) == sizeof(enum attr_id), "sizeof enum attr_id wrong");
-
-struct network_address {
-	str network_type;
-	str address_type;
-	str address;
-	sockaddr_t parsed;
-};
-
-struct sdp_origin {
-	str username;
-	str session_id;
-	str version_str;
-	struct network_address address;
-	unsigned long long version_num;
-	size_t version_output_pos;
-	unsigned int parsed:1;
-};
 
 struct sdp_connection {
 	str s;
@@ -94,9 +75,17 @@ struct sdp_connection {
 	unsigned int parsed:1;
 };
 
+INLINE unsigned int attr_id_hash(const enum attr_id *e) {
+	int i = *e;
+	return g_int_hash(&i);
+}
+INLINE gboolean attr_id_eq(const enum attr_id *a, const enum attr_id *b) {
+	return *a == *b;
+}
+
 TYPED_GQUEUE(attributes, struct sdp_attribute)
-TYPED_GHASHTABLE(attr_id_ht, enum attr_id, struct sdp_attribute, g_int_hash, g_int_equal, NULL, NULL)
-TYPED_GHASHTABLE(attr_list_ht, enum attr_id, attributes_q, g_int_hash, g_int_equal, NULL, g_queue_free)
+TYPED_GHASHTABLE(attr_id_ht, enum attr_id, struct sdp_attribute, attr_id_hash, attr_id_eq, NULL, NULL)
+TYPED_GHASHTABLE(attr_list_ht, enum attr_id, attributes_q, attr_id_hash, attr_id_eq, NULL, g_queue_free)
 TYPED_GHASHTABLE_LOOKUP_INSERT(attr_list_ht, NULL, attributes_q_new)
 
 struct sdp_attributes {
@@ -111,10 +100,11 @@ TYPED_GQUEUE(sdp_media, struct sdp_media)
 
 struct sdp_session {
 	str s;
-	struct sdp_origin origin;
+	sdp_origin origin;
 	str session_name;
+	str session_timing; /* t= */
 	struct sdp_connection connection;
-	int rr, rs;
+	struct session_bandwidth bandwidth;
 	struct sdp_attributes attributes;
 	sdp_media_q media_streams;
 };
@@ -132,15 +122,12 @@ struct sdp_media {
 	int port_count;
 
 	struct sdp_connection connection;
-	const char *c_line_pos;
-	int rr, rs;
+	const char *c_line_pos; // XXX to be obsoleted
+	struct session_bandwidth bandwidth;
 	struct sdp_attributes attributes;
-	GQueue format_list; /* list of slice-alloc'd str objects */
+	str_slice_q format_list; /* list of slice-alloc'd str objects */
 	enum media_type media_type_id;
 	int media_sdp_id;
-
-
-	unsigned int legacy_osrtp:1;
 };
 
 struct attribute_rtcp {
@@ -270,9 +257,14 @@ struct attribute_t38faxudpecdepth {
 	int maxred;
 };
 
+enum attribute_other {
+	ATTR_OTHER_UNKNOWN = 0,
+	ATTR_OTHER_EXTMAP,
+};
+
 struct sdp_attribute {
 	/* example: a=rtpmap:8 PCMA/8000 */
-	str full_line;	/* including a= and \r\n */
+	str full_line;	/* including a= and \r\n */ // XXX to be obsoleted
 	str param;	/* "PCMA/8000" */
 
 	struct sdp_attribute_strs strs;
@@ -293,28 +285,46 @@ struct sdp_attribute {
 		int i;
 		struct attribute_t38faxudpecdepth t38faxudpecdepth;
 		struct attribute_t38faxratemanagement t38faxratemanagement;
-		enum sdp_attr_type other;
+		enum attribute_other other;
 	};
+};
+
+struct sdp_attr {
+	struct sdp_attribute_strs strs;
+	enum attr_id attr;
+	enum attribute_other other;
 };
 
 /**
  * Globaly visible variables for this file.
  */
 static char __id_buf[6*2 + 1]; // 6 hex encoded characters
-const str rtpe_instance_id = STR_CONST_INIT(__id_buf);
+const str rtpe_instance_id = STR_CONST(__id_buf);
 
 /**
  * Declarations for inner functions/helpers.
  */
+static struct sdp_attr *sdp_attr_dup(const struct sdp_attribute *c);
 static void attr_free(struct sdp_attribute *p);
 static void attr_insert(struct sdp_attributes *attrs, struct sdp_attribute *attr);
-INLINE void chopper_append_c(struct sdp_chopper *c, const char *s);
+static struct call_media *sdp_out_set_source_media_address(struct call_media *media,
+		struct packet_stream *rtp_ps,
+		struct sdp_ng_flags *flags,
+		endpoint_t *sdp_address);
+
+static void sdp_out_add_bandwidth(GString *out, struct call_monologue *monologue,
+		struct call_media *media, sdp_ng_flags *flags);
+static void sdp_out_add_media_connection(GString *out, struct call_media *media,
+		struct packet_stream *rtp_ps, const sockaddr_t *address, sdp_ng_flags *flags);
+static void sdp_out_original_media_attributes(GString *out, struct call_media *media,
+		const endpoint_t *address, struct call_media *source_media,
+		struct packet_stream *rtp_ps, sdp_ng_flags *flags);
 
 /**
  * Checks whether an attribute removal request exists for a given session level.
  * `attr_name` must be without `a=`.
  */
-static bool sdp_manipulate_remove(struct sdp_manipulations * sdp_manipulations, const str * attr_name) {
+static bool sdp_manipulate_remove(const struct sdp_manipulations * sdp_manipulations, const str * attr_name) {
 
 	/* no need for checks, if not given in flags */
 	if (!sdp_manipulations)
@@ -324,13 +334,13 @@ static bool sdp_manipulate_remove(struct sdp_manipulations * sdp_manipulations, 
 		return false;
 
 	str_case_ht ht = sdp_manipulations->rem_commands;
-	if (t_hash_table_is_set(ht) && t_hash_table_lookup(ht, attr_name))
-		return true;
+	if (t_hash_table_is_set(ht) && t_hash_table_lookup(ht, attr_name)) {
+		ilog(LOG_DEBUG, "Cannot insert: '" STR_FORMAT "' because prevented by SDP manipulations (remove)",
+				STR_FMT(attr_name));
+		return true; /* means remove */
+	}
 
-	ilog(LOG_DEBUG, "Cannot insert: '" STR_FORMAT "' because prevented by SDP manipulations (remove)",
-			STR_FMT(attr_name));
-
-	return false;
+	return false; /* means don't remove */
 }
 
 /**
@@ -338,44 +348,26 @@ static bool sdp_manipulate_remove(struct sdp_manipulations * sdp_manipulations, 
  * `attr_name` must be without `a=`.
  */
 static bool sdp_manipulate_remove_c(const char *attr_name, const sdp_ng_flags *flags, enum media_type media_type) {
-	struct sdp_manipulations *sdp_manipulations = sdp_manipulations_get_by_id(flags, media_type);
-	return sdp_manipulate_remove(sdp_manipulations, &STR_INIT(attr_name));
-}
-
-/**
- * Checks whether an attribute removal request exists for a given session level.
- * `attr_name` must be without `a=`.
- */
-static bool sdp_manipulate_remove_attr(struct sdp_manipulations *sdp_manipulations,
-		const struct sdp_attribute *attr)
-{
-	if (sdp_manipulate_remove(sdp_manipulations, &attr->strs.key))
-		return true;
-	if (sdp_manipulate_remove(sdp_manipulations, &attr->strs.name))
-		return true;
-	if (sdp_manipulate_remove(sdp_manipulations, &attr->strs.line_value))
-		return true;
-	return false;
+	struct sdp_manipulations *sdp_manipulations = sdp_manipulations_get_by_id(flags->sdp_manipulations, media_type);
+	return sdp_manipulate_remove(sdp_manipulations, STR_PTR(attr_name));
 }
 
 /**
  * Adds values into a requested session level (global, audio, video)
  */
-static void sdp_manipulations_add(struct sdp_chopper *chop,
-		struct sdp_manipulations * sdp_manipulations) {
+static void sdp_manipulations_add(GString *s, const struct sdp_manipulations * sdp_manipulations) {
 
 	if (!sdp_manipulations)
 		return;
 
-	str_q * q_ptr = &sdp_manipulations->add_commands;
+	const str_q * q_ptr = &sdp_manipulations->add_commands;
 
-	for (__auto_type l = q_ptr->head; l; l = l->next)
+	for (auto_iter(l, q_ptr->head); l; l = l->next)
 	{
 		str * attr_value = l->data;
-
-		chopper_append_c(chop, "a=");
-		chopper_append_c(chop, attr_value->s);
-		chopper_append_c(chop, "\r\n");
+		g_string_append_len(s, "a=", 2);
+		g_string_append_len(s, attr_value->s, attr_value->len);
+		g_string_append_len(s, "\r\n", 2);
 	}
 }
 
@@ -383,7 +375,7 @@ static void sdp_manipulations_add(struct sdp_chopper *chop,
  * Substitute values for a requested session level (global, audio, video).
  * `attr_name` must be without `a=`.
  */
-static str *sdp_manipulations_subst(struct sdp_manipulations * sdp_manipulations,
+static str *sdp_manipulations_subst(const struct sdp_manipulations * sdp_manipulations,
 		const str * attr_name) {
 
 	if (!sdp_manipulations)
@@ -398,24 +390,6 @@ static str *sdp_manipulations_subst(struct sdp_manipulations * sdp_manipulations
 				STR_FMT(attr_name), STR_FMT(cmd_subst_value));
 
 	return cmd_subst_value;
-}
-
-/**
- * Substitute values for a requested session level (global, audio, video).
- * `attr_name` must be without `a=`.
- */
-static str *sdp_manipulations_subst_attr(struct sdp_manipulations * sdp_manipulations,
-		const struct sdp_attribute * attr)
-{
-	str * cmd_subst_value;
-
-	if ((cmd_subst_value = sdp_manipulations_subst(sdp_manipulations, &attr->strs.key)))
-		return cmd_subst_value;
-	if ((cmd_subst_value = sdp_manipulations_subst(sdp_manipulations, &attr->strs.name)))
-		return cmd_subst_value;
-	if ((cmd_subst_value = sdp_manipulations_subst(sdp_manipulations, &attr->strs.line_value)))
-		return cmd_subst_value;
-	return NULL;
 }
 
 static void append_str_attr_to_gstring(GString *s, const str * name, const str * value,
@@ -435,13 +409,13 @@ void sdp_append_str_attr(GString *s, const sdp_ng_flags *flags, enum media_type 
 	g_autoptr(GString) gs = g_string_new("");
 	g_string_vprintf(gs, fmt, ap);
 	va_end(ap);
-	append_str_attr_to_gstring(s, name, &STR_INIT_GS(gs), flags, media_type);
+	append_str_attr_to_gstring(s, name, &STR_GS(gs), flags, media_type);
 }
 
 INLINE void append_attr_to_gstring(GString *s, const char * name, const str * value,
 		const sdp_ng_flags *flags, enum media_type media_type)
 {
-	append_str_attr_to_gstring(s, &STR_INIT(name), value, flags, media_type);
+	append_str_attr_to_gstring(s, STR_PTR(name), value, flags, media_type);
 }
 INLINE struct sdp_attribute *attr_get_by_id(struct sdp_attributes *a, enum attr_id id) {
 	return t_hash_table_lookup(a->id_hash, &id);
@@ -471,7 +445,7 @@ static int __parse_address(sockaddr_t *out, str *network_type, str *address_type
 			return -1;
 	}
 
-	if (!address_type) {
+	if (!address_type->len) {
 		if (sockaddr_parse_any_str(out, address))
 			return -1;
 		return 0;
@@ -489,7 +463,7 @@ static int parse_address(struct network_address *address) {
 			&address->address_type, &address->address);
 }
 
-#define EXTRACT_TOKEN(field) do { if (str_token_sep(&output->field, value_str, ' ')) return -1; } while (0)
+#define EXTRACT_TOKEN(field) do { if (!str_token_sep(&output->field, value_str, ' ')) return -1; } while (0)
 #define EXTRACT_NETWORK_ADDRESS_NP(field)			\
 		do { EXTRACT_TOKEN(field.network_type);		\
 		EXTRACT_TOKEN(field.address_type);		\
@@ -506,7 +480,7 @@ static int parse_address(struct network_address *address) {
 
 #define PARSE_INIT str v_str = output->strs.value; str *value_str = &v_str
 
-static int parse_origin(str *value_str, struct sdp_origin *output) {
+static int parse_origin(str *value_str, sdp_origin *output) {
 	if (output->parsed)
 		return -1;
 
@@ -561,10 +535,9 @@ static int parse_media(str *value_str, struct sdp_media *output) {
 	/* to split the "formats" list into tokens, we abuse some vars */
 	str formats = output->formats;
 	str format;
-	while (!str_token_sep(&format, &formats, ' ')) {
-		sp = g_slice_alloc(sizeof(*sp));
-		*sp = format;
-		g_queue_push_tail(&output->format_list, sp);
+	while (str_token_sep(&format, &formats, ' ')) {
+		sp = str_slice_dup(&format);
+		t_queue_push_tail(&output->format_list, sp);
 	}
 
 	return 0;
@@ -659,10 +632,8 @@ static int parse_attribute_crypto(struct sdp_attribute *output) {
 	if (ret != salt_key_len)
 		goto error;
 
-	c->master_key.s = c->key_salt_buf;
-	c->master_key.len = c->crypto_suite->master_key_len;
-	c->salt.s = c->master_key.s + c->master_key.len;
-	c->salt.len = c->crypto_suite->master_salt_len;
+	c->master_key = STR_LEN(c->key_salt_buf, c->crypto_suite->master_key_len);
+	c->salt = STR_LEN(c->master_key.s + c->master_key.len, c->crypto_suite->master_salt_len);
 
 	c->lifetime_str = c->key_params_str;
 	str_shift(&c->lifetime_str, 7 + enc_salt_key_len);
@@ -727,7 +698,7 @@ static int parse_attribute_crypto(struct sdp_attribute *output) {
 			memcpy(c->mki + (c->mki_len - sizeof(u32)), &u32, sizeof(u32));
 	}
 
-	while (str_token_sep(&s, value_str, ' ') == 0) {
+	while (str_token_sep(&s, value_str, ' ')) {
 		if (!str_cmp(&s, "UNENCRYPTED_SRTCP"))
 			c->unencrypted_srtcp = 1;
 		else if (!str_cmp(&s, "UNENCRYPTED_SRTP"))
@@ -752,7 +723,7 @@ static int parse_attribute_rtcp(struct sdp_attribute *output) {
 	PARSE_INIT;
 
 	str portnum;
-	if (str_token_sep(&portnum, value_str, ' '))
+	if (!str_token_sep(&portnum, value_str, ' '))
 		goto err;
 	output->rtcp.port_num = str_to_i(&portnum, 0);
 	if (output->rtcp.port_num <= 0 || output->rtcp.port_num > 0xffff) {
@@ -800,7 +771,7 @@ static int parse_attribute_candidate(struct sdp_attribute *output, bool extended
 	if (ep == c->priority_str.s)
 		return -1;
 
-	if (__parse_address(&c->cand_parsed.endpoint.address, NULL, NULL, &c->address_str))
+	if (sockaddr_parse_any_str(&c->cand_parsed.endpoint.address, &c->address_str))
 		return 0;
 
 	c->cand_parsed.endpoint.port = strtoul(c->port_str.s, &ep, 10);
@@ -826,7 +797,7 @@ static int parse_attribute_candidate(struct sdp_attribute *output, bool extended
 		if (str_cmp(&c->rport_str, "rport"))
 			return -1;
 
-		if (__parse_address(&c->cand_parsed.related.address, NULL, NULL, &c->related_address_str))
+		if (sockaddr_parse_any_str(&c->cand_parsed.related.address, &c->related_address_str))
 			return 0;
 
 		c->cand_parsed.related.port = strtoul(c->related_port_str.s, &ep, 10);
@@ -837,9 +808,9 @@ static int parse_attribute_candidate(struct sdp_attribute *output, bool extended
 	if (extended) {
 		while (true) {
 			str field, value;
-			if (str_token_sep(&field, value_str, ' '))
+			if (!str_token_sep(&field, value_str, ' '))
 				break;
-			if (str_token_sep(&value, value_str, ' '))
+			if (!str_token_sep(&value, value_str, ' '))
 				break;
 			if (!str_cmp(&field, "ufrag"))
 				c->cand_parsed.ufrag = value;
@@ -1137,7 +1108,7 @@ static int parse_attribute(struct sdp_attribute *a) {
 			ret = parse_attribute_crypto(a);
 			break;
 		case CSH_LOOKUP("extmap"):
-			a->other = SDP_ATTR_TYPE_EXTMAP;
+			a->other = ATTR_OTHER_EXTMAP;
 			break;
 		case CSH_LOOKUP("rtpmap"):
 			ret = parse_attribute_rtpmap(a);
@@ -1229,17 +1200,8 @@ static int parse_attribute(struct sdp_attribute *a) {
 		case CSH_LOOKUP("T38FaxMaxBuffer"):
 			a->attr = ATTR_T38FAXMAXBUFFER;
 			break;
-		case CSH_LOOKUP("xg726bitorder"):
-			a->attr = ATTR_XG726BITORDER;
-			break;
 		case CSH_LOOKUP("maxptime"):
 			a->attr = ATTR_MAXPTIME;
-			break;
-		case CSH_LOOKUP("label"):
-			a->attr = ATTR_LABEL;
-			break;
-		case CSH_LOOKUP("direction"):
-			a->attr = ATTR_DIRECTION;
 			break;
 	}
 
@@ -1247,59 +1209,59 @@ static int parse_attribute(struct sdp_attribute *a) {
 }
 
 int sdp_parse(str *body, sdp_sessions_q *sessions, const sdp_ng_flags *flags) {
-	char *b, *end, *value, *line_end, *next_line;
+	str b;
 	struct sdp_session *session = NULL;
 	struct sdp_media *media = NULL;
 	const char *errstr;
 	struct sdp_attributes *attrs;
 	struct sdp_attribute *attr;
-	str *adj_s;
 	int media_sdp_id = 0;
 
-	b = body->s;
-	end = str_end(body);
+	b = *body;
 
-	while (b && b < end - 1) {
+	while (b.len >= 2) {
 		if (!rtpe_config.reject_invalid_sdp) {
-			if (b[0] == '\n' || b[0] == '\r') {
-				body->len = b - body->s;
+			if (b.s[0] == '\n' || b.s[0] == '\r') {
+				body->len = b.s - body->s;
 				break;
 			}
 		}
+
+		char line_code = b.s[0];
+
 		errstr = "Missing '=' sign";
-		if (b[1] != '=')
+		if (b.s[1] != '=')
 			goto error;
 
-		value = &b[2];
-		line_end = memchr(value, '\n', end - value);
-		if (!line_end) {
-			/* assume missing LF at end of body */
-			line_end = end;
-			next_line = NULL;
-		}
-		else {
-			next_line = line_end + 1;
-			if (line_end[-1] == '\r')
-				line_end--;
-		}
+		str full_line;
+		str_token(&full_line, &b, '\n');
+		if (full_line.s[full_line.len - 1] == '\r')
+			full_line.len--;
 
 		errstr = "SDP doesn't start with a session definition";
-		if (!session && b[0] != 'v') {
+		if (!session && line_code != 'v') {
 			if (!flags->fragment)
 				goto error;
 			else
 				goto new_session; // allowed for trickle ICE SDP fragments
 		}
 
-		str value_str = STR_INIT_LEN(value, line_end - value);
+		str value = full_line;
+		str_shift(&value, 2); // removes `v=` etc
 
-		switch (b[0]) {
+		full_line.len = b.s - full_line.s; // include \r\n
+
+		switch (line_code) {
 			case 'v':
 				errstr = "Error in v= line";
-				if (line_end != value + 1)
+				if (value.len != 1) {
+					abort();
 					goto error;
-				if (value[0] != '0')
+				}
+				if (value.s[0] != '0') {
+					abort();
 					goto error;
+				}
 
 new_session:
 				session = g_slice_alloc0(sizeof(*session));
@@ -1307,8 +1269,8 @@ new_session:
 				attrs_init(&session->attributes);
 				t_queue_push_tail(sessions, session);
 				media = NULL;
-				session->s.s = b;
-				session->rr = session->rs = -1;
+				session->s = full_line;
+				RESET_BANDWIDTH(session->bandwidth, -1);
 
 				break;
 
@@ -1317,30 +1279,31 @@ new_session:
 				if (media)
 					goto error;
 				errstr = "Error parsing o= line";
-				if (parse_origin(&value_str, &session->origin))
+				if (parse_origin(&value, &session->origin))
 					goto error;
 
 				break;
 
 			case 'm':
 				if (media && !media->c_line_pos)
-					media->c_line_pos = b;
+					media->c_line_pos = full_line.s;
+
 
 				media = g_slice_alloc0(sizeof(*media));
 				media->session = session;
 				attrs_init(&media->attributes);
 				errstr = "Error parsing m= line";
-				if (parse_media(&value_str, media))
+				if (parse_media(&value, media))
 					goto error;
 				t_queue_push_tail(&session->media_streams, media);
-				media->s.s = b;
-				media->rr = media->rs = -1;
+				media->s = full_line;
+				RESET_BANDWIDTH(media->bandwidth, -1);
 				media->media_sdp_id = media_sdp_id++;
 				break;
 
 			case 'c':
 				errstr = "Error parsing c= line";
-				if (parse_connection(&value_str,
+				if (parse_connection(&value,
 						media ? &media->connection : &session->connection))
 					goto error;
 
@@ -1348,15 +1311,12 @@ new_session:
 
 			case 'a':
 				if (media && !media->c_line_pos)
-					media->c_line_pos = b;
+					media->c_line_pos = full_line.s;
 
 				attr = g_slice_alloc0(sizeof(*attr));
 
-				attr->full_line.s = b;
-				attr->full_line.len = next_line ? (next_line - b) : (line_end - b);
-
-				attr->strs.line_value.s = value;
-				attr->strs.line_value.len = line_end - value;
+				attr->full_line = full_line;
+				attr->strs.line_value = value;
 
 				if (parse_attribute(attr)) {
 					attr_free(attr);
@@ -1370,36 +1330,54 @@ new_session:
 
 			case 'b':
 				if (media && !media->c_line_pos)
-					media->c_line_pos = b;
+					media->c_line_pos = full_line.s;
 
 				/* RR:0 */
-				if (line_end - value < 4)
+				if (value.len < 4)
 					break;
-				if (!memcmp(value, "RR:", 3))
-					*(media ? &media->rr : &session->rr) =
-						(line_end - value == 4 && value[3] == '0') ? 0 : 1;
-				else if (!memcmp(value, "RS:", 3))
-					*(media ? &media->rs : &session->rs) =
-						(line_end - value == 4 && value[3] == '0') ? 0 : 1;
+
+				/* AS, RR, RS */
+				if (!memcmp(value.s, "AS:", 3)) {
+					*(media ? &media->bandwidth.as : &session->bandwidth.as) = strtol((value.s + 3), NULL, 10);
+				}
+				else if (!memcmp(value.s, "RR:", 3)) {
+					*(media ? &media->bandwidth.rr : &session->bandwidth.rr) = strtol((value.s + 3), NULL, 10);
+				}
+				else if (!memcmp(value.s, "RS:", 3)) {
+					*(media ? &media->bandwidth.rs : &session->bandwidth.rs) = strtol((value.s + 3), NULL, 10);
+				}
+				else if (!memcmp(value.s, "TIAS:", 5)) {
+					*(media ? &media->bandwidth.tias : &session->bandwidth.tias) = strtol((value.s + 5), NULL, 10);
+				}
+				/* CT has only session level */
+				else if (!memcmp(value.s, "CT:", 3)) {
+					session->bandwidth.ct = strtol((value.s + 3), NULL, 10);
+				}
 				break;
 
 			case 'k':
 				if (media && !media->c_line_pos)
-					media->c_line_pos = b;
+					media->c_line_pos = full_line.s;
 				break;
 
 			case 's':
 				errstr = "s= line found within media section";
 				if (media)
 					goto error;
-				session->session_name = value_str;
+				session->session_name = value;
+				break;
+
+			case 't':
+				errstr = "t= line found within media section";
+				if (media)
+					goto error;
+				session->session_timing = value;
 				break;
 
 			case 'i':
 			case 'u':
 			case 'e':
 			case 'p':
-			case 't':
 			case 'r':
 			case 'z':
 				break;
@@ -1413,16 +1391,15 @@ new_session:
 		if (!session)
 			goto error;
 
-		adj_s = media ? &media->s : &session->s;
-		adj_s->len = (next_line ? : end) - adj_s->s;
-
-		b = next_line;
+		// XXX to be obsoleted
+		str *adj_s = media ? &media->s : &session->s;
+		adj_s->len = b.s - adj_s->s;
 	}
 
 	return 0;
 
 error:
-	ilog(LOG_WARNING, "Error parsing SDP at offset %li: %s", (long) (b - body->s), errstr);
+	ilog(LOG_WARNING, "Error parsing SDP at offset %zu: %s", (size_t) (b.s - body->s), errstr);
 	sdp_sessions_clear(sessions);
 	return -1;
 }
@@ -1439,7 +1416,7 @@ static void free_attributes(struct sdp_attributes *a) {
 }
 static void media_free(struct sdp_media *media) {
 	free_attributes(&media->attributes);
-	g_queue_clear_full(&media->format_list, str_slice_free);
+	str_slice_q_clear_full(&media->format_list);
 	g_slice_free1(sizeof(*media), media);
 }
 static void session_free(struct sdp_session *session) {
@@ -1510,14 +1487,17 @@ static int __rtp_payload_types(struct stream_params *sp, struct sdp_media *media
 	q = attr_list_get_by_id(&media->attributes, ATTR_RTCP_FB);
 	for (__auto_type ql = q ? q->head : NULL; ql; ql = ql->next) {
 		attr = ql->data;
-		if (attr->rtcp_fb.payload_type == -1)
-			continue;
+		/* rtcp-fb attributes applied on all payload types, must be added via generic attributes */
+		if (attr->rtcp_fb.payload_type == -1) {
+			struct sdp_attr *ac = sdp_attr_dup(attr);
+			t_queue_push_tail(&sp->generic_attributes, ac);
+		}
 		GQueue *rq = g_hash_table_lookup_queue_new(ht_rtcp_fb, GINT_TO_POINTER(attr->rtcp_fb.payload_type), NULL);
 		g_queue_push_tail(rq, &attr->rtcp_fb.value);
 	}
 
 	/* then go through the format list and associate */
-	for (GList *ql = media->format_list.head; ql; ql = ql->next) {
+	for (__auto_type ql = media->format_list.head; ql; ql = ql->next) {
 		char *ep;
 		str *s;
 		unsigned int i;
@@ -1581,6 +1561,7 @@ static void __sdp_ice(struct stream_params *sp, struct sdp_media *media) {
 	struct sdp_attribute *attr;
 	struct attribute_candidate *ac;
 	struct ice_candidate *cand;
+	bool end_of_candidates = (attr_get_by_id_m_s(media, ATTR_END_OF_CANDIDATES));
 
 	attr = attr_get_by_id_m_s(media, ATTR_ICE_UFRAG);
 	if (!attr)
@@ -1610,6 +1591,13 @@ no_cand:
 	}
 	else if (is_trickle_ice_address(&sp->rtp_endpoint))
 		SP_SET(sp, TRICKLE_ICE);
+
+	/* set end_of_candidates flag both, when it's trickle ice or not */
+	if (end_of_candidates)
+		SP_SET(sp, END_OF_CANDIDATES);
+	/* unset end_of_candidates flag, if it's non trickle and no attribute given */
+	if (!SP_ISSET(sp, TRICKLE_ICE) && !end_of_candidates)
+		SP_CLEAR(sp, END_OF_CANDIDATES);
 
 	if (attr_get_by_id_m_s(media, ATTR_ICE_LITE))
 		SP_SET(sp, ICE_LITE_PEER);
@@ -1681,7 +1669,8 @@ static void sp_free(struct stream_params *s) {
 	codec_store_cleanup(&s->codecs);
 	ice_candidates_free(&s->ice_candidates);
 	crypto_params_sdes_queue_clear(&s->sdes_params);
-	t_queue_clear_full(&s->attributes, sdp_attr_free);
+	t_queue_clear_full(&s->generic_attributes, sdp_attr_free);
+	t_queue_clear_full(&s->all_attributes, sdp_attr_free);
 	g_slice_free1(sizeof(*s), s);
 }
 
@@ -1697,12 +1686,10 @@ static void sp_free(struct stream_params *s) {
 // the indexing to be in order and instead of requiring all sections between monologue and sdp_media
 // lists to be matching.
 // returns: discard this `sp` yes/no
-static bool legacy_osrtp_accept(struct stream_params *sp, sdp_streams_q *streams, sdp_media_list *media_link,
+static bool legacy_osrtp_accept(struct stream_params *sp, sdp_streams_q *streams,
 		const sdp_ng_flags *flags, unsigned int *num)
 {
 	if (!streams->tail)
-		return false;
-	if (!media_link || !media_link->prev)
 		return false;
 	struct stream_params *last = streams->tail->data;
 
@@ -1733,8 +1720,6 @@ static bool legacy_osrtp_accept(struct stream_params *sp, sdp_streams_q *streams
 			sp_free(last);
 
 			SP_SET(sp, LEGACY_OSRTP);
-			struct sdp_media *prev_media = media_link->prev->data;
-			prev_media->legacy_osrtp = 1;
 			sp->index--;
 			(*num)--;
 			return false;
@@ -1743,8 +1728,6 @@ static bool legacy_osrtp_accept(struct stream_params *sp, sdp_streams_q *streams
 		// or is it a rejected SRTP with a non-rejected RTP counterpart?
 		if (!sp->rtp_endpoint.port && last->rtp_endpoint.port) {
 			// just throw the rejected SRTP section away
-			struct sdp_media *media = media_link->data;
-			media->legacy_osrtp = 1;
 			sp_free(sp);
 			return true;
 		}
@@ -1756,8 +1739,6 @@ static bool legacy_osrtp_accept(struct stream_params *sp, sdp_streams_q *streams
 			SP_SET(last, LEGACY_OSRTP);
 			SP_SET(last, LEGACY_OSRTP_REV);
 
-			struct sdp_media *media = media_link->data;
-			media->legacy_osrtp = 1;
 			sp_free(sp);
 			return true;
 		}
@@ -1769,28 +1750,57 @@ static bool legacy_osrtp_accept(struct stream_params *sp, sdp_streams_q *streams
 static struct sdp_attr *sdp_attr_dup(const struct sdp_attribute *c) {
 	struct sdp_attr *ac = g_new0(__typeof(*ac), 1);
 
-	str_init_dup_str(&ac->strs.name, &c->strs.name);
-	str_init_dup_str(&ac->strs.value, &c->strs.value);
-	ac->type = c->other;
+	ac->strs.name = call_str_cpy(&c->strs.name);
+	ac->strs.value = call_str_cpy(&c->strs.value);
+	ac->other = c->other;
+	ac->attr = c->attr;
 
 	return ac;
 }
 
 void sdp_attr_free(struct sdp_attr *c) {
-	str_free_dup(&c->strs.name);
-	str_free_dup(&c->strs.value);
 	g_free(c);
 }
 
+sdp_origin *sdp_orig_dup(const sdp_origin *orig) {
+	sdp_origin *copy = g_slice_alloc0(sizeof(*copy));
+	copy->username = call_str_cpy(&orig->username);
+	copy->session_id = call_str_cpy(&orig->session_id);
+	copy->version_str = call_str_cpy(&orig->version_str);
+	copy->version_num = orig->version_num;
+	copy->version_output_pos = orig->version_output_pos;
+	copy->parsed = orig->parsed;
+	/* struct network_address */
+	copy->address.network_type = call_str_cpy(&orig->address.network_type);
+	copy->address.address_type = call_str_cpy(&orig->address.address_type);
+	copy->address.address = call_str_cpy(&orig->address.address);
+	copy->address.parsed = orig->address.parsed;
+
+	return copy;
+}
+
+void sdp_orig_free(sdp_origin *o) {
+	g_slice_free1(sizeof(*o), o);
+}
+
+static void sdp_attr_append1(sdp_attr_q *dst, const struct sdp_attribute *attr) {
+	if (!attr)
+		return;
+	struct sdp_attr *ac = sdp_attr_dup(attr);
+	t_queue_push_tail(dst, ac);
+}
+// Duplicate all attributes from the source (parsed SDP attributes list) into
+// the destination (string-format attribute list)
+static void sdp_attr_append(sdp_attr_q *dst, attributes_q *attrs) {
+	if (!attrs)
+		return;
+	for (__auto_type ll = attrs->head; ll; ll = ll->next)
+		sdp_attr_append1(dst, ll->data);
+}
 // Duplicate all OTHER attributes from the source (parsed SDP attributes list) into
 // the destination (string-format attribute list)
 static void sdp_attr_append_other(sdp_attr_q *dst, struct sdp_attributes *src) {
-	__auto_type attrs = attr_list_get_by_id(src, ATTR_OTHER);
-	for (__auto_type ll = attrs ? attrs->head : NULL; ll; ll = ll->next) {
-		__auto_type attr = ll->data;
-		struct sdp_attr *ac = sdp_attr_dup(attr);
-		t_queue_push_tail(dst, ac);
-	}
+	sdp_attr_append(dst, attr_list_get_by_id(src, ATTR_OTHER));
 }
 
 /* XXX split this function up */
@@ -1805,7 +1815,23 @@ int sdp_streams(const sdp_sessions_q *sessions, sdp_streams_q *streams, sdp_ng_f
 	for (auto_iter(l, sessions->head); l; l = l->next) {
 		session = l->data;
 
-		sdp_attr_append_other(&flags->session_attributes, &session->attributes);
+		/* carry some of session level attributes for a later usage, using flags
+		 * e.g. usage in `__call_monologue_init_from_flags()` or direct usage
+		 * in `sdp_create()`
+		 */
+		sdp_attr_append_other(&flags->generic_attributes, &session->attributes);
+		sdp_attr_append(&flags->all_attributes, &session->attributes.list);
+		/* set only for the first SDP session, to be able to re-use versioning
+		 *  for all the rest SDP sessions during replacements. See `sdp_version_check()` */
+		if (!flags->session_sdp_orig.parsed)
+			flags->session_sdp_orig = session->origin;
+		flags->session_sdp_name = session->session_name;
+		flags->session_bandwidth = session->bandwidth;
+		flags->session_timing = session->session_timing;
+
+		attr = attr_get_by_id(&session->attributes, ATTR_GROUP);
+		if (attr)
+			flags->session_group = attr->strs.value;
 
 		for (__auto_type k = session->media_streams.head; k; k = k->next) {
 			media = k->data;
@@ -1826,6 +1852,9 @@ int sdp_streams(const sdp_sessions_q *sessions, sdp_streams_q *streams, sdp_ng_f
 				flags->trust_address = 1;
 			}
 
+			/*
+			 * pass important context parameters: sdp_media -> stream_params
+			 */
 			sp->consecutive_ports = media->port_count;
 			sp->num_ports = sp->consecutive_ports * 2; // only do *=2 for RTP streams?
 			sp->protocol_str = media->transport;
@@ -1839,10 +1868,18 @@ int sdp_streams(const sdp_sessions_q *sessions, sdp_streams_q *streams, sdp_ng_f
 			bf_set_clear(&sp->sp_flags, SP_FLAG_STRICT_SOURCE, flags->strict_source);
 			bf_set_clear(&sp->sp_flags, SP_FLAG_MEDIA_HANDOVER, flags->media_handover);
 
+			/* b= (bandwidth), is parsed in sdp_parse() */
+			sp->media_session_bandiwdth = media->bandwidth;
+
 			// a=ptime
 			attr = attr_get_by_id(&media->attributes, ATTR_PTIME);
 			if (attr && attr->strs.value.s)
 				sp->ptime = str_to_i(&attr->strs.value, 0);
+
+			// a=maxptime
+			attr = attr_get_by_id(&media->attributes, ATTR_MAXPTIME);
+			if (attr && attr->strs.value.s)
+				sp->maxptime = str_to_i(&attr->strs.value, 0);
 
 			sp->format_str = media->formats;
 			errstr = "Invalid RTP payload types";
@@ -1874,19 +1911,31 @@ int sdp_streams(const sdp_sessions_q *sessions, sdp_streams_q *streams, sdp_ng_f
 				cps->params.session_params.unauthenticated_srtp = attr->crypto.unauthenticated_srtp;
 			}
 
-			sdp_attr_append_other(&sp->attributes, &media->attributes);
+			sdp_attr_append_other(&sp->generic_attributes, &media->attributes);
+			sdp_attr_append(&sp->all_attributes, &media->attributes.list);
 
 			/* a=sendrecv/sendonly/recvonly/inactive */
 			SP_SET(sp, SEND);
 			SP_SET(sp, RECV);
-			if (attr_get_by_id_m_s(media, ATTR_RECVONLY))
+			const struct sdp_attribute *sendonly = attr_get_by_id_m_s(media, ATTR_SENDONLY);
+			const struct sdp_attribute *recvonly = attr_get_by_id_m_s(media, ATTR_RECVONLY);
+			const struct sdp_attribute *inactive = attr_get_by_id_m_s(media, ATTR_INACTIVE);
+			if (recvonly)
 				SP_CLEAR(sp, SEND);
-			else if (attr_get_by_id_m_s(media, ATTR_SENDONLY))
+			else if (sendonly)
 				SP_CLEAR(sp, RECV);
-			else if (attr_get_by_id_m_s(media, ATTR_INACTIVE))
+			else if (inactive)
 			{
 				SP_CLEAR(sp, RECV);
 				SP_CLEAR(sp, SEND);
+			}
+
+			if (flags->original_sendrecv) {
+				sdp_attr_append1(&sp->generic_attributes,
+						attr_get_by_id_m_s(media, ATTR_SENDRECV));
+				sdp_attr_append1(&sp->generic_attributes, sendonly);
+				sdp_attr_append1(&sp->generic_attributes, recvonly);
+				sdp_attr_append1(&sp->generic_attributes, inactive);
 			}
 
 			/* a=setup */
@@ -1922,7 +1971,7 @@ int sdp_streams(const sdp_sessions_q *sessions, sdp_streams_q *streams, sdp_ng_f
 					sp->protocol = &transport_protocols[sp->protocol->osrtp_proto];
 			}
 
-			if (legacy_osrtp_accept(sp, streams, k, flags, &num))
+			if (legacy_osrtp_accept(sp, streams, flags, &num))
 				continue;
 
 			// a=mid
@@ -1974,131 +2023,24 @@ void sdp_streams_clear(sdp_streams_q *q) {
 	t_queue_clear_full(q, sp_free);
 }
 
-
-
-struct sdp_chopper *sdp_chopper_new(str *input) {
-	struct sdp_chopper *c = g_slice_alloc0(sizeof(*c));
-	c->input = input;
-	c->output = g_string_new("");
-	return c;
-}
-
-INLINE void chopper_append(struct sdp_chopper *c, const char *s, int len) {
-	g_string_append_len(c->output, s, len);
-}
-INLINE void chopper_append_c(struct sdp_chopper *c, const char *s) {
-	chopper_append(c, s, strlen(s));
-}
-INLINE void chopper_append_str(struct sdp_chopper *c, const str *s) {
-	chopper_append(c, s->s, s->len);
-}
-static void chopper_replace(struct sdp_chopper *c, str *old, size_t *old_pos,
-		const char *repl, size_t repl_len)
-{
-	// adjust for offsets created within this run
-	*old_pos += c->offset;
-	// is our new value longer?
-	if (repl_len > old->len) {
-		// overwrite + insert
-		g_string_overwrite_len(c->output, *old_pos, repl, old->len);
-		g_string_insert(c->output, *old_pos + old->len, repl + old->len);
-		c->offset += repl_len - old->len;
-		old->len = repl_len;
-	}
-	else {
-		// overwrite + optional erase
-		g_string_overwrite(c->output, *old_pos, repl);
-		if (repl_len < old->len) {
-			g_string_erase(c->output, *old_pos + repl_len, old->len - repl_len);
-			c->offset -= old->len - repl_len;
-			old->len = repl_len;
-		}
-	}
-}
-
-#define chopper_append_printf(c, f...) g_string_append_printf((c)->output, f)
-
-static int copy_up_to_ptr(struct sdp_chopper *chop, const char *b) {
-	int offset, len;
-
-	if (!b)
-		return 0;
-
-	offset = b - chop->input->s;
-	assert(offset >= 0);
-	assert(offset <= chop->input->len);
-
-	len = offset - chop->position;
-	if (len < 0) {
-		ilog(LOG_WARNING, "Malformed SDP, cannot rewrite");
-		return -1;
-	}
-	chopper_append(chop, chop->input->s + chop->position, len);
-	chop->position += len;
-	return 0;
-}
-
-static int copy_up_to(struct sdp_chopper *chop, str *where) {
-	return copy_up_to_ptr(chop, where->s);
-}
-
-static int copy_up_to_end_of(struct sdp_chopper *chop, str *where) {
-	return copy_up_to_ptr(chop, where->s + where->len);
-}
-
-static void copy_remainder(struct sdp_chopper *chop) {
-	copy_up_to_ptr(chop, chop->input->s + chop->input->len);
-}
-
-static int skip_over(struct sdp_chopper *chop, str *where) {
-	int offset, len;
-
-	if (!where || !where->s)
-		return 0;
-
-	offset = (where->s - chop->input->s) + where->len;
-	assert(offset >= 0);
-	assert(offset <= chop->input->len);
-
-	len = offset - chop->position;
-	if (len < 0) {
-		ilog(LOG_WARNING, "Malformed SDP, cannot rewrite");
-		return -1;
-	}
-	chop->position += len;
-	return 0;
-}
-
-static int replace_transport_protocol(struct sdp_chopper *chop,
-		struct sdp_media *media, struct call_media *cm)
-{
-	str *tp = &media->transport;
-
-	if (!cm->protocol)
-		return 0;
-
-	if (copy_up_to(chop, tp))
-		return -1;
-	chopper_append_c(chop, cm->protocol->name);
-	if (skip_over(chop, tp))
-		return -1;
-
-	return 0;
-}
-
-static int print_format_str(GString *s, struct call_media *cm) {
+static void print_format_str(GString *s, struct call_media *cm) {
 	if (!cm->format_str.s)
-		return 0;
+		return;
 	g_string_append_len(s, cm->format_str.s, cm->format_str.len);
-	return 0;
+	return;
 }
 
-static int print_codec_list(GString *s, struct call_media *media) {
-	if (!proto_is_rtp(media->protocol))
-		return print_format_str(s, media);
+static void print_codec_list(GString *s, struct call_media *media) {
+	if (!proto_is_rtp(media->protocol)) {
+		print_format_str(s, media);
+		return;
+	}
 
-	if (media->codecs.codec_prefs.length == 0)
-		return 0; // legacy protocol or usage error
+	if (media->codecs.codec_prefs.length == 0) {
+		// legacy protocol, usage error, or allow-no-codec-media set. Print something and bail
+		g_string_append(s, "0");
+		return;
+	}
 
 	for (__auto_type l = media->codecs.codec_prefs.head; l; l = l->next) {
 		rtp_payload_type *pt = l->data;
@@ -2106,18 +2048,7 @@ static int print_codec_list(GString *s, struct call_media *media) {
 			g_string_append_c(s, ' ');
 		g_string_append_printf(s, "%u", pt->payload_type);
 	}
-	return 0;
-}
-
-static int replace_codec_list(struct sdp_chopper *chop,
-		struct sdp_media *media, struct call_media *cm)
-{
-	if (copy_up_to(chop, &media->formats))
-		return -1;
-	if (skip_over(chop, &media->formats))
-		return -1;
-
-	return print_codec_list(chop->output, cm);
+	return;
 }
 
 static void insert_codec_parameters(GString *s, struct call_media *cm,
@@ -2139,7 +2070,7 @@ static void insert_codec_parameters(GString *s, struct call_media *cm,
 			fmtp = pt->codec_def->format_print(pt); /* try appending list of parameters */
 			if (fmtp && fmtp->len)
 				append_int_tagged_attr_to_gstring(s, "fmtp", pt->payload_type,
-						&STR_INIT_GS(fmtp), flags, cm->type_id);
+						&STR_GS(fmtp), flags, cm->type_id);
 		}
 		if (!fmtp && pt->format_parameters.len)
 			append_int_tagged_attr_to_gstring(s, "fmtp", pt->payload_type,
@@ -2164,9 +2095,9 @@ void sdp_insert_media_attributes(GString *gs, union sdp_attr_print_arg a, const 
 	__auto_type sub = a.cm->media_subscriptions.head->data;
 	__auto_type sub_m = sub->media;
 
-	for (__auto_type l = sub_m->sdp_attributes.head; l; l = l->next) {
+	for (__auto_type l = sub_m->generic_attributes.head; l; l = l->next) {
 		__auto_type s = l->data;
-		if (s->type == SDP_ATTR_TYPE_EXTMAP && flags->strip_extmap && !MEDIA_ISSET(a.cm, PASSTHRU))
+		if (s->other == ATTR_OTHER_EXTMAP && flags->strip_extmap && !MEDIA_ISSET(a.cm, PASSTHRU))
 			continue;
 		append_str_attr_to_gstring(gs, &s->strs.name, &s->strs.value, flags, a.cm->type_id);
 	}
@@ -2179,418 +2110,68 @@ void sdp_insert_monologue_attributes(GString *gs, union sdp_attr_print_arg a, co
 	if (!source_ml)
 		return;
 
-	for (__auto_type l = source_ml->sdp_attributes.head; l; l = l->next) {
+	for (__auto_type l = source_ml->generic_attributes.head; l; l = l->next) {
 		__auto_type s = l->data;
-		if (s->type == SDP_ATTR_TYPE_EXTMAP && flags->strip_extmap)
+		if (s->other == ATTR_OTHER_EXTMAP && flags->strip_extmap)
 			continue;
 		append_str_attr_to_gstring(gs, &s->strs.name, &s->strs.value, flags, MT_UNKNOWN);
 	}
 }
-
-static int replace_media_type(struct sdp_chopper *chop, struct sdp_media *media, struct call_media *cm) {
-	str *type = &media->media_type_str;
-
-	if (!cm->type.s)
-		return 0;
-
-	if (copy_up_to(chop, type))
-		return -1;
-
-	chopper_append_str(chop, &cm->type);
-
-	if (skip_over(chop, type))
-		return -1;
-
-	return 0;
-}
-
-static int replace_media_port(struct sdp_chopper *chop, struct sdp_media *media, struct packet_stream *ps) {
-	str *port = &media->port;
-	unsigned int p;
-
-	if (!media->port_num)
-		return 0;
-
-	if (copy_up_to(chop, port))
-		return -1;
-
-	p = ps->selected_sfd ? ps->selected_sfd->socket.local.port : 0;
-	chopper_append_printf(chop, "%u", p);
-
-	if (skip_over(chop, port))
-		return -1;
-
-	return 0;
-}
-
-static int replace_consecutive_port_count(struct sdp_chopper *chop, struct sdp_media *media,
-		struct packet_stream *ps, packet_stream_list *j)
-{
-	int cons;
-	struct packet_stream *ps_n;
-
-	if (media->port_count == 1 || !ps->selected_sfd)
-		return 0;
-
-	for (cons = 1; cons < media->port_count; cons++) {
-		j = j->next;
-		if (!j)
-			goto warn;
-		ps_n = j->data;
-		if (ps_n->selected_sfd->socket.local.port != ps->selected_sfd->socket.local.port + cons) {
-warn:
-			ilog(LOG_WARN, "Failed to handle consecutive ports");
-			break;
-		}
+void sdp_insert_all_attributes(GString *s, struct call_media *media, struct sdp_ng_flags *flags) {
+	for (__auto_type l = media->all_attributes.head; l; l = l->next) {
+		__auto_type a = l->data;
+		// the one exception: skip this and then print it separately if it was present,
+		// so that we can print our own candidates first
+		if (a->attr == ATTR_END_OF_CANDIDATES)
+			continue;
+		append_str_attr_to_gstring(s, &a->strs.name, &a->strs.value, flags, media->type_id);
 	}
-
-	chopper_append_printf(chop, "/%i", cons);
-
-	return 0;
 }
 
 static int insert_ice_address(GString *s, stream_fd *sfd, const sdp_ng_flags *flags) {
-	char buf[64];
-	int len;
-
-	if (!is_addr_unspecified(&flags->parsed_media_address))
-		len = sprintf(buf, "%s",
-				sockaddr_print_buf(&flags->parsed_media_address));
+	if (!is_addr_unspecified(&flags->media_address))
+		sockaddr_print_gstring(s, &flags->media_address);
 	else
-		call_stream_address46(buf, sfd->stream, SAF_ICE, &len, sfd->local_intf, false);
-	g_string_append_len(s, buf, len);
+		call_stream_address(s, sfd->stream, SAF_ICE, sfd->local_intf, false);
 	g_string_append_printf(s, " %u", sfd->socket.local.port);
 
 	return 0;
 }
 
 static int insert_raddr_rport(GString *s, stream_fd *sfd, const sdp_ng_flags *flags) {
-        char buf[64];
-        int len;
-
 	g_string_append(s, " raddr ");
-	if (!is_addr_unspecified(&flags->parsed_media_address))
-		len = sprintf(buf, "%s",
-				sockaddr_print_buf(&flags->parsed_media_address));
+	if (!is_addr_unspecified(&flags->media_address))
+		sockaddr_print_gstring(s, &flags->media_address);
 	else
-		call_stream_address46(buf, sfd->stream, SAF_ICE, &len, sfd->local_intf, false);
-	g_string_append_len(s, buf, len);
+		call_stream_address(s, sfd->stream, SAF_ICE, sfd->local_intf, false);
 	g_string_append(s, " rport ");
 	g_string_append_printf(s, "%u", sfd->socket.local.port);
 
 	return 0;
 }
 
-
-static int replace_network_address(struct sdp_chopper *chop, struct network_address *address,
-		struct packet_stream *ps, sdp_ng_flags *flags, bool keep_unspec)
-{
-	char buf[64];
-	int len;
-
-	if (copy_up_to(chop, &address->address_type))
-		return -1;
-
-	if (flags->media_address.s && is_addr_unspecified(&flags->parsed_media_address))
-		__parse_address(&flags->parsed_media_address, NULL, NULL, &flags->media_address);
-
-	if (!is_addr_unspecified(&flags->parsed_media_address))
-		len = sprintf(buf, "%s %s",
-				flags->parsed_media_address.family->rfc_name,
-				sockaddr_print_buf(&flags->parsed_media_address));
-	else
-		call_stream_address46(buf, ps, SAF_NG, &len, NULL, keep_unspec);
-	chopper_append(chop, buf, len);
-
-	if (skip_over(chop, &address->address))
-		return -1;
-
-	return 0;
-}
-
-static int synth_session_connection(struct sdp_chopper *chop, struct sdp_media *sdp_media) {
-	if (!sdp_media->session->connection.s.s)
-		return -1;
-
-	if (sdp_media->c_line_pos)
-		copy_up_to_ptr(chop, sdp_media->c_line_pos);
-	else
-		copy_up_to_end_of(chop, chop->input);
-
-	chopper_append_c(chop, "c=");
-	chopper_append_str(chop, &sdp_media->session->connection.s);
-	chopper_append_c(chop, "\n");
-
-	return 0;
-}
-
-void sdp_chopper_destroy(struct sdp_chopper *chop) {
-	if (chop->output)
-		g_string_free(chop->output, TRUE);
-	g_slice_free1(sizeof(*chop), chop);
-}
-void sdp_chopper_destroy_ret(struct sdp_chopper *chop, str *ret) {
-	*ret = STR_NULL;
-	if (chop->output) {
-		size_t len = chop->output->len;
-		char *s = g_string_free(chop->output, FALSE);
-		str_init_len(ret, s, len);
-		chop->output = NULL;
-	}
-	sdp_chopper_destroy(chop);
-}
-
-/* processing existing session attributes (those present in offer/answer) */
-static int process_session_attributes(struct sdp_chopper *chop, struct sdp_attributes *attrs,
-		sdp_ng_flags *flags)
-{
-	struct sdp_attribute *attr;
-
-	for (__auto_type l = attrs->list.head; l; l = l->next) {
-		attr = l->data;
-
-		struct sdp_manipulations *sdp_manipulations = sdp_manipulations_get_by_id(flags, MT_UNKNOWN);
-
-		switch (attr->attr) {
-			case ATTR_ICE:
-			case ATTR_ICE_UFRAG:
-			case ATTR_ICE_PWD:
-			case ATTR_ICE_OPTIONS:
-			case ATTR_ICE_LITE:
-				if (flags->ice_option != ICE_REMOVE && flags->ice_option != ICE_FORCE
-						&& flags->ice_option != ICE_DEFAULT)
-					break;
-				goto strip;
-
-			case ATTR_CANDIDATE:
-				if (flags->ice_option == ICE_FORCE_RELAY) {
-					if ((attr->candidate.type_str.len == 5) &&
-					    (strncasecmp(attr->candidate.type_str.s, "relay", 5) == 0))
-						goto strip;
-					else
-						break;
-				}
-				if (flags->ice_option != ICE_REMOVE && flags->ice_option != ICE_FORCE
-						&& flags->ice_option != ICE_DEFAULT)
-					break;
-				goto strip;
-
-			case ATTR_FINGERPRINT:
-			case ATTR_SETUP:
-			case ATTR_TLS_ID:
-			case ATTR_IGNORE:
-				goto strip;
-
-			case ATTR_INACTIVE:
-			case ATTR_SENDONLY:
-			case ATTR_RECVONLY:
-			case ATTR_SENDRECV:
-				if (!flags->original_sendrecv)
-					goto strip;
-				break;
-
-			case ATTR_GROUP:
-				if (attr->group.semantics == GROUP_BUNDLE)
-					goto strip;
-				break;
-
-			default:
-				break;
-		}
-
-		/* if attr is supposed to be removed don't add to the chop->output */
-		if (sdp_manipulate_remove_attr(sdp_manipulations, attr))
-			goto strip;
-
-		/* if attr is supposed to be substituted don't add to the chop->output, but add another value */
-		str *subst_str = sdp_manipulations_subst_attr(sdp_manipulations, attr);
-		if (subst_str)
-			goto strip_with_subst;
-
-		continue;
-
-strip:
-		if (copy_up_to(chop, &attr->full_line))
-			return -1;
-		if (skip_over(chop, &attr->full_line))
-			return -1;
-		continue;
-
-strip_with_subst:
-		if (copy_up_to(chop, &attr->full_line))
-			return -1;
-		if (skip_over(chop, &attr->full_line))
-			return -1;
-		chopper_append_printf(chop, "a=" STR_FORMAT "\r\n", STR_FMT(subst_str));
-	}
-
-	return 0;
-}
-
-/* processing existing media attributes (those present in offer/answer) */
-static int process_media_attributes(struct sdp_chopper *chop, struct sdp_media *sdp,
-		sdp_ng_flags *flags, struct call_media *media)
-{
-	struct sdp_attributes *attrs = &sdp->attributes;
-	struct sdp_attribute *attr /* , *a */;
-
-	for (__auto_type l = attrs->list.head; l; l = l->next) {
-		attr = l->data;
-
-		// strip all attributes if we're sink and generator - make our own clean SDP
-		if (MEDIA_ISSET(media, GENERATOR))
-			goto strip;
-
-		struct sdp_manipulations *sdp_manipulations = sdp_manipulations_get_by_id(flags,
-				sdp->media_type_id);
-
-		// protocol-agnostic attributes
-		switch (attr->attr) {
-			case ATTR_ICE:
-			case ATTR_ICE_UFRAG:
-			case ATTR_ICE_PWD:
-			case ATTR_ICE_OPTIONS:
-			case ATTR_ICE_LITE:
-				if (MEDIA_ISSET(media, PASSTHRU))
-					break;
-				if (flags->ice_option != ICE_REMOVE && flags->ice_option != ICE_FORCE
-						&& flags->ice_option != ICE_DEFAULT)
-					break;
-				goto strip;
-
-			case ATTR_CANDIDATE:
-				if (flags->ice_option == ICE_FORCE_RELAY) {
-					if ((attr->candidate.type_str.len == 5) &&
-					    (strncasecmp(attr->candidate.type_str.s, "relay", 5) == 0))
-						goto strip;
-					else
-						break;
-				}
-				if (MEDIA_ISSET(media, PASSTHRU))
-					break;
-				if (flags->ice_option != ICE_REMOVE && flags->ice_option != ICE_FORCE
-						&& flags->ice_option != ICE_DEFAULT)
-					break;
-				goto strip;
-
-			case ATTR_IGNORE:
-			case ATTR_END_OF_CANDIDATES: // we strip it here and re-insert it later
-			case ATTR_MID:
-				goto strip;
-
-			case ATTR_INACTIVE:
-			case ATTR_SENDONLY:
-			case ATTR_RECVONLY:
-			case ATTR_SENDRECV:
-				if (!flags->original_sendrecv)
-					goto strip;
-				break;
-
-			/* strip all unknown type attributes if required, additionally:
-			 * ssrc / msid / unknown types
-			 */
-			case ATTR_OTHER:
-				goto strip;
-
-			default:
-				break;
-		}
-
-		// leave everything alone if protocol is unsupported
-		if (!media->protocol)
-			continue;
-
-		switch (attr->attr) {
-			case ATTR_RTCP:
-			case ATTR_RTCP_MUX:
-				if (flags->ice_option == ICE_FORCE_RELAY)
-					break;
-				goto strip;
-
-			case ATTR_RTPMAP:
-			case ATTR_FMTP:
-				if (media->codecs.codec_prefs.length > 0)
-					goto strip;
-				break;
-			case ATTR_PTIME:
-				if (media->ptime)
-					goto strip;
-				break;
-			case ATTR_RTCP_FB:
-				if (attr->rtcp_fb.payload_type == -1)
-					break; // leave this one alone
-				if (media->codecs.codec_prefs.length > 0)
-					goto strip;
-				break;
-
-			case ATTR_CRYPTO:
-			case ATTR_FINGERPRINT:
-			case ATTR_SETUP:
-			case ATTR_TLS_ID:
-				if (MEDIA_ISSET(media, PASSTHRU))
-					break;
-				goto strip;
-
-			default:
-				break;
-		}
-
-		/* if attr is supposed to be removed don't add to the chop->output */
-		if (sdp_manipulate_remove_attr(sdp_manipulations, attr))
-			goto strip;
-
-		/* if attr is supposed to be substituted don't add to the chop->output, but add another value */
-		str *subst_str = sdp_manipulations_subst_attr(sdp_manipulations, attr);
-		if (subst_str)
-			goto strip_with_subst;
-
-		continue;
-
-strip:
-		if (copy_up_to(chop, &attr->full_line))
-			return -1;
-		if (skip_over(chop, &attr->full_line))
-			return -1;
-		continue;
-
-strip_with_subst:
-		if (copy_up_to(chop, &attr->full_line))
-			return -1;
-		if (skip_over(chop, &attr->full_line))
-			return -1;
-		chopper_append_printf(chop, "a=" STR_FORMAT "\r\n", STR_FMT(subst_str));
-	}
-
-	return 0;
-}
-
-static void new_priority(struct sdp_media *media, enum ice_candidate_type type, unsigned int *tprefp,
+static void new_priority(struct call_media *media, enum ice_candidate_type type, unsigned int *tprefp,
 		unsigned int *lprefp)
 {
 	unsigned int lpref, tpref;
 	uint32_t prio;
-	struct sdp_attribute *a;
-	struct attribute_candidate *c;
 
 	lpref = 0;
 	tpref = ice_type_preference(type);
 	prio = ice_priority_pref(tpref, lpref, 1);
 
-	attributes_q *cands = attr_list_get_by_id(&media->attributes, ATTR_CANDIDATE);
-	if (!cands)
-		goto out;
+	candidate_q *cands = &media->ice_candidates;
 
 	for (__auto_type l = cands->head; l; l = l->next) {
-		a = l->data;
-		c = &a->candidate;
-		if (c->cand_parsed.priority <= prio && c->cand_parsed.type == type
-				&& c->cand_parsed.component_id == 1)
+		__auto_type c = l->data;
+		if (c->priority <= prio && c->type == type
+				&& c->component_id == 1)
 		{
 			/* tpref should come out as 126 (if host) here, unless the client isn't following
 			 * the RFC, in which case we must adapt */
-			tpref = ice_type_pref_from_prio(c->cand_parsed.priority);
+			tpref = ice_type_pref_from_prio(c->priority);
 
-			lpref = ice_local_pref_from_prio(c->cand_parsed.priority);
+			lpref = ice_local_pref_from_prio(c->priority);
 			if (lpref)
 				lpref--;
 			else {
@@ -2603,14 +2184,13 @@ static void new_priority(struct sdp_media *media, enum ice_candidate_type type, 
 		}
 	}
 
-out:
 	*tprefp = tpref;
 	*lprefp = lpref;
 }
 
 static void insert_candidate(GString *s, stream_fd *sfd,
 		unsigned int type_pref, unsigned int local_pref, enum ice_candidate_type type,
-		const sdp_ng_flags *flags, struct sdp_media *sdp_media)
+		const sdp_ng_flags *flags, struct call_media *media)
 {
 	unsigned long priority;
 	struct packet_stream *ps = sfd->stream;
@@ -2629,18 +2209,17 @@ static void insert_candidate(GString *s, stream_fd *sfd,
 	if(type != ICT_HOST)
 		insert_raddr_rport(s_dst, sfd, flags);
 
-	/* append to the chop->output */
-	append_tagged_attr_to_gstring(s, "candidate", &ifa->ice_foundation, &STR_INIT_GS(s_dst), flags,
-			(sdp_media ? sdp_media->media_type_id : MT_UNKNOWN));
+	append_tagged_attr_to_gstring(s, "candidate", &ifa->ice_foundation, &STR_GS(s_dst), flags,
+			(media ? media->type_id : MT_UNKNOWN));
 }
 
 static void insert_sfd_candidates(GString *s, struct packet_stream *ps,
 		unsigned int type_pref, unsigned int local_pref, enum ice_candidate_type type,
-		const sdp_ng_flags *flags, struct sdp_media *sdp_media)
+		const sdp_ng_flags *flags)
 {
 	for (__auto_type l = ps->sfds.head; l; l = l->next) {
 		stream_fd *sfd = l->data;
-		insert_candidate(s, sfd, type_pref, local_pref, type, flags, sdp_media);
+		insert_candidate(s, sfd, type_pref, local_pref, type, flags, ps->media);
 
 		if (local_pref != -1)
 			local_pref++;
@@ -2648,7 +2227,7 @@ static void insert_sfd_candidates(GString *s, struct packet_stream *ps,
 }
 
 static void insert_candidates(GString *s, struct packet_stream *rtp, struct packet_stream *rtcp,
-		const sdp_ng_flags *flags, struct sdp_media *sdp_media)
+		const sdp_ng_flags *flags, struct call_media *source_media)
 {
 	const struct local_intf *ifa;
 	struct call_media *media;
@@ -2662,8 +2241,8 @@ static void insert_candidates(GString *s, struct packet_stream *rtp, struct pack
 	cand_type = ICT_HOST;
 	if (flags->ice_option == ICE_FORCE_RELAY)
 		cand_type = ICT_RELAY;
-	if (MEDIA_ISSET(media, PASSTHRU) && sdp_media)
-		new_priority(sdp_media, cand_type, &type_pref, &local_pref);
+	if (MEDIA_ISSET(media, PASSTHRU) && source_media)
+		new_priority(source_media, cand_type, &type_pref, &local_pref);
 	else {
 		type_pref = ice_type_preference(cand_type);
 		local_pref = -1;
@@ -2673,9 +2252,10 @@ static void insert_candidates(GString *s, struct packet_stream *rtp, struct pack
 
 	if (ag && AGENT_ISSET(ag, COMPLETED)) {
 		ifa = rtp->selected_sfd->local_intf;
-		insert_candidate(s, rtp->selected_sfd, type_pref, ifa->unique_id, cand_type, flags, sdp_media);
+		insert_candidate(s, rtp->selected_sfd, type_pref, ifa->unique_id, cand_type, flags, rtp->media);
 		if (rtcp) /* rtcp-mux only possible in answer */
-			insert_candidate(s, rtcp->selected_sfd, type_pref, ifa->unique_id, cand_type, flags, sdp_media);
+			insert_candidate(s, rtcp->selected_sfd, type_pref, ifa->unique_id, cand_type, flags,
+					rtp->media);
 
 		if (flags->opmode == OP_OFFER && AGENT_ISSET(ag, CONTROLLING)) {
 			g_auto(candidate_q) rc = TYPED_GQUEUE_INIT;
@@ -2690,24 +2270,43 @@ static void insert_candidates(GString *s, struct packet_stream *rtp, struct pack
 				g_string_append_printf(s_dst, "%lu %s %u", cand->component_id,
 						sockaddr_print_buf(&cand->endpoint.address), cand->endpoint.port);
 			}
-			/* append to the chop->output */
-			append_attr_to_gstring(s, "remote-candidates", &STR_INIT_GS(s_dst), flags, (sdp_media ? sdp_media->media_type_id : MT_UNKNOWN));
+			append_attr_to_gstring(s, "remote-candidates", &STR_GS(s_dst), flags,
+					rtp->media->type_id);
 		}
 		return;
 	}
 
-	insert_sfd_candidates(s, rtp, type_pref, local_pref, cand_type, flags, sdp_media);
+	insert_sfd_candidates(s, rtp, type_pref, local_pref, cand_type, flags);
 
 	if (rtcp) /* rtcp-mux only possible in answer */
-		insert_sfd_candidates(s, rtcp, type_pref, local_pref, cand_type, flags, sdp_media);
+		insert_sfd_candidates(s, rtcp, type_pref, local_pref, cand_type, flags);
+}
+
+static void insert_setup(GString *out, struct call_media *media, const sdp_ng_flags *flags,
+	bool add_default)
+{
+	str actpass_str = STR_NULL;
+	if (MEDIA_ARESET2(media, SETUP_PASSIVE, SETUP_ACTIVE))
+		actpass_str = STR("actpass");
+	else if (MEDIA_ISSET(media, SETUP_PASSIVE))
+		actpass_str = STR("passive");
+	else if (MEDIA_ISSET(media, SETUP_ACTIVE))
+		actpass_str = STR("active");
+	else {
+		if (!add_default)
+			return;
+		actpass_str = STR("holdconn");
+	}
+
+	append_attr_to_gstring(out, "setup", &actpass_str, flags, media->type_id);
 }
 
 static void insert_dtls(GString *s, struct call_media *media, struct dtls_connection *dtls,
-		const sdp_ng_flags *flags) {
+		const sdp_ng_flags *flags)
+{
 	unsigned char *p;
 	int i;
 	const struct dtls_hash_func *hf;
-	str actpass_str = STR_NULL;
 	call_t *call = media->call;
 
 	if (!media->protocol || !media->protocol->srtp)
@@ -2736,16 +2335,8 @@ static void insert_dtls(GString *s, struct call_media *media, struct dtls_connec
 
 	assert(hf->num_bytes > 0);
 
-	if (MEDIA_ARESET2(media, SETUP_PASSIVE, SETUP_ACTIVE))
-		str_init(&actpass_str, "actpass");
-	else if (MEDIA_ISSET(media, SETUP_PASSIVE))
-		str_init(&actpass_str, "passive");
-	else if (MEDIA_ISSET(media, SETUP_ACTIVE))
-		str_init(&actpass_str, "active");
-	else
-		str_init(&actpass_str, "holdconn");
-
-	append_attr_to_gstring(s, "setup", &actpass_str, flags, media->type_id);
+	/* a=setup: */
+	insert_setup(s, media, flags, true);
 
 	/* prepare fingerprint */
 	g_autoptr(GString) s_dst = g_string_new("");
@@ -2757,8 +2348,7 @@ static void insert_dtls(GString *s, struct call_media *media, struct dtls_connec
 		g_string_append_printf(s_dst, "%02X:", *p++);
 	g_string_truncate(s_dst, s_dst->len - 1);
 
-	/* append to the chop->output */
-	append_attr_to_gstring(s, "fingerprint", &STR_INIT_GS(s_dst), flags, media->type_id);
+	append_attr_to_gstring(s, "fingerprint", &STR_GS(s_dst), flags, media->type_id);
 
 	if (dtls) {
 		/* prepare tls-id */
@@ -2768,8 +2358,7 @@ static void insert_dtls(GString *s, struct call_media *media, struct dtls_connec
 		for (i = 0; i < sizeof(dtls->tls_id); i++)
 			g_string_append_printf(s_dst, "%02x", *p++);
 
-		/* append to the chop->output */
-		append_attr_to_gstring(s, "tls-id", &STR_INIT_GS(s_dst), flags, media->type_id);
+		append_attr_to_gstring(s, "tls-id", &STR_GS(s_dst), flags, media->type_id);
 	}
 }
 
@@ -2820,8 +2409,7 @@ static void insert_crypto1(GString *s, struct call_media *media, struct crypto_p
 	if (cps->params.session_params.unauthenticated_srtp)
 		g_string_append(s_dst, " UNAUTHENTICATED_SRTP");
 
-	/* append to the chop->output */
-	append_int_tagged_attr_to_gstring(s, "crypto", cps->tag, &STR_INIT_GS(s_dst), flags, media->type_id);
+	append_int_tagged_attr_to_gstring(s, "crypto", cps->tag, &STR_GS(s_dst), flags, media->type_id);
 }
 
 static void insert_crypto(GString *s, struct call_media *media, const sdp_ng_flags *flags) {
@@ -2831,52 +2419,77 @@ static void insert_crypto(GString *s, struct call_media *media, const sdp_ng_fla
 		insert_crypto1(s, media, l->data, flags);
 }
 static void insert_rtcp_attr(GString *s, struct packet_stream *ps, const sdp_ng_flags *flags,
-		struct sdp_media *sdp_media) {
+		struct call_media *media)
+{
 	if (flags->no_rtcp_attr)
 		return;
 	g_autoptr(GString) s_dst = g_string_new("");
+
 	g_string_append_printf(s_dst, "%u", ps->selected_sfd->socket.local.port);
 
 	if (flags->full_rtcp_attr) {
-		char buf[64];
-		int len;
-		if (!is_addr_unspecified(&flags->parsed_media_address))
-			len = sprintf(buf, "%s %s",
-					flags->parsed_media_address.family->rfc_name,
-					sockaddr_print_buf(&flags->parsed_media_address));
+		g_string_append(s_dst, " IN ");
+		if (!is_addr_unspecified(&flags->media_address))
+			g_string_append_printf(s_dst, "%s %s",
+					flags->media_address.family->rfc_name,
+					sockaddr_print_buf(&flags->media_address));
 		else
-			call_stream_address46(buf, ps, SAF_NG, &len, NULL, false);
-		g_string_append_printf(s_dst, " IN %.*s", len, buf);
+			call_stream_address(s_dst, ps, SAF_NG, NULL, false);
 	}
-	/* append to the chop->output */
-	append_attr_to_gstring(s, "rtcp", &STR_INIT_GS(s_dst), flags, (sdp_media ? sdp_media->media_type_id : MT_UNKNOWN));
+	append_attr_to_gstring(s, "rtcp", &STR_GS(s_dst), flags, (media ? media->type_id : MT_UNKNOWN));
 }
 
-
-static void sdp_version_replace(struct sdp_chopper *chop, sdp_sessions_q *sessions,
-		struct call_monologue *monologue)
+/**
+ * Handle sdp version replacements.
+ */
+static void sdp_version_replace(GString *s, sdp_origin *src_orig, sdp_origin *other_orig)
 {
 	char version_str[64];
-	snprintf(version_str, sizeof(version_str), "%llu", monologue->sdp_version);
+	snprintf(version_str, sizeof(version_str), "%llu", src_orig->version_num);
 	size_t version_len = strlen(version_str);
-	chop->offset = 0; // start from the top
 
-	for (__auto_type l = sessions->head; l; l = l->next) {
-		struct sdp_session *session = l->data;
-		struct sdp_origin *origin = &session->origin;
-		// update string unconditionally to keep position tracking intact
-		chopper_replace(chop, &origin->version_str, &origin->version_output_pos, version_str, version_len);
+	if (!other_orig)
+		return;
+
+	other_orig->version_num = src_orig->version_num;
+	/* is our new value longer? */
+	if (version_len > other_orig->version_str.len) {
+		/* overwrite + insert */
+		g_string_overwrite_len(s, other_orig->version_output_pos, version_str, other_orig->version_str.len);
+		g_string_insert(s, other_orig->version_output_pos + other_orig->version_str.len, version_str + other_orig->version_str.len);
+		other_orig->version_str.len = version_len;
+	}
+	else {
+		/* overwrite + optional erase */
+		g_string_overwrite(s, other_orig->version_output_pos, version_str);
+		if (version_len < other_orig->version_str.len) {
+			g_string_erase(s, other_orig->version_output_pos + version_len, other_orig->version_str.len - version_len);
+			other_orig->version_str.len = version_len;
+		}
 	}
 }
 
-static void sdp_version_check(struct sdp_chopper *chop, sdp_sessions_q *sessions,
-		struct call_monologue *monologue,
-		unsigned int force_increase) {
+/**
+ * SDP session version manipulations.
+ */
+static void sdp_version_check(GString *s, struct call_monologue *monologue,
+		bool force_increase)
+{
+	if (!monologue->session_last_sdp_orig)
+		return;
+
+	sdp_origin *origin = monologue->session_last_sdp_orig;
+	sdp_origin *other_origin = NULL;
+
+	struct media_subscription *ms = call_ml_get_top_ms(monologue);
+	if (ms && ms->monologue && ms->monologue->session_sdp_orig)
+		other_origin = ms->monologue->session_sdp_orig;
+
 	/* We really expect only a single session here, but we treat all the same regardless,
-	 * and use the same version number on all of them */
+	* and use the same version number on all of them */
 
 	/* First update all versions to match our single version */
-	sdp_version_replace(chop, sessions, monologue);
+	sdp_version_replace(s, origin, other_origin);
 
 	/* Now check if we need to change the version actually.
 	 * The version change will be forced with the 'force_increase',
@@ -2886,17 +2499,17 @@ static void sdp_version_check(struct sdp_chopper *chop, sdp_sessions_q *sessions
 	if (!force_increase) {
 		if (!monologue->last_out_sdp)
 			goto dup;
-		if (g_string_equal(monologue->last_out_sdp, chop->output))
+		if (g_string_equal(monologue->last_out_sdp, s))
 			return;
 	}
 
 	/* mismatch detected. increment version, update again, and store copy */
-	monologue->sdp_version++;
-	sdp_version_replace(chop, sessions, monologue);
+	origin->version_num++;
+	sdp_version_replace(s, origin, other_origin);
 	if (monologue->last_out_sdp)
 		g_string_free(monologue->last_out_sdp, TRUE);
 dup:
-	monologue->last_out_sdp = g_string_new_len(chop->output->str, chop->output->len);
+	monologue->last_out_sdp = g_string_new_len(s->str, s->len);
 }
 
 const char *sdp_get_sendrecv(struct call_media *media) {
@@ -2910,11 +2523,14 @@ const char *sdp_get_sendrecv(struct call_media *media) {
 		return "inactive";
 }
 
-/* A function used to append attributes to the output chop */
+/**
+ * Appends attributes to the output SDP.
+ * Includes substitute and remove SDP attribute manipulations.
+ */
 static void generic_append_attr_to_gstring(GString *s, const str * attr, char separator, const str * value,
 		const sdp_ng_flags *flags, enum media_type media_type)
 {
-	struct sdp_manipulations *sdp_manipulations = sdp_manipulations_get_by_id(flags, media_type);
+	struct sdp_manipulations *sdp_manipulations = sdp_manipulations_get_by_id(flags->sdp_manipulations, media_type);
 
 	str * attr_subst = sdp_manipulations_subst(sdp_manipulations, attr);
 
@@ -2939,7 +2555,7 @@ static void generic_append_attr_to_gstring(GString *s, const str * attr, char se
 			g_string_append_len(s, value->s, value->len);
 
 			// check if the complete attribute string is marked for removal ...
-			str complete = STR_INIT_LEN(s->str + attr_start, s->len - attr_start);
+			str complete = STR_LEN(s->str + attr_start, s->len - attr_start);
 			if (sdp_manipulate_remove(sdp_manipulations, &complete))
 			{
 				// rewind and bail
@@ -2960,14 +2576,14 @@ static void generic_append_attr_to_gstring(GString *s, const str * attr, char se
 	g_string_append(s, "\r\n");
 }
 
-/* A function used to append attributes (`a=name:value`) to the output chop */
+/* Appends attributes (`a=name:value`) to the output SDP */
 static void append_str_attr_to_gstring(GString *s, const str * name, const str * value,
 		const sdp_ng_flags *flags, enum media_type media_type)
 {
 	generic_append_attr_to_gstring(s, name, ':', value, flags, media_type);
 }
 
-/* A function used to append attributes (`a=name:tag value`) to the output chop */
+/* Appends attributes (`a=name:tag value`) to the output SDP */
 static void append_tagged_attr_to_gstring(GString *s, const char * name, const str *tag, const str * value,
 		const sdp_ng_flags *flags, enum media_type media_type)
 {
@@ -2976,10 +2592,10 @@ static void append_tagged_attr_to_gstring(GString *s, const char * name, const s
 	g_autoptr(GString) n = g_string_new(name);
 	g_string_append_c(n, ':');
 	g_string_append_len(n, tag->s, tag->len);
-	generic_append_attr_to_gstring(s, &STR_INIT_GS(n), ' ', value, flags, media_type);
+	generic_append_attr_to_gstring(s, &STR_GS(n), ' ', value, flags, media_type);
 }
 
-/* A function used to append attributes (`a=name:uint value`) to the output chop */
+/* Appends attributes (`a=name:uint value`) to the output SDP */
 static void append_int_tagged_attr_to_gstring(GString *s, const char * name, unsigned int tag, const str * value,
 		const sdp_ng_flags *flags, enum media_type media_type)
 {
@@ -2987,10 +2603,10 @@ static void append_int_tagged_attr_to_gstring(GString *s, const char * name, uns
 		return;
 	g_autoptr(GString) n = g_string_new(name);
 	g_string_append_printf(n, ":%u", tag);
-	generic_append_attr_to_gstring(s, &STR_INIT_GS(n), ' ', value, flags, media_type);
+	generic_append_attr_to_gstring(s, &STR_GS(n), ' ', value, flags, media_type);
 }
 
-/* A function used to append attributes to the output chop */
+/* Appends attributes to the output SDP */
 static void append_attr_int_to_gstring(GString *s, const char * name, const int value,
 		const sdp_ng_flags *flags, enum media_type media_type)
 {
@@ -2998,8 +2614,8 @@ static void append_attr_int_to_gstring(GString *s, const char * name, const int 
 	append_int_tagged_attr_to_gstring(s, name, value, NULL, flags, media_type);
 }
 
-struct packet_stream *print_rtcp(GString *s, struct call_media *media, packet_stream_list *rtp_ps_link,
-		const sdp_ng_flags *flags, struct sdp_media *sdp_media)
+static struct packet_stream *print_rtcp(GString *s, struct call_media *media, packet_stream_list *rtp_ps_link,
+		const sdp_ng_flags *flags)
 {
 	struct packet_stream *ps = rtp_ps_link->data;
 	struct packet_stream *ps_rtcp = NULL;
@@ -3016,15 +2632,16 @@ struct packet_stream *print_rtcp(GString *s, struct call_media *media, packet_st
 		if (MEDIA_ISSET(media, RTCP_MUX) &&
 					(flags->opmode == OP_ANSWER ||
 						flags->opmode == OP_PUBLISH ||
-						((flags->opmode == OP_OFFER || flags->opmode == OP_REQUEST) && flags->rtcp_mux_require) ||
+						((flags->opmode == OP_OFFER || flags->opmode == OP_SUBSCRIBE_REQ) && flags->rtcp_mux_require) ||
 						IS_OP_OTHER(flags->opmode)))
 		{
-			insert_rtcp_attr(s, ps, flags, sdp_media);
+			insert_rtcp_attr(s, ps, flags, media);
 			append_attr_to_gstring(s, "rtcp-mux", NULL, flags, media->type_id);
 			ps_rtcp = NULL;
 		}
 		else if (ps_rtcp && flags->ice_option != ICE_FORCE_RELAY) {
-			insert_rtcp_attr(s, ps_rtcp, flags, sdp_media);
+			insert_rtcp_attr(s, ps_rtcp, flags, media);
+
 			if (MEDIA_ISSET(media, RTCP_MUX))
 				append_attr_to_gstring(s, "rtcp-mux", NULL, flags, media->type_id);
 		}
@@ -3035,422 +2652,542 @@ struct packet_stream *print_rtcp(GString *s, struct call_media *media, packet_st
 	return ps_rtcp;
 }
 
-static void print_sdp_session_section(GString *s, sdp_ng_flags *flags,
-		struct call_media *call_media)
-{
-	bool media_has_ice = MEDIA_ISSET(call_media, ICE);
-	bool media_has_ice_lite_self = MEDIA_ISSET(call_media, ICE_LITE_SELF);
-
-	if (flags->loop_protect)
-		append_attr_to_gstring(s, "rtpengine", &rtpe_instance_id, flags, MT_UNKNOWN);
-	if (media_has_ice && media_has_ice_lite_self)
-		append_attr_to_gstring(s, "ice-lite", NULL, flags, MT_UNKNOWN);
-}
-
 /* TODO: rework an appending of parameters in terms of sdp attribute manipulations */
-static struct packet_stream *print_sdp_media_section(GString *s, struct call_media *media,
-		struct sdp_media *sdp_media,
-		const sdp_ng_flags *flags,
-		packet_stream_list *rtp_ps_link,
-		bool is_active,
-		bool force_end_of_ice)
+static void print_sdp_media_section(GString *s, struct call_media *media,
+		const endpoint_t *address, struct call_media *source_media,
+		struct packet_stream *rtp_ps,
+		packet_stream_list *rtp_ps_link, sdp_ng_flags *flags)
 {
-	struct packet_stream *rtp_ps = rtp_ps_link->data;
+	struct call_monologue *monologue = media->monologue;
 	struct packet_stream *ps_rtcp = NULL;
+	bool inactive_media = (!address->port || !rtp_ps->selected_sfd); /* audio is accepted? */
 
+	if (source_media) {
+		/* just print out all original values and attributes */
+		sdp_out_original_media_attributes(s, media, address, source_media, rtp_ps, flags);
+		return;
+	}
+
+	/* add actual media connection
+	 * print zeroed address for the non accepted media, see RFC 3264 */
+	sdp_out_add_media_connection(s, media, rtp_ps, (inactive_media ? NULL : &address->address), flags);
+
+	/* add per media bandwidth */
+	sdp_out_add_bandwidth(s, monologue, media, flags);
+
+	/* mid and label must be added even for inactive streams (see #1361 and #1362). */
 	if (media->media_id.s)
 		append_attr_to_gstring(s, "mid", &media->media_id, flags, media->type_id);
 	if (media->label.len && flags->siprec)
 		append_attr_to_gstring(s, "label", &media->label, flags, media->type_id);
 
-	if (is_active) {
-		if (proto_is_rtp(media->protocol))
-			insert_codec_parameters(s, media, flags);
+	/* nothing more to be printed for inactive stream (non-accepted media session) */
+	if (inactive_media)
+		return;
 
-		/* all unknown type attributes will be added here */
-		media->sdp_attr_print(s, media, flags);
+	if (proto_is_rtp(media->protocol))
+		insert_codec_parameters(s, media, flags);
 
-		/* print sendrecv */
-		if (!flags->original_sendrecv)
-			append_attr_to_gstring(s, sdp_get_sendrecv(media), NULL, flags,
+	/* all unknown type attributes will be added here */
+	media->sdp_attr_print(s, media, flags);
+
+	/* print sendrecv */
+	if (!flags->original_sendrecv)
+		append_attr_to_gstring(s, sdp_get_sendrecv(media), NULL, flags,
+				media->type_id);
+
+	ps_rtcp = print_rtcp(s, media, rtp_ps_link, flags);
+
+	if (proto_is_rtp(media->protocol)) {
+		insert_crypto(s, media, flags);
+		insert_dtls(s, media, dtls_ptr(rtp_ps->selected_sfd), flags);
+
+		if (media->ptime)
+			append_attr_int_to_gstring(s, "ptime", media->ptime, flags,
 					media->type_id);
-
-		ps_rtcp = print_rtcp(s, media, rtp_ps_link, flags, sdp_media);
-
-		if (proto_is_rtp(media->protocol)) {
-			insert_crypto(s, media, flags);
-			insert_dtls(s, media, dtls_ptr(rtp_ps->selected_sfd), flags);
-
-			if (media->ptime)
-				append_attr_int_to_gstring(s, "ptime", media->ptime, flags,
-						media->type_id);
-		}
-
-		if (MEDIA_ISSET(media, ICE) && media->ice_agent) {
-			append_attr_to_gstring(s, "ice-ufrag", &media->ice_agent->ufrag[1], flags,
+		if (media->maxptime)
+			append_attr_int_to_gstring(s, "maxptime", media->maxptime, flags,
 					media->type_id);
-			append_attr_to_gstring(s, "ice-pwd", &media->ice_agent->pwd[1], flags,
-					media->type_id);
-		}
-
-		if (MEDIA_ISSET(media, TRICKLE_ICE) && media->ice_agent) {
-			append_attr_to_gstring(s, "ice-options", &STR_CONST_INIT("trickle"), flags,
-					media->type_id);
-		}
-		if (MEDIA_ISSET(media, ICE)) {
-			insert_candidates(s, rtp_ps, ps_rtcp, flags, sdp_media);
-		}
 	}
 
-	if ((MEDIA_ISSET(media, TRICKLE_ICE) && media->ice_agent) || force_end_of_ice) {
+	if (MEDIA_ISSET(media, ICE) && media->ice_agent) {
+		append_attr_to_gstring(s, "ice-ufrag", &media->ice_agent->ufrag[1], flags,
+				media->type_id);
+		append_attr_to_gstring(s, "ice-pwd", &media->ice_agent->pwd[1], flags,
+				media->type_id);
+	}
+
+	if (MEDIA_ISSET(media, TRICKLE_ICE) && media->ice_agent) {
+		append_attr_to_gstring(s, "ice-options", &STR_CONST("trickle"), flags,
+				media->type_id);
+	}
+	if (MEDIA_ISSET(media, ICE)) {
+		insert_candidates(s, rtp_ps, ps_rtcp, flags, source_media);
+	}
+
+	if ((MEDIA_ISSET(media, TRICKLE_ICE) && media->ice_agent)) {
 		append_attr_to_gstring(s, "end-of-candidates", NULL, flags, media->type_id);
 	}
 
-	return ps_rtcp;
+	return;
 }
 
-
-static const char *replace_sdp_media_section(struct sdp_chopper *chop, struct call_media *call_media,
-		struct sdp_media *sdp_media, packet_stream_list *rtp_ps_link, sdp_ng_flags *flags,
-		const bool keep_zero_address)
+static void sdp_out_add_origin(GString *out, struct call_monologue *monologue,
+		struct packet_stream *first_ps, sdp_ng_flags *flags)
 {
-	const char *err = NULL;
-	struct packet_stream *ps = rtp_ps_link->data;
+	struct call_monologue *ml = monologue;
 
-	bool is_active = true;
+	/* for the offer/answer model or subscribe don't use the given monologues SDP,
+	 * but try the one of the subscription, because the given monologue itself
+	 * has likely no session attributes set yet */
+	struct media_subscription *ms = call_ml_get_top_ms(monologue);
+	if (ms && ms->monologue)
+		ml = ms->monologue;
 
-	if (flags->ice_option != ICE_FORCE_RELAY && call_media->type_id != MT_MESSAGE) {
-		err = "failed to replace media type";
-		if (replace_media_type(chop, sdp_media, call_media))
-			goto error;
-		err = "failed to replace media port";
-		if (replace_media_port(chop, sdp_media, ps))
-			goto error;
-		err = "failed to replace media port count";
-		if (replace_consecutive_port_count(chop, sdp_media, ps, rtp_ps_link))
-			goto error;
-		err = "failed to replace media protocol";
-		if (replace_transport_protocol(chop, sdp_media, call_media))
-			goto error;
-		err = "failed to replace media formats";
-		if (replace_codec_list(chop, sdp_media, call_media))
-			goto error;
+	/* orig username
+	 * session_last_sdp_orig is stored on the other media always,
+	 * so if origin is meant for the A media, then it is stored on the B one */
+	str * orig_username = (monologue->session_last_sdp_orig &&
+			(flags->replace_username || flags->replace_origin_full)) ?
+			&monologue->session_last_sdp_orig->username : &ml->session_sdp_orig->username;
 
-		if (sdp_media->connection.parsed) {
-			err = "failed to replace media network address";
-			if (replace_network_address(chop, &sdp_media->connection.address, ps,
-						flags, keep_zero_address))
-				goto error;
-		}
+	/* orig session id */
+	str * orig_session_id = (monologue->session_last_sdp_orig && flags->replace_origin_full) ?
+			&monologue->session_last_sdp_orig->session_id : &ml->session_sdp_orig->session_id;
+
+	/* orig session ver
+	 * replacement is handled later in sdp_create() based on SDP changes */
+	unsigned long long orig_session_version = ml->session_sdp_orig->version_num;
+	/* record origin version position for replacements
+	 * + 4 - means: `o=` + 2 spaces between username and version / version and id */
+	ml->session_sdp_orig->version_output_pos = out->len + orig_username->len + orig_session_id->len + 4;
+
+	/* orig IP family and address */
+	str orig_address_type;
+	str orig_address;
+	if (!ms || flags->replace_origin || flags->replace_origin_full) {
+		/* replacing flags or PUBLISH */
+		orig_address_type = STR(first_ps->selected_sfd->local_intf->advertised_address.addr.family->rfc_name);
+		orig_address = STR(sockaddr_print_buf(&first_ps->selected_sfd->local_intf->advertised_address.addr));
+	} else {
+		orig_address_type = ml->session_sdp_orig->address.address_type;
+		orig_address = ml->session_sdp_orig->address.address;
 	}
-	else if (call_media->type_id == MT_MESSAGE) {
-		err = "failed to generate connection line";
-		if (!sdp_media->connection.parsed)
-			if (synth_session_connection(chop, sdp_media))
-				goto error;
-		// leave everything untouched
-		is_active = false;
-		goto next;
-	}
 
-	/* all unknown type attributes will stripped here */
-	err = "failed to process media attributes";
-	if (process_media_attributes(chop, sdp_media, flags, call_media))
-		goto error;
-
-	copy_up_to_end_of(chop, &sdp_media->s);
-
-	if (!sdp_media->port_num || !ps->selected_sfd)
-		is_active = false;
-
-next:
-	print_sdp_media_section(chop->output, call_media, sdp_media, flags, rtp_ps_link, is_active,
-			attr_get_by_id(&sdp_media->attributes, ATTR_END_OF_CANDIDATES));
-	return NULL;
-
-error:
-	return err;
+	/* print it to the output sdp */
+	g_string_append_printf(out,
+			"o="STR_FORMAT" "STR_FORMAT" %llu IN "STR_FORMAT" "STR_FORMAT"\r\n",
+			STR_FMT(orig_username),
+			STR_FMT(orig_session_id),
+			orig_session_version,
+			STR_FMT(&orig_address_type),
+			STR_FMT(&orig_address));
 }
 
+static void sdp_out_add_session_name(GString *out, struct call_monologue *monologue)
+{
+	g_string_append(out, "s=");
 
-/* called with call->master_lock held in W */
-int sdp_replace(struct sdp_chopper *chop, sdp_sessions_q *sessions, struct call_monologue *monologue,
+	/* PUBLISH exceptionally doesn't include sdp session name from SDP.
+	 * The session name and other values should be copied only from a source SDP,
+	 * if that is also a media source. For a publish request that's not the case. */
+
+	/* for the offer/answer model or subscribe don't use the given monologues SDP,
+	 * but try the one of the subscription, because the given monologue itself
+	 * has likely no session attributes set yet */
+	struct media_subscription *ms = call_ml_get_top_ms(monologue);
+	if (ms && ms->monologue)
+	{
+		/* if a session name was empty in the s= attr of the coming message,
+		 * while processing this ml in `__call_monologue_init_from_flags()`,
+		 * then just keep it empty. */
+		if (ms->monologue->sdp_session_name.len)
+			g_string_append_len(out, ms->monologue->sdp_session_name.s, ms->monologue->sdp_session_name.len);
+	}
+	else
+		g_string_append(out, rtpe_config.software_id);
+
+	g_string_append(out, "\r\n");
+}
+
+static void sdp_out_add_timing(GString *out, struct call_monologue *monologue)
+{
+	/* sdp timing per session level */
+	g_string_append(out, "t=");
+
+	struct media_subscription *ms = call_ml_get_top_ms(monologue);
+	if (ms && ms->monologue && ms->monologue->sdp_session_timing.len)
+		g_string_append_len(out, ms->monologue->sdp_session_timing.s, ms->monologue->sdp_session_timing.len);
+	else
+		g_string_append(out, "0 0"); /* default */
+
+	g_string_append(out, "\r\n");
+}
+
+static void sdp_out_add_other(GString *out, struct call_monologue *monologue,
+		struct call_media *media,
 		sdp_ng_flags *flags)
 {
-	struct sdp_session *session;
-	struct sdp_media *sdp_media;
-	int sess_conn;
-	struct call_media *call_media;
-	struct packet_stream *ps;
-	const char *err = NULL;
+	bool media_has_ice = MEDIA_ISSET(media, ICE);
+	bool media_has_ice_lite_self = MEDIA_ISSET(media, ICE_LITE_SELF);
 
-	unsigned int media_index = 0;
+	struct media_subscription *ms = call_ml_get_top_ms(monologue);
 
-	for (__auto_type l = sessions->head; l; l = l->next) {
-		session = l->data;
-
-		// look for first usable (non-rejected, non-empty) packet stream
-		// from any media to determine session-level attributes, if any
-		ps = NULL;
-		for (unsigned int ix = media_index; ix < monologue->medias->len; ix++) {
-			call_media = monologue->medias->pdata[ix];
-			if (!call_media)
-				continue;
-			if (!call_media->streams.head)
-				continue;
-			ps = call_media->streams.head->data;
-			break;
-		}
-
-		err = "no usable session media stream";
-		if (!ps)
-			goto error;
-
-		err = "error while processing o= line";
-		if (!monologue->sdp_username)
-			monologue->sdp_username = call_strdup_len(monologue->call, session->origin.username.s,
-					session->origin.username.len);
-		else if (flags->replace_username) {
-			if (copy_up_to(chop, &session->origin.username))
-				goto error;
-			chopper_append_c(chop, monologue->sdp_username);
-			if (skip_over(chop, &session->origin.username))
-				goto error;
-		}
-
-		// record position of o= line and init SDP version
-		if (copy_up_to(chop, &session->origin.version_str))
-			goto error;
-		session->origin.version_output_pos = chop->output->len;
-		if (!monologue->sdp_version) {
-			monologue->sdp_version = session->origin.version_num;
-			if (monologue->sdp_version == ULLONG_MAX)
-				monologue->sdp_version = (unsigned int)ssl_random();
-		}
-
-		if (session->origin.parsed && flags->replace_origin &&
-		    flags->ice_option != ICE_FORCE_RELAY) {
-			err = "failed to replace network address";
-			if (replace_network_address(chop, &session->origin.address, ps, flags, false))
-				goto error;
-		}
-
-		err = "error while processing s= line";
-		if (!monologue->sdp_session_name)
-			monologue->sdp_session_name = call_strdup_len(monologue->call, session->session_name.s,
-					session->session_name.len);
-		else if (flags->replace_sess_name) {
-			if (copy_up_to(chop, &session->session_name))
-				goto error;
-			chopper_append_c(chop, monologue->sdp_session_name);
-			if (skip_over(chop, &session->session_name))
-				goto error;
-		}
-
-		sess_conn = 0;
-		if (flags->replace_sess_conn)
-			sess_conn = 1;
-		else {
-			for (__auto_type k = session->media_streams.head; k; k = k->next) {
-				sdp_media = k->data;
-				if (!sdp_media->connection.parsed) {
-					sess_conn = 1;
-					break;
-				}
-			}
-		}
-
-		bool media_has_ice = MEDIA_ISSET(call_media, ICE);
-		bool keep_zero_address = ! media_has_ice;
-
-		if (session->connection.parsed && sess_conn &&
-		    flags->ice_option != ICE_FORCE_RELAY) {
-			err = "failed to replace network address";
-			if (replace_network_address(chop, &session->connection.address, ps, flags,
-						keep_zero_address))
-				goto error;
-		}
-
-		if (!MEDIA_ISSET(call_media, PASSTHRU)) {
-			err = "failed to process session attributes";
-			if (process_session_attributes(chop, &session->attributes, flags))
-				goto error;
-		}
-
-		copy_up_to_end_of(chop, &session->s);
-
-		/* add a list of important attrs to the session section */
-		print_sdp_session_section(chop->output, flags, call_media);
-
-		/* ADD arbitrary SDP manipulations for a session sessions */
-		struct sdp_manipulations *sdp_manipulations = sdp_manipulations_get_by_id(flags, MT_UNKNOWN);
-		sdp_manipulations_add(chop, sdp_manipulations);
-
-		for (__auto_type k = session->media_streams.head; k; k = k->next) {
-			sdp_media = k->data;
-
-			// skip over received dummy SDP sections
-			if (sdp_media->legacy_osrtp) {
-				if (skip_over(chop, &sdp_media->s))
-					goto error;
-				continue;
-			}
-
-			err = "no matching media";
-			call_media = monologue->medias->pdata[media_index];
-			if (!call_media)
-				goto error;
-			err = "no matching media stream";
-			__auto_type rtp_ps_link = call_media->streams.head;
-			if (!rtp_ps_link)
-				goto error;
-
-			const struct transport_protocol *prtp = NULL;
-			if (call_media->protocol && call_media->protocol->srtp)
-				prtp = &transport_protocols[call_media->protocol->rtp_proto];
-
-			if (prtp) {
-				if (MEDIA_ISSET(call_media, LEGACY_OSRTP)
-						&& !MEDIA_ISSET(call_media, LEGACY_OSRTP_REV))
-				{
-					// generate rejected m= line for accepted legacy OSRTP
-					chopper_append_c(chop, "m=");
-					chopper_append_str(chop, &call_media->type);
-					chopper_append_c(chop, " 0 ");
-					chopper_append_c(chop, prtp->name);
-					chopper_append_c(chop, " ");
-					chopper_append_str(chop, &call_media->format_str);
-					chopper_append_c(chop, "\r\n");
-				}
-				else if (flags->osrtp_offer_legacy && flags->opmode == OP_OFFER) {
-					// generate duplicate plain RTP media section for OSRTP offer:
-					// save current chopper state, save actual protocol,
-					// print SDP section, restore chopper and protocl
-					struct sdp_chopper chop_copy = *chop;
-					const struct transport_protocol *proto = call_media->protocol;
-					call_media->protocol = prtp;
-					err = replace_sdp_media_section(chop, call_media, sdp_media,
-							rtp_ps_link, flags,
-							keep_zero_address);
-					*chop = chop_copy;
-					call_media->protocol = proto;
-					if (err)
-						goto error;
-				}
-			}
-
-			err = replace_sdp_media_section(chop, call_media, sdp_media,
-					rtp_ps_link, flags,
-					keep_zero_address);
-			if (err)
-				goto error;
-
-			if (prtp && MEDIA_ISSET(call_media, LEGACY_OSRTP)
-					&& MEDIA_ISSET(call_media, LEGACY_OSRTP_REV))
-			{
-				// generate rejected m= line for accepted legacy OSRTP
-				chopper_append_c(chop, "m=");
-				chopper_append_str(chop, &call_media->type);
-				chopper_append_c(chop, " 0 ");
-				chopper_append_c(chop, prtp->name);
-				chopper_append_c(chop, " ");
-				chopper_append_str(chop, &call_media->format_str);
-				chopper_append_c(chop, "\r\n");
-			}
-
-			/* ADD arbitrary SDP manipulations for audio/video media sessions */
-			sdp_manipulations = sdp_manipulations_get_by_id(flags, sdp_media->media_type_id);
-			sdp_manipulations_add(chop, sdp_manipulations);
-
-			media_index++;
-		}
+	/* add loop protectio if required */
+	if (flags->loop_protect)
+		append_attr_to_gstring(out, "rtpengine", &rtpe_instance_id, flags, media->type_id);
+#ifdef WITH_TRANSCODING
+	if (monologue->player && monologue->player->moh && rtpe_config.moh_attr_name) {
+		append_attr_to_gstring(out, rtpe_config.moh_attr_name, NULL, flags, media->type_id);
 	}
+#endif
+	/* ice-lite */
+	if (media_has_ice && media_has_ice_lite_self)
+		append_attr_to_gstring(out, "ice-lite", NULL, flags, media->type_id);
 
-	copy_remainder(chop);
+	/* group */
+	if (ms && ms->monologue && ms->monologue->sdp_session_group.len && flags->ice_option == ICE_FORCE_RELAY)
+		append_attr_to_gstring(out, "group", &ms->monologue->sdp_session_group, flags, media->type_id);
 
-	/* The SDP version gets increased in case:
-	 * - if replace_sdp_version (sdp-version) flag is set and SDP information has been updated, or
-	 * - if the force_inc_sdp_ver (force-increment-sdp-ver) flag is set additionally to replace_sdp_version,
-	 *    which forces version increase regardless changes in the SDP information.
-	 */
-	if (flags->replace_sdp_version)
-		sdp_version_check(chop, sessions, monologue, flags->force_inc_sdp_ver);
+	/* carry other session level a= attributes to the outgoing SDP */
+	monologue->sdp_attr_print(out, monologue, flags);
 
-
-	return 0;
-
-error:
-	ilog(LOG_ERROR, "Error rewriting SDP: %s", err);
-	return -1;
+	/* ADD arbitrary SDP manipulations for a session sessions */
+	struct sdp_manipulations *sdp_manipulations = sdp_manipulations_get_by_id(flags->sdp_manipulations, MT_UNKNOWN);
+	sdp_manipulations_add(out, sdp_manipulations);
 }
 
-int sdp_create(str *out, struct call_monologue *monologue, const sdp_ng_flags *flags) {
+static void sdp_out_add_bandwidth(GString *out, struct call_monologue *monologue,
+		struct call_media *media, sdp_ng_flags *flags)
+{
+	/* if there's a media given, only do look up the values for that one */
+	if (media) {
+		/* sdp bandwidth per media level */
+		struct media_subscription *ms = call_media_get_top_ms(media);
+		if (!ms || !ms->media)
+			return;
+		if (ms->media->sdp_media_bandwidth.as >= 0)
+			g_string_append_printf(out, "b=AS:%ld\r\n", ms->media->sdp_media_bandwidth.as);
+		if (ms->media->sdp_media_bandwidth.rr >= 0)
+			g_string_append_printf(out, "b=RR:%ld\r\n", ms->media->sdp_media_bandwidth.rr);
+		if (ms->media->sdp_media_bandwidth.rs >= 0)
+			g_string_append_printf(out, "b=RS:%ld\r\n", ms->media->sdp_media_bandwidth.rs);
+		if (ms->media->sdp_media_bandwidth.tias >= 0)
+			g_string_append_printf(out, "b=TIAS:%ld\r\n", ms->media->sdp_media_bandwidth.tias);
+	}
+	else {
+		/* sdp bandwidth per session/media level
+		* 0 value is supported (e.g. b=RR:0 and b=RS:0), to be able to disable rtcp */
+		struct media_subscription *ms = call_ml_get_top_ms(monologue);
+		/* don't add session level bandwidth for subscribe requests */
+		if (!ms || !ms->monologue || flags->opmode == OP_SUBSCRIBE_REQ)
+			return;
+		if (ms->monologue->sdp_session_bandwidth.as >= 0)
+			g_string_append_printf(out, "b=AS:%ld\r\n", ms->monologue->sdp_session_bandwidth.as);
+		if (ms->monologue->sdp_session_bandwidth.rr >= 0)
+			g_string_append_printf(out, "b=RR:%ld\r\n", ms->monologue->sdp_session_bandwidth.rr);
+		if (ms->monologue->sdp_session_bandwidth.rs >= 0)
+			g_string_append_printf(out, "b=RS:%ld\r\n", ms->monologue->sdp_session_bandwidth.rs);
+		if (ms->monologue->sdp_session_bandwidth.ct >= 0)
+			g_string_append_printf(out, "b=CT:%ld\r\n", ms->monologue->sdp_session_bandwidth.ct);
+		if (ms->monologue->sdp_session_bandwidth.tias >= 0)
+			g_string_append_printf(out, "b=TIAS:%ld\r\n", ms->monologue->sdp_session_bandwidth.tias);
+	}
+}
+
+static void sdp_out_add_media_connection(GString *out, struct call_media *media,
+		struct packet_stream *rtp_ps, const sockaddr_t *address, sdp_ng_flags *flags)
+{
+	if (!is_addr_unspecified(&flags->media_address))
+		address = &flags->media_address;
+
+	const char *media_conn_address = NULL;
+	const char *media_conn_address_type = NULL;
+
+	/* print zeroed address */
+	if (!address || !address->family || (PS_ISSET(rtp_ps, ZERO_ADDR) && !MEDIA_ISSET(media, ICE))) {
+		if (!address || !address->family) {
+			const struct intf_address *ifa_addr;
+			const struct local_intf *ifa;
+			if (rtp_ps->selected_sfd)
+				ifa = rtp_ps->selected_sfd->local_intf;
+			else
+				ifa = get_any_interface_address(rtp_ps->media->logical_intf, rtp_ps->media->desired_family);
+			ifa_addr = &ifa->spec->local_address;
+			media_conn_address_type = ifa_addr->addr.family->rfc_name;
+			media_conn_address = ifa_addr->addr.family->unspec_string;
+		}
+		else {
+			media_conn_address_type = address->family->rfc_name;
+			media_conn_address = address->family->unspec_string;
+		}
+	}
+	else {
+		media_conn_address_type = address->family->rfc_name;
+		media_conn_address = sockaddr_print_buf(address);
+	}
+
+	g_string_append_printf(out,
+			"c=IN %s %s\r\n",
+			media_conn_address_type,
+			media_conn_address);
+}
+
+/**
+ * Add OSRTP related media line.
+ */
+static void sdp_out_add_osrtp_media(GString *out, struct call_media *media,
+	const struct transport_protocol *prtp, const endpoint_t *address)
+{
+	g_string_append_printf(out, "m=" STR_FORMAT " %d %s ",
+			STR_FMT(&media->type),
+			address ? address->port : 0,
+			prtp->name);
+
+	/* print codecs and add newline  */
+	print_codec_list(out, media);
+	g_string_append_printf(out, "\r\n");
+}
+
+/**
+ * Add media line.
+ */
+static bool sdp_out_add_media(GString *out, struct call_media *media,
+		unsigned int port)
+{
+	if (media->protocol)
+		g_string_append_printf(out, "m=" STR_FORMAT " %i %s ",
+				STR_FMT(&media->type),
+				port,
+				media->protocol->name);
+	else if (media->protocol_str.s)
+		g_string_append_printf(out, "m=" STR_FORMAT " %i " STR_FORMAT " ",
+				STR_FMT(&media->type),
+				port,
+				STR_FMT(&media->protocol_str));
+	else
+		return false;
+
+	/* print codecs and add newline  */
+	print_codec_list(out, media);
+	g_string_append_printf(out, "\r\n");
+
+	return true;
+}
+
+static void sdp_out_handle_osrtp1(GString *out, struct call_media *media,
+		const endpoint_t *address, const struct transport_protocol *prtp,
+		struct packet_stream *rtp_ps, packet_stream_list *rtp_ps_link,
+		sdp_ng_flags *flags)
+{
+	if (!prtp)
+		return;
+
+	if (MEDIA_ISSET(media, LEGACY_OSRTP) && !MEDIA_ISSET(media, LEGACY_OSRTP_REV))
+		/* generate rejected m= line for accepted legacy OSRTP */
+		sdp_out_add_osrtp_media(out, media, prtp, NULL);
+	else if(flags->osrtp_offer_legacy && (flags->opmode == OP_OFFER || flags->opmode == OP_SUBSCRIBE_REQ)) {
+		const struct transport_protocol *proto = media->protocol;
+		media->protocol = prtp;
+
+		sdp_out_add_osrtp_media(out, media, prtp, address);
+		/* print media level attributes */
+		print_sdp_media_section(out, media, address, NULL, rtp_ps, rtp_ps_link, flags);
+
+		media->protocol = proto;
+	}
+}
+
+static void sdp_out_handle_osrtp2(GString *out, struct call_media *media,
+		const struct transport_protocol *prtp)
+{
+	if (!prtp)
+		return;
+
+	if (MEDIA_ISSET(media, LEGACY_OSRTP) && MEDIA_ISSET(media, LEGACY_OSRTP_REV))
+		/* generate rejected m= line for accepted legacy OSRTP */
+		sdp_out_add_osrtp_media(out, media, prtp, 0);
+}
+
+/**
+ * Adds original attributes into the media.
+ */
+static void sdp_out_original_media_attributes(GString *out, struct call_media *media,
+		const endpoint_t *address, struct call_media *source_media,
+		struct packet_stream *rtp_ps, sdp_ng_flags *flags)
+{
+	sdp_out_add_media_connection(out, media, rtp_ps, &address->address, flags);
+	sdp_out_add_bandwidth(out, source_media->monologue, media, flags);
+	sdp_insert_all_attributes(out, source_media, flags);
+	if (MEDIA_ISSET(source_media, ICE)) {
+		struct packet_stream *rtcp_ps = rtp_ps->rtcp_sibling;
+		/* TODO: is this a better or worse test than used in print_rtcp() ? */
+		if (rtcp_ps && (!rtcp_ps->selected_sfd || rtcp_ps->selected_sfd->socket.local.port == 0))
+			rtcp_ps = NULL;
+		insert_candidates(out, rtp_ps, rtcp_ps, flags, source_media);
+		if (MEDIA_ISSET(source_media, END_OF_CANDIDATES))
+			append_attr_to_gstring(out, "end-of-candidates", NULL, flags, media->type_id);
+	}
+}
+
+/**
+ * Should we just pass through the original SDP (mostly) unchanged,
+ * then we need to look up the source media.
+ */
+static struct call_media *sdp_out_set_source_media_address(struct call_media *media,
+		struct packet_stream *rtp_ps,
+		struct sdp_ng_flags *flags,
+		endpoint_t *sdp_address)
+{
+	struct call_media *source_media = NULL;
+	/* the port and address that goes into the SDP also depends on this */
+	if (rtp_ps->selected_sfd) {
+		sdp_address->port = rtp_ps->selected_sfd->socket.local.port;
+		sdp_address->address = rtp_ps->selected_sfd->local_intf->advertised_address.addr;
+	}
+
+	struct media_subscription *ms = call_media_get_top_ms(media);
+	if (ms && ms->media) {
+		source_media = ms->media;
+		/* cases with message, force relay and pass through */
+		if (media->type_id == MT_MESSAGE || flags->ice_option == ICE_FORCE_RELAY || MEDIA_ISSET(media, PASSTHRU)) {
+			if (source_media->streams.head) {
+				__auto_type sub_ps = source_media->streams.head->data;
+				*sdp_address = sub_ps->advertised_endpoint;
+			}
+			return source_media;
+		}
+		/* detect passthrough (cases where no RTP/SRTP spotted on both media sides).
+		 * Doesn't require source_address to be changed to the original one (e.g. T.38 cases),
+		 * since we still probably want to proxy media for them.
+		 */
+		else if (!proto_is_rtp(media->protocol) && !proto_is_rtp(source_media->protocol))
+			return source_media;
+	}
+
+	// handle special case: allow-no-codec-media
+	if (flags->allow_no_codec_media && media->codecs.codec_prefs.length == 0
+			&& proto_is_rtp(media->protocol))
+	{
+		// convert to rejected/removed stream
+		*sdp_address = (endpoint_t) {0};
+	}
+
+	return NULL;
+}
+
+/**
+ * For the offer/answer model, SDP create will be triggered for the B monologue,
+ * which likely has empty paramaters (such as sdp origin, session name etc.), hence
+ * such parameters have to be taken from the A monologue (so from the subscription).
+ *
+ * For the rest of cases (publish, subscribe, janus etc.) this works as usual:
+ * given monologue is a monologue which is being processed.
+ */
+int sdp_create(str *out, struct call_monologue *monologue, sdp_ng_flags *flags)
+{
 	const char *err = NULL;
 	GString *s = NULL;
+	const struct transport_protocol *prtp;
+	struct call_media *media = NULL;
+	struct packet_stream *first_ps = NULL;
 
 	err = "Need at least one media";
 	if (!monologue->medias->len)
 		goto err;
 
-	// grab first components
-	struct call_media *media = monologue->medias->pdata[0];
-	err = "No media stream";
-	if (!media->streams.length)
-		goto err;
-	struct packet_stream *first_ps = media->streams.head->data;
-	err = "No packet stream";
-	if (!first_ps->selected_sfd)
-		goto err;
-
-	s = g_string_new("v=0\r\no=- ");
-
-	// init session params
-	if (!monologue->sdp_session_id)
-		monologue->sdp_session_id = (unsigned long long) rtpe_now.tv_sec << 32 | rtpe_now.tv_usec;
-	if (!monologue->sdp_version)
-		monologue->sdp_version = monologue->sdp_session_id;
-
-	g_string_append_printf(s, "%llu %llu IN %s %s\r\n", monologue->sdp_session_id, monologue->sdp_version,
-			first_ps->selected_sfd->local_intf->advertised_address.addr.family->rfc_name,
-			sockaddr_print_buf(&first_ps->selected_sfd->local_intf->advertised_address.addr));
-
-	g_string_append_printf(s, "s=%s\r\n", rtpe_config.software_id);
-	g_string_append(s, "t=0 0\r\n");
-
-	monologue->sdp_attr_print(s, monologue, flags);
-
-	for (unsigned int i = 0; i < monologue->medias->len; i++) {
+	/* look for the first usable (non-rejected, non-empty) media and ps,
+	 * thereby to determine session-level attributes, if any */
+	for (int i = 0; i < monologue->medias->len; i++) {
 		media = monologue->medias->pdata[i];
+		if (!media)
+			continue;
+		if (!media->streams.head)
+			continue;
+		first_ps = media->streams.head->data;
+		if (!first_ps->selected_sfd)
+			continue;
+		break;
+	}
+
+	err = "No usable packet stream";
+	if (!first_ps || !first_ps->selected_sfd)
+		goto err;
+
+	/* init new sdp */
+	s = g_string_new("v=0\r\n");
+
+	/* add origin including name and version */
+	sdp_out_add_origin(s, monologue, first_ps, flags);
+
+	/* add an actual sdp session name */
+	sdp_out_add_session_name(s, monologue);
+
+	/* don't set connection on the session level
+	 * but instead per media, below */
+
+	/* add bandwidth control per session level */
+	sdp_out_add_bandwidth(s, monologue, NULL, flags);
+
+	/* set timing to always be: 0 0 */
+	sdp_out_add_timing(s, monologue);
+
+	/* add other session level attributes */
+	sdp_out_add_other(s, monologue, media, flags);
+
+	/* print media sections */
+	for (unsigned int i = 0; i < monologue->medias->len; i++)
+	{
+		media = monologue->medias->pdata[i];
+
+		/* check call media existence */
 		err = "Empty media stream";
 		if (!media)
 			continue;
+
+		/* check streams existence */
 		err = "Zero length media stream";
 		if (!media->streams.length)
 			goto err;
+
 		__auto_type rtp_ps_link = media->streams.head;
 		struct packet_stream *rtp_ps = rtp_ps_link->data;
-		err = "No selected FD";
-		if (!rtp_ps->selected_sfd)
-			goto err;
+
+		endpoint_t sdp_address = {0};
+		struct call_media *source_media = sdp_out_set_source_media_address(media, rtp_ps, flags,
+				&sdp_address);
+		unsigned int port = sdp_address.port;
+
+		prtp = NULL;
+		if (media->protocol && media->protocol->srtp)
+			prtp = &transport_protocols[media->protocol->rtp_proto];
+
+		/* handle first OSRTP part */
+		sdp_out_handle_osrtp1(s, media, &sdp_address, prtp, rtp_ps, rtp_ps_link, flags);
+
+		/* set: media type, port, protocol (e.g. RTP/SAVP) */
 		err = "Unknown media protocol";
-		if (media->protocol)
-			g_string_append_printf(s, "m=" STR_FORMAT " %i %s ",
-					STR_FMT(&media->type),
-					rtp_ps->selected_sfd->socket.local.port,
-					media->protocol->name);
-		else if (media->protocol_str.s)
-			g_string_append_printf(s, "m=" STR_FORMAT " %i " STR_FORMAT " ",
-					STR_FMT(&media->type),
-					rtp_ps->selected_sfd->socket.local.port,
-					STR_FMT(&media->protocol_str));
-		else
+		if (!sdp_out_add_media(s, media, port))
 			goto err;
-		print_codec_list(s, media);
-		g_string_append_printf(s, "\r\nc=IN %s %s\r\n",
-				rtp_ps->selected_sfd->local_intf->advertised_address.addr.family->rfc_name,
-				sockaddr_print_buf(&rtp_ps->selected_sfd->local_intf->advertised_address.addr));
-		print_sdp_media_section(s, media, NULL, flags, rtp_ps_link, true, false);
+
+		/* print media level attributes */
+		print_sdp_media_section(s, media, &sdp_address, source_media, rtp_ps, rtp_ps_link, flags);
+
+		/* handle second OSRTP part */
+		sdp_out_handle_osrtp2(s, media, prtp);
+
+		/* ADD arbitrary SDP manipulations for audio/video media sessions */
+		struct sdp_manipulations *sdp_manipulations = sdp_manipulations_get_by_id(flags->sdp_manipulations, media->type_id);
+		sdp_manipulations_add(s, sdp_manipulations);
 	}
+
+	/* The SDP version gets increased in case:
+	* - if replace_sdp_version (sdp-version) or replace_origin_full flag is set and SDP information has been updated, or
+	* - if the force_inc_sdp_ver (force-increment-sdp-ver) flag is set additionally to replace_sdp_version,
+	*    which forces version increase regardless changes in the SDP information.
+	*/
+	if (flags->force_inc_sdp_ver || flags->replace_sdp_version || flags->replace_origin_full)
+		sdp_version_check(s, monologue, !!flags->force_inc_sdp_ver);
 
 	out->len = s->len;
 	out->s = g_string_free(s, FALSE);

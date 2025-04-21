@@ -10,11 +10,13 @@
 #include <string.h>
 #include <glib/gprintf.h>
 #include "auxlib.h"
+#include "bencode.h"
 
 
 struct log_limiter_entry {
 	char *prefix;
 	char *msg;
+	time_t when;
 };
 
 typedef struct _fac_code {
@@ -87,8 +89,9 @@ int ilog_facility = LOG_DAEMON;
 
 
 static GHashTable *__log_limiter;
-static pthread_mutex_t __log_limiter_lock;
+static mutex_t __log_limiter_lock = MUTEX_STATIC_INIT;
 static unsigned int __log_limiter_count;
+static bencode_buffer_t __log_limiter_buffer;
 
 
 
@@ -159,34 +162,38 @@ void __vpilog(int prio, const char *prefix, const char *fmt, va_list ap) {
 		len--;
 
 	if ((prio & LOG_FLAG_LIMIT)) {
-		time_t when;
 		struct log_limiter_entry lle, *llep;
 
 		lle.prefix = (char *) prefix;
 		lle.msg = msg;
 
-		pthread_mutex_lock(&__log_limiter_lock);
+		LOCK(&__log_limiter_lock);
 
 		if (__log_limiter_count > 10000) {
 			g_hash_table_remove_all(__log_limiter);
 			__log_limiter_count = 0;
+			bencode_buffer_free(&__log_limiter_buffer);
+			bencode_buffer_init(&__log_limiter_buffer);
 		}
 
 		time_t now = time(NULL);
 
-		when = (time_t) GPOINTER_TO_UINT(g_hash_table_lookup(__log_limiter, &lle));
-		if (!when || (now - when) >= 15) {
-			llep = g_slice_alloc0(sizeof(*llep));
-			llep->prefix = strdup(prefix);
-			llep->msg = strdup(msg);
-			g_hash_table_insert(__log_limiter, llep, GUINT_TO_POINTER(now));
-			__log_limiter_count++;
-			when = 0;
+		llep = g_hash_table_lookup(__log_limiter, &lle);
+		if (!llep || (now - llep->when) >= 15) {
+			llep = bencode_buffer_alloc(&__log_limiter_buffer, sizeof(*llep));
+			if (llep) {
+				*llep = (__typeof(*llep)) {
+					.prefix = bencode_strdup(&__log_limiter_buffer, prefix),
+					.msg = bencode_strdup(&__log_limiter_buffer, msg),
+					.when = now,
+				};
+				g_hash_table_insert(__log_limiter, llep, llep);
+				__log_limiter_count++;
+				llep = NULL;
+			}
 		}
 
-		pthread_mutex_unlock(&__log_limiter_lock);
-
-		if (when)
+		if (llep)
 			return;
 	}
 
@@ -247,17 +254,9 @@ static int log_limiter_entry_equal(const void *a, const void *b) {
 	return 1;
 }
 
-static void log_limiter_entry_free(void *p) {
-	struct log_limiter_entry *lle = p;
-	free(lle->prefix);
-	free(lle->msg);
-	g_slice_free1(sizeof(*lle), lle);
-}
-
 void log_init(const char *handle) {
-	pthread_mutex_init(&__log_limiter_lock, NULL);
-	__log_limiter = g_hash_table_new_full(log_limiter_entry_hash, log_limiter_entry_equal,
-			log_limiter_entry_free, NULL);
+	__log_limiter = g_hash_table_new(log_limiter_entry_hash, log_limiter_entry_equal);
+	bencode_buffer_init(&__log_limiter_buffer);
 
 	if (!rtpe_common_config_ptr->log_stderr)
 		openlog(handle, LOG_PID | LOG_NDELAY, ilog_facility);
@@ -265,7 +264,7 @@ void log_init(const char *handle) {
 
 void log_free(void) {
 	g_hash_table_destroy(__log_limiter);
-	pthread_mutex_destroy(&__log_limiter_lock);
+	bencode_buffer_free(&__log_limiter_buffer);
 }
 
 int parse_log_facility(const char *name, int *dst) {

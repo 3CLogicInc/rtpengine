@@ -99,7 +99,7 @@ const int num_hash_funcs = G_N_ELEMENTS(hash_funcs);
 
 
 static struct dtls_cert *__dtls_cert;
-static rwlock_t __dtls_cert_lock;
+static rwlock_t __dtls_cert_lock = RWLOCK_STATIC_INIT;
 
 
 
@@ -118,9 +118,7 @@ const struct dtls_hash_func *dtls_find_hash_func(const str *s) {
 	return NULL;
 }
 
-static void cert_free(void *p) {
-	struct dtls_cert *cert = p;
-
+static void cert_free(struct dtls_cert *cert) {
 	if (cert->pkey)
 		EVP_PKEY_free(cert->pkey);
 	if (cert->x509)
@@ -321,7 +319,7 @@ static int cert_init(void) {
 
 	/* digest */
 
-	new_cert = obj_alloc0("dtls_cert", sizeof(*new_cert), cert_free);
+	new_cert = obj_alloc0(struct dtls_cert, cert_free);
 
 	for (int i = 0; i < num_hash_funcs; i++) {
 		struct dtls_fingerprint *fp = malloc(sizeof(*fp));
@@ -381,7 +379,6 @@ int dtls_init(void) {
 	int i;
 	char *p;
 
-	rwlock_init(&__dtls_cert_lock);
 	if (cert_init())
 		return -1;
 
@@ -558,7 +555,7 @@ static int try_connect(struct dtls_connection *d) {
 	int ret, code;
 	unsigned char buf[0x10000];
 
-	__DBG("try_connect(%i)", d->active);
+	__DBG("try_connect(%u)", d->active);
 
 	if (d->connected)
 		ret = SSL_read(d->ssl, buf, sizeof(buf)); /* retransmission after connected - handshake lost */
@@ -600,6 +597,51 @@ static int try_connect(struct dtls_connection *d) {
 			ret = -1;
 			break;
 	}
+
+	return ret;
+}
+
+static long dtls_bio_callback(BIO *bio, int oper, const char *argp, size_t len, int argi, long argl,
+		int ret, size_t *proc)
+{
+	if (oper == (BIO_CB_CTRL | BIO_CB_RETURN)) {
+		if (argi == BIO_CTRL_DGRAM_QUERY_MTU)
+			return rtpe_config.dtls_mtu; // this is with overhead already subtracted
+		if (argi == BIO_CTRL_DGRAM_GET_MTU_OVERHEAD)
+			return DTLS_MTU_OVERHEAD;
+		return ret;
+	}
+
+	if (oper != BIO_CB_WRITE)
+		return ret;
+	if (!argp || len <= 0)
+		return ret;
+
+	struct packet_stream *ps = (struct packet_stream *) BIO_get_callback_arg(bio);
+	if (!ps)
+		return ret;
+	struct stream_fd *sfd = ps->selected_sfd;
+	if (!sfd)
+		return ret;
+	struct dtls_connection *d = dtls_ptr(sfd);
+	if (!d)
+		return ret;
+
+	__DBG("dtls packet output: len %zu %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+		len,
+		argp[0], argp[1], argp[2], argp[3],
+		argp[4], argp[5], argp[6], argp[7],
+		argp[8], argp[9], argp[10], argp[11],
+		argp[12], argp[13], argp[14], argp[15]);
+
+	const endpoint_t *fsin = &ps->endpoint;
+	if (fsin->port == 9 || fsin->address.family == NULL)
+		return ret;
+
+	ilogs(srtp, LOG_DEBUG, "Sending DTLS packet");
+	socket_sendto(&sfd->socket, argp, len, fsin);
+	atomic64_inc_na(&ps->stats_out->packets);
+	atomic64_add_na(&ps->stats_out->bytes, len);
 
 	return ret;
 }
@@ -656,15 +698,25 @@ int dtls_connection_init(struct dtls_connection *d, struct packet_stream *ps, in
 	if (!d->r_bio || !d->w_bio)
 		goto error;
 
+	BIO_set_callback_ex(d->w_bio, dtls_bio_callback);
+	BIO_set_callback_arg(d->w_bio, (char *) ps);
+
+#if defined(BIO_CTRL_DGRAM_SET_MTU)
+	BIO_ctrl(d->w_bio, BIO_CTRL_DGRAM_SET_MTU, rtpe_config.dtls_mtu, NULL);
+	BIO_ctrl(d->r_bio, BIO_CTRL_DGRAM_SET_MTU, rtpe_config.dtls_mtu, NULL);
+#endif
+
 	SSL_set_app_data(d->ssl, d);
 	SSL_set_bio(d->ssl, d->r_bio, d->w_bio);
 	d->init = 1;
 	SSL_set_mode(d->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
-	int ec_groups[1] = { NID_X9_62_prime256v1 };
-	SSL_set1_groups(d->ssl, &ec_groups, G_N_ELEMENTS(ec_groups));
-#else // <3.0
+
+        /* SSL_set1_groups_list et al. is not
+         * necessary for OpenSSL >= 1.1.1 as it has sensible defaults
+         * minimally P-521:P-384:P-256
+         */
+#if OPENSSL_VERSION_NUMBER < 0x10101000L
 	EC_KEY* ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
 	if (ecdh == NULL)
 		goto error;
@@ -681,7 +733,7 @@ int dtls_connection_init(struct dtls_connection *d, struct packet_stream *ps, in
 #endif
 #endif
 
-	d->active = active ? -1 : 0;
+	d->active = active ? 1 : 0;
 
 	random_string(d->tls_id, sizeof(d->tls_id));
 
@@ -792,7 +844,6 @@ error:
 int dtls(stream_fd *sfd, const str *s, const endpoint_t *fsin) {
 	struct packet_stream *ps = sfd->stream;
 	int ret;
-	unsigned char buf[0x10000];
 
 	if (!ps)
 		return 0;
@@ -820,6 +871,8 @@ int dtls(stream_fd *sfd, const str *s, const endpoint_t *fsin) {
 		MEDIA_CLEAR(ps->media, SDES);
 	}
 
+	int dret = 0;
+
 	ret = try_connect(d);
 	if (ret == -1) {
 		ilogs(srtp, LOG_ERROR, "DTLS error on local port %u", sfd->socket.local.port);
@@ -834,6 +887,7 @@ int dtls(stream_fd *sfd, const str *s, const endpoint_t *fsin) {
 	}
 	else if (ret == 1) {
 		/* connected! */
+		dret = 1;
 		mutex_lock(&ps->out_lock); // nested lock!
 		if (dtls_setup_crypto(ps, d))
 			{} /* XXX ?? */
@@ -853,43 +907,7 @@ int dtls(stream_fd *sfd, const str *s, const endpoint_t *fsin) {
 		}
 	}
 
-	while (1) {
-		ret = BIO_ctrl_pending(d->w_bio);
-		if (ret <= 0)
-			break;
-
-		if (ret > sizeof(buf)) {
-			ilogs(srtp, LOG_ERROR, "BIO buffer overflow");
-			(void) BIO_reset(d->w_bio);
-			break;
-		}
-
-		ret = BIO_read(d->w_bio, buf, ret);
-		if (ret <= 0)
-			break;
-
-		__DBG("dtls packet output: len %u %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-			ret,
-			buf[0], buf[1], buf[2], buf[3],
-			buf[4], buf[5], buf[6], buf[7],
-			buf[8], buf[9], buf[10], buf[11],
-			buf[12], buf[13], buf[14], buf[15]);
-
-		if (!fsin) {
-			fsin = &ps->endpoint;
-			if (fsin->port == 9 || fsin->address.family == NULL)
-				fsin = NULL;
-		}
-
-		if (fsin) {
-			ilogs(srtp, LOG_DEBUG, "Sending DTLS packet");
-			socket_sendto(&sfd->socket, buf, ret, fsin);
-			atomic64_inc(&ps->stats_out.packets);
-			atomic64_add(&ps->stats_out.bytes, ret);
-		}
-	}
-
-	return 0;
+	return dret;
 }
 
 /* call must be locked */

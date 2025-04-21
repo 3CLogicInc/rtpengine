@@ -105,7 +105,7 @@ static int t38_gateway_handler(t38_core_state_t *stat, void *user_data, const ui
 	g_string_append_len(s, (void *) &seq, 2);
 
 	// add primary IFP packet
-	str buf = STR_INIT_LEN(b, len);
+	str buf = STR_LEN(b, len);
 	__add_udptl(s, &buf);
 
 	// add error correction packets
@@ -237,8 +237,7 @@ static int t38_gateway_handler(t38_core_state_t *stat, void *user_data, const ui
 	return 0;
 }
 
-void __t38_gateway_free(void *p) {
-	struct t38_gateway *tg = p;
+void __t38_gateway_free(struct t38_gateway *tg) {
 	ilog(LOG_DEBUG, "Destroying T.38 gateway");
 	if (tg->gw)
 		t38_gateway_free(tg->gw);
@@ -382,7 +381,7 @@ int t38_gateway_pair(struct call_media *t38_media, struct call_media *pcm_media,
 	ilog(LOG_DEBUG, "Creating new T.38 gateway");
 
 	// create and init new
-	struct t38_gateway *tg = obj_alloc0("t38_gateway", sizeof(*tg), __t38_gateway_free);
+	__auto_type tg = obj_alloc0(struct t38_gateway, __t38_gateway_free);
 
 	tg->t38_media = t38_media;
 	tg->pcm_media = pcm_media;
@@ -392,7 +391,7 @@ int t38_gateway_pair(struct call_media *t38_media, struct call_media *pcm_media,
 	tg->options = opts;
 
 	tg->pcm_pt.payload_type = -1;
-	str_init(&tg->pcm_pt.encoding, "PCM-S16LE");
+	tg->pcm_pt.encoding = STR("PCM-S16LE");
 	tg->pcm_pt.encoding_with_params = tg->pcm_pt.encoding;
 	tg->pcm_pt.clock_rate = 8000;
 	tg->pcm_pt.channels = 1;
@@ -457,13 +456,13 @@ err:
 
 
 // call is locked in W
-void t38_gateway_start(struct t38_gateway *tg) {
+void t38_gateway_start(struct t38_gateway *tg, str_case_value_ht codec_set) {
 	if (!tg)
 		return;
 
 	// set up our player first
 	media_player_set_media(tg->pcm_player, tg->pcm_media);
-	if (media_player_setup(tg->pcm_player, &tg->pcm_pt, NULL))
+	if (media_player_setup(tg->pcm_player, &tg->pcm_pt, NULL, codec_set))
 		return;
 
 	// now start our player if we can or should
@@ -719,7 +718,7 @@ int t38_gateway_input_udptl(struct t38_gateway *tg, const str *buf) {
 							"packet with seq %i from FEC",
 							seq_fec);
 
-					str rec_str = STR_INIT_GS(rec_s);
+					str rec_str = STR_GS(rec_s);
 					__fec_save(tg, &rec_str, seq_fec);
 					up = __make_udptl_packet(&rec_str, seq_fec);
 					packet_sequencer_insert(&tg->sequencer, &up->p);

@@ -5,6 +5,7 @@
 #include "main.h"
 #include "ssrc.h"
 #include "helpers.h"
+#include "bufferpool.h"
 
 int _log_facility_rtcp;
 int _log_facility_cdr;
@@ -13,18 +14,15 @@ struct rtpengine_config rtpe_config;
 struct rtpengine_config initial_rtpe_config;
 struct poller **rtpe_pollers;
 struct poller *rtpe_control_poller;
+struct poller *uring_poller;
 unsigned int num_media_pollers;
 unsigned int rtpe_poller_rr_iter;
-bool (*rtpe_poller_add_item)(struct poller *, struct poller_item *) = poller_add_item;
-bool (*rtpe_poller_del_item)(struct poller *, int) = poller_del_item;
-bool (*rtpe_poller_del_item_callback)(struct poller *, int, void (*)(void *), void *) = poller_del_item_callback;
-void (*rtpe_poller_blocked)(struct poller *, void *) = poller_blocked;
-void (*rtpe_poller_error)(struct poller *, void *) = poller_error;
 GString *dtmf_logs;
 GQueue rtpe_control_ng = G_QUEUE_INIT;
+struct bufferpool *shm_bufferpool;
 
 static str *sdup(char *s) {
-	str r = STR_INIT(s);
+	str r = STR(s);
 	return str_dup(&r);
 }
 static void queue_dump(GString *s, rtp_pt_q *q) {
@@ -91,20 +89,21 @@ static void __start(const char *file, int line) {
 	ZERO(call);
 	obj_hold(&call);
 	call.tags = tags_ht_new();
-	str_init(&call.callid, "test-call");
+	call.callid = STR("test-call");
 	bencode_buffer_init(&call.buffer);
+	call_memory_arena_set(&call);
 	ml_A = __monologue_create(&call);
 	ml_B = __monologue_create(&call);
 	media_A = call_media_new(&call); // originator
 	media_B = call_media_new(&call); // output destination
 	t_queue_push_tail(&media_A->streams, ps_new(&call));
 	t_queue_push_tail(&media_B->streams, ps_new(&call));
-	str_init(&ml_A->tag, "tag_A");
-	str_init(&ml_A->label, "label_A");
+	ml_A->tag = STR("tag_A");
+	ml_A->label = STR("label_A");
 	media_A->monologue = ml_A;
 	media_A->protocol = &transport_protocols[PROTO_RTP_AVP];
-	str_init(&ml_B->tag, "tag_B");
-	str_init(&ml_B->label, "label_B");
+	ml_B->tag = STR("tag_B");
+	ml_B->label = STR("label_B");
 	media_B->monologue = ml_B;
 	media_B->protocol = &transport_protocols[PROTO_RTP_AVP];
 	__init();
@@ -119,7 +118,7 @@ static void __start(const char *file, int line) {
 static void codec_set(char *c) {
 	// from call_ng_flags_str_ht_split
 	c = strdup(c);
-	str s = STR_INIT(c);
+	str s = STR(c);
 	str splitter = s;
 
 	while (1) {
@@ -140,8 +139,8 @@ static void codec_set(char *c) {
 //#define ht_set(ht, s) __ht_set(flags.ht, #s)
 
 #define sdp_pt_fmt_ch(num, codec, clockrate, channels, fmt) \
-	__sdp_pt_fmt(num, (str) STR_CONST_INIT(#codec), clockrate, channels, (str) STR_CONST_INIT(#codec "/" #clockrate), \
-			(str) STR_CONST_INIT(#codec "/" #clockrate "/" #channels), (str) STR_CONST_INIT(fmt))
+	__sdp_pt_fmt(num, (str) STR_CONST(#codec), clockrate, channels, (str) STR_CONST(#codec "/" #clockrate), \
+			(str) STR_CONST(#codec "/" #clockrate "/" #channels), (str) STR_CONST(fmt))
 
 #define sdp_pt_fmt(num, codec, clockrate, fmt) sdp_pt_fmt_ch(num, codec, clockrate, 1, fmt)
 #define sdp_pt_fmt_s(num, codec, clockrate, fmt) sdp_pt_fmt_ch(num, codec, clockrate, 2, fmt)
@@ -154,7 +153,7 @@ static void __sdp_pt_fmt(int num, str codec, int clockrate, int channels, str fu
 		.encoding_with_full_params = full_full,
 		.encoding = codec,
 		.clock_rate = clockrate,
-		.encoding_parameters = STR_CONST_INIT(""),
+		.encoding_parameters = STR_CONST(""),
 		.channels = channels,
 		.format_parameters = *fmtdup,
 		.codec_opts = STR_NULL,
@@ -226,13 +225,13 @@ static void __check_encoder(const char *file, int line, struct call_media *m,
 #endif
 
 #define packet_seq_ts(side, pt_in, pload, rtp_ts, rtp_seq, pt_out, pload_exp, ts_exp, fatal) \
-	__packet_seq_ts( __FILE__, __LINE__, media_ ## side, pt_in, (str) STR_CONST_INIT(pload), \
-			(str) STR_CONST_INIT(pload_exp), ssrc_ ## side, rtp_ts, rtp_seq, pt_out, \
+	__packet_seq_ts( __FILE__, __LINE__, media_ ## side, pt_in, (str) STR_CONST(pload), \
+			(str) STR_CONST(pload_exp), ssrc_ ## side, rtp_ts, rtp_seq, pt_out, \
 			ts_exp, 1, fatal)
 
 #define packet_seq_exp(side, pt_in, pload, rtp_ts, rtp_seq, pt_out, pload_exp, ts_diff_exp) \
-	__packet_seq_ts( __FILE__, __LINE__, media_ ## side, pt_in, (str) STR_CONST_INIT(pload), \
-			(str) STR_CONST_INIT(pload_exp), ssrc_ ## side, rtp_ts, rtp_seq, pt_out, \
+	__packet_seq_ts( __FILE__, __LINE__, media_ ## side, pt_in, (str) STR_CONST(pload), \
+			(str) STR_CONST(pload_exp), ssrc_ ## side, rtp_ts, rtp_seq, pt_out, \
 			-1, ts_diff_exp, 1)
 
 static void __packet_seq_ts(const char *file, int line, struct call_media *media, long long pt_in, str pload,
@@ -252,7 +251,8 @@ static void __packet_seq_ts(const char *file, int line, struct call_media *media
 	str pl_exp = pload_exp;
 
 	// from media_packet_rtp()
-	struct local_intf lif = { };
+	struct interface_stats_block sblock;
+	struct local_intf lif = { .stats = &sblock };
 	stream_fd sfd = {
 		.local_intf = &lif,
 	};
@@ -282,8 +282,7 @@ static void __packet_seq_ts(const char *file, int line, struct call_media *media
 	mp.payload = pl;
 	mp.payload.s = (packet + sizeof(struct rtp_header));
 	memcpy(mp.payload.s, pl.s, pl.len);
-	mp.raw.s = packet;
-	mp.raw.len = packet_len;
+	mp.raw = STR_LEN(packet, packet_len);
 	printf("send RTP SSRC %x seq %u TS %u PT %u\n", (unsigned int) ssrc,
 			(unsigned int) rtp_seq, (unsigned int) rtp_ts, (unsigned int) pt_in);
 	printf("send packet contents: ");
@@ -385,6 +384,7 @@ static void end(void) {
 	if (ml_B)
 		__monologue_free(ml_B);
 	__cleanup();
+	call_memory_arena_release();
 	printf("\n");
 }
 
@@ -416,6 +416,9 @@ static void dtmf(const char *s) {
 
 int main(void) {
 	rtpe_common_config_ptr = &rtpe_config.common;
+	bufferpool_init();
+	media_bufferpool = bufferpool_new(g_malloc, g_free, 4096);
+	shm_bufferpool = bufferpool_new(g_malloc, g_free, 4096);
 
 	unsigned long random_seed = 0;
 
@@ -542,7 +545,7 @@ int main(void) {
 
 #ifdef WITH_AMR_TESTS
 	{
-		str codec_name = STR_CONST_INIT("AMR-WB");
+		str codec_name = STR_CONST("AMR-WB");
 		codec_def_t *def = codec_find(&codec_name, MT_AUDIO);
 		assert(def);
 		if (def->support_encoding && def->support_decoding) {
@@ -600,7 +603,7 @@ int main(void) {
 	}
 
 	{
-		str codec_name = STR_CONST_INIT("AMR");
+		str codec_name = STR_CONST("AMR");
 		codec_def_t *def = codec_find(&codec_name, MT_AUDIO);
 		assert(def);
 		if (def->support_encoding && def->support_decoding) {
@@ -1367,7 +1370,7 @@ int main(void) {
 
 	// CN transcoding
 	rtpe_config.silence_detect_int = 10 << 16;
-	str_init_len(&rtpe_config.cn_payload, "\x40", 1);
+	rtpe_config.cn_payload = STR_LEN("\x40", 1);
 	// CN transcoding - forward
 	start();
 	sdp_pt(8, PCMA, 8000);
@@ -1720,6 +1723,11 @@ int main(void) {
 	expect(A, "96/opus/48000/2");
 	expect(B, "8/PCMA/8000");
 	end();
+
+	statistics_free();
+	bufferpool_destroy(media_bufferpool);
+	bufferpool_destroy(shm_bufferpool);
+	bufferpool_cleanup();
 
 	return 0;
 }

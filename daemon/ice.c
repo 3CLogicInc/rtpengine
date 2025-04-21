@@ -33,10 +33,6 @@
 			STR_FMT_M(&(p)->remote_candidate->foundation),		\
 			(p)->remote_candidate->component_id
 
-struct fragment_key {
-	str call_id;
-	str from_tag;
-};
 struct sdp_fragment {
 	ng_buffer *ngbuf;
 	struct timeval received;
@@ -46,7 +42,7 @@ struct sdp_fragment {
 
 
 
-static void __ice_agent_free(void *p);
+static void __ice_agent_free(struct ice_agent *);
 static void create_random_ice_string(call_t *call, str *s, int len);
 static void __do_ice_checks(struct ice_agent *ag);
 static struct ice_candidate_pair *__pair_lookup(struct ice_agent *, struct ice_candidate *cand,
@@ -87,27 +83,19 @@ const char * const ice_type_strings[] = {
 
 
 
-static unsigned int frag_key_hash(const void *A);
-static int frag_key_eq(const void *A, const void *B);
-static void fragment_key_free(struct fragment_key *);
-
-TYPED_GQUEUE(fragment, struct sdp_fragment)
-TYPED_GHASHTABLE(fragments_ht, struct fragment_key, fragment_q, frag_key_hash, frag_key_eq,
-		fragment_key_free, NULL)
-TYPED_GHASHTABLE_LOOKUP_INSERT(fragments_ht, fragment_key_free, fragment_q_new)
-
-static mutex_t sdp_fragments_lock;
-static fragments_ht sdp_fragments;
+TYPED_GHASHTABLE_LOOKUP_INSERT(fragments_ht, NULL, fragment_q_new)
 
 
 
-static void ice_update_media_streams(struct call_monologue *ml, sdp_streams_q *streams) {
+static void ice_update_media_streams(struct call_monologue *ml, sdp_streams_q *streams,
+		sdp_ng_flags *flags)
+{
 	for (__auto_type l = streams->head; l; l = l->next) {
 		struct stream_params *sp = l->data;
 		struct call_media *media = NULL;
 
 		if (sp->media_id.len)
-			media = g_hash_table_lookup(ml->media_ids, &sp->media_id);
+			media = t_hash_table_lookup(ml->media_ids, &sp->media_id);
 		else if (sp->index > 0) {
 			unsigned int arr_idx = sp->index - 1;
 			if (arr_idx < ml->medias->len)
@@ -133,48 +121,28 @@ static void ice_update_media_streams(struct call_monologue *ml, sdp_streams_q *s
 }
 
 
-static unsigned int frag_key_hash(const void *A) {
-	const struct fragment_key *a = A;
-	return str_hash(&a->call_id) ^ str_hash(&a->from_tag);
-}
-static int frag_key_eq(const void *A, const void *B) {
-	const struct fragment_key *a = A;
-	const struct fragment_key *b = B;
-	return str_equal(&a->call_id, &b->call_id)
-		&& str_equal(&a->from_tag, &b->from_tag);
-}
-
 static void fragment_free(struct sdp_fragment *frag) {
 	sdp_streams_clear(&frag->streams);
 	call_ng_free_flags(&frag->flags);
 	obj_put(frag->ngbuf);
 	g_slice_free1(sizeof(*frag), frag);
 }
-static void fragment_key_free(struct fragment_key *k) {
-	g_free(k->call_id.s);
-	g_free(k->from_tag.s);
-	g_slice_free1(sizeof(*k), k);
-}
-static void queue_sdp_fragment(ng_buffer *ngbuf, sdp_streams_q *streams, sdp_ng_flags *flags) {
+static void queue_sdp_fragment(ng_buffer *ngbuf, call_t *call, str *key, sdp_streams_q *streams, sdp_ng_flags *flags) {
 	ilog(LOG_DEBUG, "Queuing up SDP fragment for " STR_FORMAT_M "/" STR_FORMAT_M,
 			STR_FMT_M(&flags->call_id), STR_FMT_M(&flags->from_tag));
-
-	struct fragment_key *k = g_slice_alloc0(sizeof(*k));
-	str_init_dup_str(&k->call_id, &flags->call_id);
-	str_init_dup_str(&k->from_tag, &flags->from_tag);
 
 	struct sdp_fragment *frag = g_slice_alloc0(sizeof(*frag));
 	frag->received = rtpe_now;
 	frag->ngbuf = obj_get(ngbuf);
-	frag->streams = *streams;
+	if (streams) {
+		frag->streams = *streams;
+		t_queue_init(streams);
+	}
 	frag->flags = *flags;
-	t_queue_init(streams);
 	ZERO(*flags);
 
-	mutex_lock(&sdp_fragments_lock);
-	fragment_q *frags = fragments_ht_lookup_insert(sdp_fragments, k);
+	fragment_q *frags = fragments_ht_lookup_insert(call->sdp_fragments, call_str_dup(key));
 	t_queue_push_tail(frags, frag);
-	mutex_unlock(&sdp_fragments_lock);
 }
 bool trickle_ice_update(ng_buffer *ngbuf, call_t *call, sdp_ng_flags *flags,
 		sdp_streams_q *streams)
@@ -182,37 +150,27 @@ bool trickle_ice_update(ng_buffer *ngbuf, call_t *call, sdp_ng_flags *flags,
 	if (!flags->fragment)
 		return false;
 
-	if (!call) {
-		queue_sdp_fragment(ngbuf, streams, flags);
-		return true;
-	}
 	struct call_monologue *ml = call_get_monologue(call, &flags->from_tag);
 	if (!ml) {
-		queue_sdp_fragment(ngbuf, streams, flags);
+		queue_sdp_fragment(ngbuf, call, &flags->from_tag, streams, flags);
 		return true;
 	}
 
-	ice_update_media_streams(ml, streams);
+	ice_update_media_streams(ml, streams, flags);
 
 	return true;
 }
 #define MAX_FRAG_AGE 3000000
 void dequeue_sdp_fragments(struct call_monologue *monologue) {
-	struct fragment_key k;
-	ZERO(k);
-	k.call_id = monologue->call->callid;
-	k.from_tag = monologue->tag;
+	call_t *call = monologue->call;
 
 	fragment_q *frags = NULL;
 
-	{
-		LOCK(&sdp_fragments_lock);
-		t_hash_table_steal_extended(sdp_fragments, &k, NULL, &frags);
-		if (!frags)
-			return;
+	t_hash_table_steal_extended(call->sdp_fragments, &monologue->tag, NULL, &frags);
+	if (!frags)
+		return;
 
-		// we own the queue now
-	}
+	// we own the queue now
 
 	struct sdp_fragment *frag;
 	while ((frag = t_queue_pop_head(frags))) {
@@ -220,9 +178,9 @@ void dequeue_sdp_fragments(struct call_monologue *monologue) {
 			goto next;
 
 		ilog(LOG_DEBUG, "Dequeuing SDP fragment for " STR_FORMAT_M "/" STR_FORMAT_M,
-				STR_FMT_M(&k.call_id), STR_FMT_M(&k.from_tag));
+				STR_FMT_M(&call->callid), STR_FMT_M(&monologue->tag));
 
-		ice_update_media_streams(monologue, &frag->streams);
+		ice_update_media_streams(monologue, &frag->streams, &frag->flags);
 
 next:
 		fragment_free(frag);
@@ -230,7 +188,7 @@ next:
 
 	t_queue_free(frags);
 }
-static gboolean fragment_check_cleanup(struct fragment_key *key, fragment_q *frags, void *p) {
+static gboolean fragment_check_cleanup(str *key, fragment_q *frags, void *p) {
 	bool all = GPOINTER_TO_INT(p);
 	if (!key || !frags)
 		return TRUE;
@@ -247,10 +205,8 @@ static gboolean fragment_check_cleanup(struct fragment_key *key, fragment_q *fra
 	}
 	return FALSE;
 }
-static void fragments_cleanup(bool all) {
-	mutex_lock(&sdp_fragments_lock);
-	t_hash_table_foreach_remove(sdp_fragments, fragment_check_cleanup, GINT_TO_POINTER(all));
-	mutex_unlock(&sdp_fragments_lock);
+void ice_fragments_cleanup(fragments_ht ht, bool all) {
+	t_hash_table_foreach_remove(ht, fragment_check_cleanup, GINT_TO_POINTER(all));
 }
 
 
@@ -346,39 +302,31 @@ static struct ice_candidate_pair *__pair_candidate(stream_fd *sfd, struct ice_ag
 	return pair;
 }
 
-static unsigned int __pair_hash(const void *p) {
-	const struct ice_candidate_pair *pair = p;
+static unsigned int __pair_hash(const struct ice_candidate_pair *pair) {
 	return g_direct_hash(pair->local_intf) ^ g_direct_hash(pair->remote_candidate);
 }
-static int __pair_equal(const void *a, const void *b) {
-	const struct ice_candidate_pair *A = a, *B = b;
+static int __pair_equal(const struct ice_candidate_pair *A, const struct ice_candidate_pair *B) {
 	return A->local_intf == B->local_intf
 		&& A->remote_candidate == B->remote_candidate;
 }
-static unsigned int __cand_hash(const void *p) {
-	const struct ice_candidate *cand = p;
+static unsigned int __cand_hash(const struct ice_candidate *cand) {
 	return endpoint_hash(&cand->endpoint) ^ cand->component_id;
 }
-static int __cand_equal(const void *a, const void *b) {
-	const struct ice_candidate *A = a, *B = b;
+static int __cand_equal(const struct ice_candidate *A, const struct ice_candidate *B) {
 	return endpoint_eq(&A->endpoint, &B->endpoint)
 		&& A->component_id == B->component_id;
 }
-static unsigned int __found_hash(const void *p) {
-	const struct ice_candidate *cand = p;
+static unsigned int __found_hash(const struct ice_candidate *cand) {
 	return str_hash(&cand->foundation) ^ cand->component_id;
 }
-static int __found_equal(const void *a, const void *b) {
-	const struct ice_candidate *A = a, *B = b;
+static int __found_equal(const struct ice_candidate *A, const struct ice_candidate *B) {
 	return str_equal(&A->foundation, &B->foundation)
 		&& A->component_id == B->component_id;
 }
-static unsigned int __trans_hash(const void *p) {
-	const uint32_t *tp = p;
+static unsigned int __trans_hash(const uint32_t *tp) {
 	return tp[0] ^ tp[1] ^ tp[2];
 }
-static int __trans_equal(const void *a, const void *b) {
-	const uint32_t *A = a, *B = b;
+static int __trans_equal(const uint32_t *A, const uint32_t *B) {
 	return A[0] == B[0] && A[1] == B[1] && A[2] == B[2];
 }
 static int __pair_prio_cmp(const void *a, const void *b) {
@@ -430,14 +378,14 @@ static void __ice_agent_initialize(struct ice_agent *ag) {
 	create_random_ice_string(call, &ag->ufrag[1], 8);
 	create_random_ice_string(call, &ag->pwd[1], 26);
 
-	atomic64_set(&ag->last_activity, rtpe_now.tv_sec);
+	atomic64_set_na(&ag->last_activity, rtpe_now.tv_sec);
 }
 
 static struct ice_agent *__ice_agent_new(struct call_media *media) {
 	struct ice_agent *ag;
 	call_t *call = media->call;
 
-	ag = obj_alloc0("ice_agent", sizeof(*ag), __ice_agent_free);
+	ag = obj_alloc0(struct ice_agent, __ice_agent_free);
 	ag->tt_obj.tt = &ice_agents_timer_thread;
 	ag->tt_obj.thread = &ice_agents_timer_thread.threads[0]; // there's only one thread
 	ag->call = obj_get(call);
@@ -462,7 +410,7 @@ void ice_agent_init(struct ice_agent **agp, struct call_media *media) {
 static int __copy_cand(call_t *call, struct ice_candidate *dst, const struct ice_candidate *src) {
 	int eq = (dst->priority == src->priority);
 	*dst = *src;
-	call_str_cpy(call, &dst->foundation, &src->foundation);
+	dst->foundation = call_str_cpy(&src->foundation);
 	return eq ? 0 : 1;
 }
 
@@ -512,7 +460,7 @@ void ice_update(struct ice_agent *ag, struct stream_params *sp, bool allow_reset
 
 	log_info_ice_agent(ag);
 
-	atomic64_set(&ag->last_activity, rtpe_now.tv_sec);
+	atomic64_set_na(&ag->last_activity, rtpe_now.tv_sec);
 	media = ag->media;
 	call = media->call;
 
@@ -528,9 +476,9 @@ void ice_update(struct ice_agent *ag, struct stream_params *sp, bool allow_reset
 
 		/* update remote info */
 		if (sp->ice_ufrag.s)
-			call_str_cpy(call, &ag->ufrag[0], &sp->ice_ufrag);
+			ag->ufrag[0] = call_str_cpy(&sp->ice_ufrag);
 		if (sp->ice_pwd.s)
-			call_str_cpy(call, &ag->pwd[0], &sp->ice_pwd);
+			ag->pwd[0] = call_str_cpy(&sp->ice_pwd);
 
 		candidates = &sp->ice_candidates;
 	}
@@ -700,9 +648,7 @@ static void __ice_agent_free_components(struct ice_agent *ag) {
 	ice_candidates_free(&ag->remote_candidates);
 	ice_candidate_pairs_free(&ag->candidate_pairs);
 }
-static void __ice_agent_free(void *p) {
-	struct ice_agent *ag = p;
-
+static void __ice_agent_free(struct ice_agent *ag) {
 	if (!ag) {
 		ilogs(ice, LOG_ERR, "ice ag is NULL");
 		return;
@@ -753,22 +699,10 @@ static void __agent_deschedule(struct ice_agent *ag) {
 void ice_init(void) {
 	random_string((void *) &tie_breaker, sizeof(tie_breaker));
 	timerthread_init(&ice_agents_timer_thread, 1, ice_agents_timer_run);
-
-	sdp_fragments = fragments_ht_new();
-	mutex_init(&sdp_fragments_lock);
 }
 
 void ice_free(void) {
 	timerthread_free(&ice_agents_timer_thread);
-
-	fragments_cleanup(true);
-	t_hash_table_destroy_ptr(&sdp_fragments);
-	mutex_destroy(&sdp_fragments_lock);
-}
-
-enum thread_looper_action ice_slow_timer(void) {
-	fragments_cleanup(false);
-	return TLA_CONTINUE;
 }
 
 static void __fail_pair(struct ice_candidate_pair *pair) {
@@ -894,7 +828,7 @@ static void __do_ice_checks(struct ice_agent *ag) {
 	if (!ag->pwd[0].s)
 		return;
 
-	atomic64_set(&ag->last_activity, rtpe_now.tv_sec);
+	atomic64_set_na(&ag->last_activity, rtpe_now.tv_sec);
 
 	__DBG("running checks, call "STR_FORMAT" tag "STR_FORMAT"", STR_FMT(&ag->call->callid),
 			STR_FMT(&ag->media->monologue->tag));
@@ -1037,7 +971,7 @@ static void __cand_ice_foundation(call_t *call, struct ice_candidate *cand) {
 
 	len = sprintf(buf, "%x%x%x", endpoint_hash(&cand->endpoint),
 			cand->type, g_direct_hash(cand->transport));
-	call_str_cpy_len(call, &cand->foundation, buf, len);
+	cand->foundation = call_str_cpy_len(buf, len);
 }
 
 /* agent must be locked */
@@ -1307,7 +1241,7 @@ int ice_request(stream_fd *sfd, const endpoint_t *src,
 	if (!ag)
 		return -1;
 
-	atomic64_set(&ag->last_activity, rtpe_now.tv_sec);
+	atomic64_set_na(&ag->last_activity, rtpe_now.tv_sec);
 
 	/* determine candidate pair */
 	{
@@ -1416,7 +1350,7 @@ int ice_response(stream_fd *sfd, const endpoint_t *src,
 	if (!ag)
 		return -1;
 
-	atomic64_set(&ag->last_activity, rtpe_now.tv_sec);
+	atomic64_set_na(&ag->last_activity, rtpe_now.tv_sec);
 
 	{
 		LOCK(&ag->lock);
@@ -1562,11 +1496,11 @@ static void create_random_ice_string(call_t *call, str *s, int len) {
 		return;
 
 	random_ice_string(buf, len);
-	call_str_cpy_len(call, s, buf, len);
+	*s = call_str_cpy_len(buf, len);
 }
 
 void ice_foundation(str *s) {
-	str_init_len(s, malloc(ICE_FOUNDATION_LENGTH), ICE_FOUNDATION_LENGTH);
+	*s = STR_LEN(malloc(ICE_FOUNDATION_LENGTH), ICE_FOUNDATION_LENGTH);
 	random_ice_string(s->s, ICE_FOUNDATION_LENGTH);
 }
 

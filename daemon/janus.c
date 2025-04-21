@@ -14,9 +14,10 @@
 #include "ice.h"
 #include "log_funcs.h"
 
-TYPED_GHASHTABLE(janus_handles_set, uint64_t, void, g_int64_hash, g_int64_equal, NULL, NULL)
+TYPED_GHASHTABLE(janus_handles_set, uint64_t, void, int64_hash, int64_eq, NULL, NULL)
+TYPED_DIRECT_FUNCS(websocket_conn_direct_hash, websocket_conn_direct_eq, struct websocket_conn)
 TYPED_GHASHTABLE(janus_websockets_ht, struct websocket_conn, struct websocket_conn,
-		g_direct_hash, g_direct_equal, NULL, NULL)
+		websocket_conn_direct_hash, websocket_conn_direct_eq, NULL, NULL)
 
 struct janus_session { // "login" session
 	struct obj obj;
@@ -27,7 +28,7 @@ struct janus_session { // "login" session
 	janus_handles_set handles; // handle ID -> 0x1. handle ID owned by janus_handles
 };
 
-TYPED_GHASHTABLE(janus_sessions_ht, uint64_t, struct janus_session, g_int64_hash, g_int64_equal, NULL, NULL)
+TYPED_GHASHTABLE(janus_sessions_ht, uint64_t, struct janus_session, int64_hash, int64_eq, NULL, __obj_put)
 
 
 struct janus_handle { // corresponds to a conference participant
@@ -36,10 +37,10 @@ struct janus_handle { // corresponds to a conference participant
 	uint64_t room;
 };
 
-TYPED_GHASHTABLE(janus_handles_ht, uint64_t, struct janus_handle, g_int64_hash, g_int64_equal, NULL, NULL)
+TYPED_GHASHTABLE(janus_handles_ht, uint64_t, struct janus_handle, int64_hash, int64_eq, NULL, NULL)
 
 
-TYPED_GHASHTABLE(janus_feeds_ht, uint64_t, uint64_t, g_int64_hash, g_int64_equal, g_free, g_free)
+TYPED_GHASHTABLE(janus_feeds_ht, uint64_t, uint64_t, int64_hash, int64_eq, g_free, g_free)
 
 struct janus_room {
 	uint64_t id;
@@ -51,21 +52,20 @@ struct janus_room {
 	janus_feeds_ht feeds; // feed ID -> handle ID
 };
 
-TYPED_GHASHTABLE(janus_rooms_ht, uint64_t, struct janus_room, g_int64_hash, g_int64_equal, NULL, NULL)
+TYPED_GHASHTABLE(janus_rooms_ht, uint64_t, struct janus_room, int64_hash, int64_eq, NULL, NULL)
 
 
-TYPED_GHASHTABLE(janus_tokens_ht, char, time_t, g_str_hash, g_str_equal, g_free, g_free)
+TYPED_GHASHTABLE(janus_tokens_ht, char, time_t, c_str_hash, c_str_equal, g_free, g_free)
 
 
-static mutex_t janus_lock;
+static mutex_t janus_lock = MUTEX_STATIC_INIT;
 static janus_tokens_ht janus_tokens; // auth tokens, currently mostly unused
 static janus_sessions_ht janus_sessions; // session ID -> session. holds a session reference
 static janus_handles_ht janus_handles; // handle ID -> handle
 static janus_rooms_ht janus_rooms; // room ID -> room
 
 
-static void __janus_session_free(void *p) {
-	struct janus_session *s = p;
+static void __janus_session_free(struct janus_session *s) {
 	if (t_hash_table_size(s->websockets) != 0)
 		ilog(LOG_WARN, "Janus session is leaking %i WS references", t_hash_table_size(s->websockets));
 	t_hash_table_destroy(s->websockets);
@@ -120,7 +120,7 @@ static struct call_monologue *janus_get_monologue(uint64_t handle_id, call_t *ca
 {
 	g_autoptr(char) handle_buf = NULL;
 	handle_buf = g_strdup_printf("%" PRIu64, handle_id);
-	str handle_str = STR_INIT(handle_buf);
+	str handle_str = STR(handle_buf);
 
 	return fn(call, &handle_str);
 }
@@ -226,8 +226,7 @@ static const char *janus_videoroom_create(struct janus_session *session, struct 
 		room->id = room_id;
 		if (t_hash_table_lookup(janus_rooms, &room->id))
 			continue;
-		room->call_id.s = janus_call_id(room_id);
-		room->call_id.len = strlen(room->call_id.s);
+		room->call_id = STR(janus_call_id(room_id));
 		call_t *call = call_get_or_create(&room->call_id, true);
 		if (!call) {
 			ilog(LOG_WARN, "Call with reserved Janus ID '" STR_FORMAT
@@ -334,17 +333,17 @@ static void janus_add_publisher_details(JsonBuilder *builder, struct call_monolo
 	json_builder_set_member_name(builder, "streams");
 	json_builder_begin_array(builder);
 
-	const char *a_codec = NULL, *v_codec = NULL;
+	str *a_codec = NULL, *v_codec = NULL;
 
 	for (unsigned int i = 0; i < ml->medias->len; i++) {
 		struct call_media *media = ml->medias->pdata[i];
 		if (!media)
 			continue;
 
-		const char *codec = NULL;
+		str *codec = NULL;
 		for (__auto_type k = media->codecs.codec_prefs.head; k; k = k->next) {
 			rtp_payload_type *pt = k->data;
-			codec = pt->encoding.s;
+			codec = &pt->encoding;
 			// XXX check codec support?
 			break;
 		}
@@ -352,13 +351,13 @@ static void janus_add_publisher_details(JsonBuilder *builder, struct call_monolo
 		json_builder_begin_object(builder);
 
 		json_builder_set_member_name(builder, "type");
-		json_builder_add_string_value(builder, media->type.s);
+		glib_json_builder_add_str(builder, &media->type);
 		json_builder_set_member_name(builder, "mindex");
 		json_builder_add_int_value(builder, media->index - 1);
 
 		json_builder_set_member_name(builder, "mid");
 		if (media->media_id.s)
-			json_builder_add_string_value(builder, media->media_id.s);
+			glib_json_builder_add_str(builder, &media->media_id);
 		else
 			json_builder_add_null_value(builder);
 
@@ -368,7 +367,7 @@ static void janus_add_publisher_details(JsonBuilder *builder, struct call_monolo
 		}
 		else if (codec) {
 			json_builder_set_member_name(builder, "codec");
-			json_builder_add_string_value(builder, codec);
+			glib_json_builder_add_str(builder, codec);
 
 			if (media->type_id == MT_AUDIO && !a_codec)
 				a_codec = codec;
@@ -383,12 +382,12 @@ static void janus_add_publisher_details(JsonBuilder *builder, struct call_monolo
 
 	if (a_codec) {
 		json_builder_set_member_name(builder, "audio_codec");
-		json_builder_add_string_value(builder, a_codec);
+		glib_json_builder_add_str(builder, a_codec);
 	}
 
 	if (v_codec) {
 		json_builder_set_member_name(builder, "video_codec");
-		json_builder_add_string_value(builder, v_codec);
+		glib_json_builder_add_str(builder, v_codec);
 	}
 
 	// TODO add "display"
@@ -625,21 +624,14 @@ static const char *janus_videoroom_join(struct websocket_message *wm, struct jan
 				call_get_or_create_monologue);
 
 		g_auto(sdp_ng_flags) flags;
-		call_ng_flags_init(&flags, OP_REQUEST);
+		call_ng_flags_init(&flags, OP_SUBSCRIBE_REQ);
 
 		flags.generate_mid = 1;
 		flags.rtcp_mirror = 1;
+		flags.replace_origin_full = 1;
 
-		if (!plain_offer) {
-			// set all WebRTC-specific attributes
-			flags.transport_protocol = &transport_protocols[PROTO_UDP_TLS_RTP_SAVPF];
-			flags.ice_option = ICE_FORCE;
-			flags.trickle_ice = 1;
-			flags.rtcp_mux_offer = 1;
-			flags.rtcp_mux_require = 1;
-			flags.no_rtcp_attr = 1;
-			flags.sdes_off = 1;
-		}
+		if (!plain_offer)
+			ng_flags_webrtc(&flags);
 		else {
 			flags.transport_protocol = &transport_protocols[PROTO_RTP_AVP];
 			flags.ice_option = ICE_REMOVE;
@@ -857,7 +849,7 @@ static const char *janus_videoroom_configure(struct websocket_message *wm, struc
 		if (strcmp(jsep_type, "offer"))
 			return "Not an offer";
 
-		g_auto(str) sdp_in = STR_INIT_DUP(jsep_sdp);
+		str sdp_in = call_str_cpy_c(jsep_sdp);
 
 		g_auto(sdp_ng_flags) flags;
 		g_auto(sdp_sessions_q) parsed = TYPED_GQUEUE_INIT;
@@ -873,6 +865,7 @@ static const char *janus_videoroom_configure(struct websocket_message *wm, struc
 
 		// accept unsupported codecs if necessary
 		flags.accept_any = 1;
+		flags.replace_origin_full = 1;
 
 		int ret = monologue_publish(ml, &streams, &flags);
 		if (ret)
@@ -961,7 +954,15 @@ static const char *janus_videoroom_start(struct websocket_message *wm, struct ja
 	if (strcmp(jsep_type, "answer"))
 		return "Not an answer";
 
-	g_auto(str) sdp_in = STR_INIT_DUP(jsep_sdp);
+	struct janus_room *room = t_hash_table_lookup(janus_rooms, &room_id);
+	*retcode = 426;
+	if (!room)
+		return "No such room";
+	g_autoptr(call_t) call = call_get(&room->call_id);
+	if (!call)
+		return "No such room";
+
+	str sdp_in = call_str_cpy_c(jsep_sdp);
 
 	g_auto(sdp_ng_flags) flags;
 	g_auto(sdp_sessions_q) parsed = TYPED_GQUEUE_INIT;
@@ -970,16 +971,11 @@ static const char *janus_videoroom_start(struct websocket_message *wm, struct ja
 	*retcode = 512;
 	if (sdp_parse(&sdp_in, &parsed, &flags))
 		return "Failed to parse SDP";
+
+	*retcode = 512;
 	if (sdp_streams(&parsed, &streams, &flags))
 		return "Incomplete SDP specification";
 
-	struct janus_room *room = t_hash_table_lookup(janus_rooms, &room_id);
-	*retcode = 426;
-	if (!room)
-		return "No such room";
-	g_autoptr(call_t) call = call_get(&room->call_id);
-	if (!call)
-		return "No such room";
 	*retcode = 456;
 	uint64_t *feed_id = t_hash_table_lookup(room->subscribers, &handle->id);
 	if (!feed_id)
@@ -1088,7 +1084,7 @@ static const char *janus_videoroom(struct websocket_message *wm, struct janus_se
 	const char *req = json_reader_get_string_value(reader);
 	if (!req)
 		goto err;
-	str req_str = STR_INIT(req);
+	str req_str = STR(req);
 	json_reader_end_member(reader);
 
 	switch (__csh_lookup(&req_str)) {
@@ -1181,7 +1177,7 @@ static const char *janus_create(JsonReader *reader, JsonBuilder *builder, struct
 		session_id = jr_str_int(reader);
 	json_reader_end_member(reader);
 
-	struct janus_session *session = obj_alloc0("janus_session", sizeof(*session), __janus_session_free);
+	__auto_type session = obj_alloc0(struct janus_session, __janus_session_free);
 	mutex_init(&session->lock);
 	mutex_lock(&session->lock); // not really necessary but Coverity complains
 	session->last_act = rtpe_now.tv_sec;
@@ -1284,11 +1280,11 @@ void janus_media_up(struct call_media *media) {
 	json_builder_add_int_value(builder, handle);
 	json_builder_set_member_name(builder, "mid");
 	if (media->media_id.s)
-		json_builder_add_string_value(builder, media->media_id.s);
+		glib_json_builder_add_str(builder, &media->media_id);
 	else
 		json_builder_add_null_value(builder);
 	json_builder_set_member_name(builder, "type");
-	json_builder_add_string_value(builder, media->type.s);
+	glib_json_builder_add_str(builder, &media->type);
 	json_builder_set_member_name(builder, "receiving");
 	json_builder_add_boolean_value(builder, true);
 	json_builder_end_object(builder); // }
@@ -1467,8 +1463,11 @@ static const char *janus_destroy(struct websocket_message *wm, JsonReader *reade
 
 	struct janus_session *ht_session = NULL;
 	t_hash_table_steal_extended(janus_sessions, &session->id, NULL, &ht_session);
-	if (ht_session != session)
+	if (ht_session != session) {
+		if (ht_session) // return wrongly stolen session
+			t_hash_table_insert(janus_sessions, &ht_session->id, ht_session);
 		return "Sesssion ID not found"; // already removed/destroyed
+	}
 
 	janus_session_cleanup(session);
 	obj_put(session);
@@ -1541,12 +1540,11 @@ static const char *janus_message(struct websocket_message *wm, JsonReader *reade
 		json_builder_set_member_name(builder, "type");
 		json_builder_add_string_value(builder, jsep_type_out);
 		json_builder_set_member_name(builder, "sdp");
-		json_builder_add_string_value(builder, jsep_sdp_out.s);
+		glib_json_builder_add_str(builder, &jsep_sdp_out);
 		json_builder_end_object(builder); // }
 	}
 
 	return err;
-
 }
 
 
@@ -1617,9 +1615,15 @@ static const char *janus_trickle(JsonReader *reader, struct janus_session *sessi
 		call_id = janus_call_id(handle->room);
 
 		struct janus_room *room = t_hash_table_lookup(janus_rooms, &handle->room);
-
-		if (room)
-			call = call_get(&room->call_id);
+		if (!room) {
+			*retcode = 426;
+			return "No such room";
+		}
+		call = call_get(&room->call_id);
+		if (!call) {
+			*retcode = 426;
+			return "No such room";
+		}
 	}
 
 	// set up "streams" structures to use an trickle ICE update. these must be
@@ -1631,6 +1635,7 @@ static const char *janus_trickle(JsonReader *reader, struct janus_session *sessi
 	// top-level structures first, with auto cleanup
 	g_auto(sdp_streams_q) streams = TYPED_GQUEUE_INIT;
 	g_autoptr(ng_buffer) ngbuf = ng_buffer_new(NULL);
+	bencode_buffer_init(&ngbuf->buffer);
 	g_auto(sdp_ng_flags) flags;
 	call_ng_flags_init(&flags, OP_OTHER);
 
@@ -1642,7 +1647,7 @@ static const char *janus_trickle(JsonReader *reader, struct janus_session *sessi
 
 	// allocate and parse candidate
 	str cand_str;
-	bencode_strdup_str(&ngbuf->buffer, &cand_str, candidate);
+	cand_str = bencode_strdup_str(&ngbuf->buffer, candidate);
 	str_shift_cmp(&cand_str, "candidate:"); // skip prefix
 	if (!cand_str.len) // end of candidates
 		return NULL;
@@ -1659,12 +1664,12 @@ static const char *janus_trickle(JsonReader *reader, struct janus_session *sessi
 
 	g_autoptr(char) handle_buf = NULL;
 	handle_buf = g_strdup_printf("%" PRIu64, handle_id);
-	bencode_strdup_str(&ngbuf->buffer, &flags.from_tag, handle_buf);
-	bencode_strdup_str(&ngbuf->buffer, &flags.call_id, call_id);
+	flags.from_tag = bencode_strdup_str(&ngbuf->buffer, handle_buf);
+	flags.call_id = bencode_strdup_str(&ngbuf->buffer, call_id);
 
 	// populate and allocate a=mid
 	if (sdp_mid)
-		bencode_strdup_str(&ngbuf->buffer, &sp->media_id, sdp_mid);
+		sp->media_id = bencode_strdup_str(&ngbuf->buffer, sdp_mid);
 
 	// check m= line index
 	if (sdp_m_line >= 0)
@@ -1673,7 +1678,7 @@ static const char *janus_trickle(JsonReader *reader, struct janus_session *sessi
 	// ufrag can be given in-line or separately
 	sp->ice_ufrag = cand->ufrag;
 	if (!sp->ice_ufrag.len && ufrag)
-		bencode_strdup_str(&ngbuf->buffer, &sp->ice_ufrag, ufrag);
+		sp->ice_ufrag = bencode_strdup_str(&ngbuf->buffer, ufrag);
 
 	// finally do the update
 	trickle_ice_update(ngbuf, call, &flags, &streams);
@@ -1792,7 +1797,7 @@ static const char *websocket_janus_process_json(struct websocket_message *wm,
 
 	ilog(LOG_DEBUG, "Processing '%s' type Janus message", janus_cmd);
 
-	str janus_cmd_str = STR_INIT(janus_cmd);
+	str janus_cmd_str = STR(janus_cmd);
 
 	err = NULL;
 
@@ -1907,7 +1912,7 @@ const char *websocket_janus_process(struct websocket_message *wm) {
 
 
 const char *websocket_janus_get(struct websocket_message *wm) {
-	str uri = STR_INIT(wm->uri);
+	str uri = STR(wm->uri);
 
 	ilog(LOG_DEBUG, "Processing Janus GET: '%s'", wm->uri);
 
@@ -1940,7 +1945,7 @@ const char *websocket_janus_get(struct websocket_message *wm) {
 
 
 const char *websocket_janus_post(struct websocket_message *wm) {
-	str uri = STR_INIT(wm->uri);
+	str uri = STR(wm->uri);
 
 	ilog(LOG_DEBUG, "Processing Janus POST: '%s'", wm->uri);
 
@@ -1951,14 +1956,14 @@ const char *websocket_janus_post(struct websocket_message *wm) {
 
 	// parse out session ID and handle ID if given
 	str s;
-	if (str_token_sep(&s, &uri, '/'))
+	if (!str_token_sep(&s, &uri, '/'))
 		goto done;
 	if (str_cmp(&s, "janus"))
 		goto done;
-	if (str_token_sep(&s, &uri, '/'))
+	if (!str_token_sep(&s, &uri, '/'))
 		goto done;
 	session_id = str_to_ui(&s, 0);
-	if (str_token_sep(&s, &uri, '/'))
+	if (!str_token_sep(&s, &uri, '/'))
 		goto done;
 	handle_id = str_to_ui(&s, 0);
 
@@ -1968,7 +1973,6 @@ done:
 
 
 void janus_init(void) {
-	mutex_init(&janus_lock);
 	janus_tokens = janus_tokens_ht_new();
 	janus_sessions = janus_sessions_ht_new();
 	janus_handles = janus_handles_ht_new();
@@ -1976,7 +1980,6 @@ void janus_init(void) {
 	// XXX timer thread to clean up orphaned sessions
 }
 void janus_free(void) {
-	mutex_destroy(&janus_lock);
 	t_hash_table_destroy(janus_tokens);
 	t_hash_table_destroy(janus_sessions);
 	t_hash_table_destroy(janus_handles);

@@ -51,7 +51,7 @@ static bool audio_player_run(struct media_player *mp) {
 
 // call locked in W
 bool audio_player_setup(struct call_media *m, const rtp_payload_type *dst_pt,
-		unsigned int size_ms, unsigned int delay_ms)
+		unsigned int size_ms, unsigned int delay_ms, str_case_value_ht codec_set)
 {
 	if (!dst_pt)
 		return false;
@@ -72,7 +72,7 @@ bool audio_player_setup(struct call_media *m, const rtp_payload_type *dst_pt,
 	// TODO: shortcut this to avoid the detour of avframe -> avpacket -> avframe (all in s16)
 	rtp_payload_type src_pt = {
 		.payload_type = -1,
-		.encoding = STR_CONST_INIT("PCM-S16LE"), // XXX support flp
+		.encoding = STR_CONST("PCM-S16LE"), // XXX support flp
 		.channels = dst_pt->channels,
 		.clock_rate = clockrate,
 		.ptime = ptime_ms,
@@ -123,7 +123,7 @@ bool audio_player_setup(struct call_media *m, const rtp_payload_type *dst_pt,
 	ap->ptime_us = ptime_us;
 	ap->ptime = ptime_smp;
 
-	if (media_player_setup(mp, &src_pt, dst_pt))
+	if (media_player_setup(mp, &src_pt, dst_pt, codec_set))
 		goto error;
 
 	bufsize_ms = MAX(bufsize_ms, ptime_ms * 2); // make sure the buf size is at least 2 frames

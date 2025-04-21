@@ -57,6 +57,9 @@
 #include "mqtt.h"
 #include "janus.h"
 #include "nftables.h"
+#include "bufferpool.h"
+#include "log_funcs.h"
+#include "uring.h"
 
 
 
@@ -67,12 +70,6 @@ static unsigned int num_poller_threads;
 unsigned int num_media_pollers;
 unsigned int rtpe_poller_rr_iter;
 
-bool (*rtpe_poller_add_item)(struct poller *, struct poller_item *) = poller_add_item;
-bool (*rtpe_poller_del_item)(struct poller *, int) = poller_del_item;
-bool (*rtpe_poller_del_item_callback)(struct poller *, int, void (*)(void *), void *) = poller_del_item_callback;
-void (*rtpe_poller_blocked)(struct poller *, void *) = poller_blocked;
-void (*rtpe_poller_error)(struct poller *, void *) = poller_error;
-
 struct rtpengine_config initial_rtpe_config;
 
 static GQueue rtpe_tcp = G_QUEUE_INIT;
@@ -81,6 +78,7 @@ static GQueue rtpe_cli = G_QUEUE_INIT;
 
 GQueue rtpe_control_ng = G_QUEUE_INIT;
 GQueue rtpe_control_ng_tcp = G_QUEUE_INIT;
+struct bufferpool *shm_bufferpool;
 
 struct rtpengine_config rtpe_config = {
 	// non-zero defaults
@@ -89,7 +87,7 @@ struct rtpengine_config rtpe_config = {
 	.delete_delay = 30,
 	.redis_subscribed_keyspaces = G_QUEUE_INIT,
 	.redis_expires_secs = 86400,
-	.interfaces = G_QUEUE_INIT,
+	.interfaces = TYPED_GQUEUE_INIT,
 	.homer_protocol = SOCK_DGRAM,
 	.homer_id = 2001,
 	.homer_ng_capt_proto = 0x3d, // first available value in HEP proto specification
@@ -114,12 +112,15 @@ struct rtpengine_config rtpe_config = {
 	.mqtt_publish_interval = 5000,
 	.dtmf_digit_delay = 2500,
 	.rtcp_interval = 5000,
+	.moh_max_duration = -1, // disabled by default
+	.moh_max_repeats = 999,
 	.common = {
 		.log_levels = {
 			[log_level_index_internals] = -1,
 		},
 	},
 	.max_recv_iters = MAX_RECV_ITERS,
+	.kernel_player_media = 128,
 };
 
 static void sighandler(gpointer x) {
@@ -130,6 +131,7 @@ static void sighandler(gpointer x) {
 	sigemptyset(&ss);
 	sigaddset(&ss, SIGINT);
 	sigaddset(&ss, SIGTERM);
+	sigaddset(&ss, SIGHUP);
 	sigaddset(&ss, SIGUSR1);
 	sigaddset(&ss, SIGUSR2);
 
@@ -149,6 +151,8 @@ static void sighandler(gpointer x) {
 
 		if (ret == SIGINT || ret == SIGTERM)
 			rtpe_shutdown = true;
+		else if (ret == SIGHUP)
+			_exit(42);
 		else if (ret == SIGUSR1) {
 			for (unsigned int i = 0; i < num_log_levels; i++) {
 				g_atomic_int_add(&rtpe_config.common.log_levels[i], -1);
@@ -269,22 +273,34 @@ static void __resolve_ifname(char *s, GQueue *addrs) {
 	freeaddrinfo(res);
 }
 
-static int if_addr_parse(GQueue *q, char *s, struct ifaddrs *ifas) {
+static int if_addr_parse(intf_config_q *q, char *s, struct ifaddrs *ifas) {
 	str name;
 	char *c;
 	sockaddr_t *addr, adv;
 	GQueue addrs = G_QUEUE_INIT;
 	struct intf_config *ifa;
 
+	while (*s == ' ')
+		s++;
+
 	/* name */
-	c = strchr(s, '/');
+	c = strpbrk(s, "/=");
 	if (c) {
+		char cc = *c;
 		*c++ = 0;
-		str_init(&name, s);
+		name = STR(s);
 		s = c;
+		if (cc == '=') {
+			// foo=bar
+			ifa = g_slice_alloc0(sizeof(*ifa));
+			ifa->name = str_dup_str(&name);
+			ifa->alias = STR_DUP(s);
+			t_queue_push_tail(q, ifa);
+			return 0;
+		}
 	}
 	else
-		str_init(&name, "default");
+		name = STR("default");
 
 	/* advertised address */
 	c = strchr(s, '!');
@@ -329,7 +345,7 @@ static int if_addr_parse(GQueue *q, char *s, struct ifaddrs *ifas) {
 
 	while ((addr = g_queue_pop_head(&addrs))) {
 		ifa = g_slice_alloc0(sizeof(*ifa));
-		str_init_dup_str(&ifa->name, &name);
+		ifa->name = str_dup_str(&name);
 		ifa->local_address.addr = *addr;
 		ifa->local_address.type = socktype_udp;
 		ifa->advertised_address.addr = adv;
@@ -343,7 +359,7 @@ static int if_addr_parse(GQueue *q, char *s, struct ifaddrs *ifas) {
 		ifa->name_rr_spec = ifa->name;
 		str_token(&ifa->name_base, &ifa->name_rr_spec, ':'); // sets name_rr_spec to null string if no ':' found
 
-		g_queue_push_tail(q, ifa);
+		t_queue_push_tail(q, ifa);
 
 		g_slice_free1(sizeof(*addr), addr);
 	}
@@ -353,8 +369,8 @@ static int if_addr_parse(GQueue *q, char *s, struct ifaddrs *ifas) {
 
 
 
-static int redis_ep_parse(endpoint_t *ep, int *db, char **auth, const char *auth_env, char *s) {
-	char *sl;
+static int redis_ep_parse(endpoint_t *ep, int *db, char **hostname, char **auth, const char *auth_env, char *s) {
+	char *sl, *sp;
 	long l;
 
 	sl = strrchr(s, '@');
@@ -366,19 +382,29 @@ static int redis_ep_parse(endpoint_t *ep, int *db, char **auth, const char *auth
 	else if ((sl = getenv(auth_env)))
 		*auth = g_strdup(sl);
 
-	sl = strchr(s, '/');
-	if (!sl)
-		return -1;
-	*sl = 0;
-	sl++;
-	if (!*sl)
-		return -1;
-	l = strtol(sl, &sl, 10);
-	if (*sl != 0)
-		return -1;
-	if (l < 0)
-		return -1;
-	*db = l;
+	if (db) {
+		sl = strchr(s, '/');
+		if (!sl)
+			return -1;
+		*sl = 0;
+		sl++;
+		if (!*sl)
+			return -1;
+		l = strtol(sl, &sl, 10);
+		if (*sl != 0)
+			return -1;
+		if (l < 0)
+			return -1;
+		*db = l;
+	}
+
+	/* copy for the case with re-resolve during re-connections */
+	sp = strrchr(s, ':'); /* make sure to not take port into the value of hostname */
+	if (sp)
+		*hostname = g_strdup_printf("%.*s", (int)(sp - s), s);
+	else
+		*hostname = g_strdup(s);
+
 	if (endpoint_parse_any_getaddrinfo_full(ep, s))
 		return -1;
 	return 0;
@@ -388,7 +414,7 @@ static int redis_ep_parse(endpoint_t *ep, int *db, char **auth, const char *auth
 static void parse_cn_payload(str *out, char **in, const char *def, const char *name) {
 	if (!in || !*in) {
 		if (def)
-			str_init_dup(out, def);
+			*out = STR_DUP(def);
 		return;
 	}
 
@@ -420,6 +446,11 @@ static void endpoint_list_dup(GQueue *out, const GQueue *in) {
 	g_queue_init(out);
 	for (GList *l = in->head; l; l = l->next)
 		g_queue_push_tail(out, endpoint_dup(l->data));
+}
+static void endpoint_list_free(GQueue *q) {
+	endpoint_t *ep;
+	while ((ep = g_queue_pop_head(q)))
+		g_slice_free1(sizeof(*ep), ep);
 }
 static void parse_listen_list(GQueue *out, char **epv, const char *option) {
 	if (!epv)
@@ -461,10 +492,10 @@ static void release_listeners(GQueue *q) {
 }
 
 
-static void options(int *argc, char ***argv) {
+static void options(int *argc, char ***argv, GHashTable *templates) {
 	g_autoptr(char_p) if_a = NULL;
 	g_autoptr(char_p) ks_a = NULL;
-	unsigned long uint_keyspace_db;
+	long int_keyspace_db;
 	str str_keyspace_db;
 	char **iter;
 	g_autoptr(char_p) listenps = NULL;
@@ -476,6 +507,7 @@ static void options(int *argc, char ***argv) {
 	g_autoptr(char) graphite_prefix_s = NULL;
 	g_autoptr(char) redisps = NULL;
 	g_autoptr(char) redisps_write = NULL;
+	g_autoptr(char) redisps_subscribe = NULL;
 	g_autoptr(char) log_facility_cdr_s = NULL;
 	g_autoptr(char) log_facility_rtcp_s = NULL;
 	g_autoptr(char) log_facility_dtmf_s = NULL;
@@ -498,7 +530,7 @@ static void options(int *argc, char ***argv) {
 #ifdef HAVE_MQTT
 	g_autoptr(char) mqtt_publish_scope = NULL;
 #endif
-	g_autoptr(char) mos = NULL;
+	g_autoptr(char_p) mos_options = NULL;
 	g_autoptr(char) dcc = NULL;
 	g_autoptr(char) use_audio_player = NULL;
 	g_autoptr(char) control_pmtu = NULL;
@@ -508,8 +540,8 @@ static void options(int *argc, char ***argv) {
 	bool nftables_status = false;
 	g_autoptr(char) nftables_family = NULL;
 #endif
-
-	rwlock_lock_w(&rtpe_config.config_lock);
+	g_autoptr(char) redis_format = NULL;
+	g_autoptr(char) templates_section = NULL;
 
 	GOptionEntry e[] = {
 		{ "table",	't', 0, G_OPTION_ARG_INT,	&rtpe_config.kernel_table,		"Kernel table to use",		"INT"		},
@@ -524,6 +556,7 @@ static void options(int *argc, char ***argv) {
 		{ "nftables-status",0, 0, G_OPTION_ARG_NONE,	&nftables_status,		"Check nftables rules, print result and exit", NULL },
 #endif
 		{ "interface",	'i', 0, G_OPTION_ARG_STRING_ARRAY,&if_a,	"Local interface for RTP",	"[NAME/]IP[!IP]"},
+		{ "templates", 0, 0,	G_OPTION_ARG_STRING,	&templates_section,	"Config section to read signalling templates from ",	"STR"},
 		{ "save-interface-ports",'S', 0, G_OPTION_ARG_NONE,	&rtpe_config.save_interface_ports,	"Bind ports only on first available interface of desired family", NULL },
 		{ "subscribe-keyspace", 'k', 0, G_OPTION_ARG_STRING_ARRAY,&ks_a,	"Subscription keyspace list",	"INT INT ..."},
 		{ "listen-ng",	'n', 0, G_OPTION_ARG_STRING_ARRAY,	&listenngs,	"UDP ports to listen on, NG protocol","[IP46|HOSTNAME:]PORT ..."	},
@@ -546,6 +579,8 @@ static void options(int *argc, char ***argv) {
 		{ "port-max",	'M', 0, G_OPTION_ARG_INT,	&rtpe_config.port_max,	"Highest port to use for RTP",	"INT"		},
 		{ "redis",	'r', 0, G_OPTION_ARG_STRING,	&redisps,	"Connect to Redis database",	"[PW@]IP:PORT/INT"	},
 		{ "redis-write",'w', 0, G_OPTION_ARG_STRING,    &redisps_write, "Connect to Redis write database",      "[PW@]IP:PORT/INT"       },
+		{ "redis-subscribe", 0, 0, G_OPTION_ARG_STRING, &redisps_subscribe, "Connect to Redis subscribe database",      "[PW@]IP:PORT[/INT]"       },
+		{ "redis-resolve-on-reconnect", 0,0,	G_OPTION_ARG_NONE,	&rtpe_config.redis_resolve_on_reconnect,	"Re-resolve given FQDN on each re-connect to the redis server.",	NULL },
 		{ "redis-num-threads", 0, 0, G_OPTION_ARG_INT, &rtpe_config.redis_num_threads, "Number of Redis restore threads",      "INT"       },
 		{ "redis-expires", 0, 0, G_OPTION_ARG_INT, &rtpe_config.redis_expires_secs, "Expire time in seconds for redis keys",      "INT"       },
 		{ "no-redis-required", 'q', 0, G_OPTION_ARG_NONE, &rtpe_config.no_redis_required, "Start no matter of redis connection state", NULL },
@@ -553,6 +588,7 @@ static void options(int *argc, char ***argv) {
 		{ "redis-disable-time", 0, 0, G_OPTION_ARG_INT, &rtpe_config.redis_disable_time, "Number of seconds redis communication is disabled because of errors", "INT" },
 		{ "redis-cmd-timeout", 0, 0, G_OPTION_ARG_INT, &rtpe_config.redis_cmd_timeout, "Sets a timeout in milliseconds for redis commands", "INT" },
 		{ "redis-connect-timeout", 0, 0, G_OPTION_ARG_INT, &rtpe_config.redis_connect_timeout, "Sets a timeout in milliseconds for redis connections", "INT" },
+		{ "redis-format", 0, 0,	G_OPTION_ARG_STRING, &redis_format,		"Format for persistent storage in Redis/KeyDB", "native|bencode|JSON" },
 #if 0
 		// temporarily disabled, see discussion on https://github.com/sipwise/rtpengine/commit/2ebf5a1526c1ce8093b3011a1e23c333b3f99400
 		// related to Change-Id: I83d9b9a844f4f494ad37b44f5d1312f272beff3f
@@ -591,7 +627,7 @@ static void options(int *argc, char ***argv) {
 		{ "homer-disable-rtcp-stats", 0, 0, G_OPTION_ARG_NONE,	&rtpe_config.homer_rtcp_off,	"Disable RTCP stats tracing to Homer (enabled by default if homer server enabled)", NULL	},
 		{ "homer-enable-ng", 0, 0, G_OPTION_ARG_NONE,	&rtpe_config.homer_ng_on,	"Enable NG tracing to Homer", NULL	},
 		{ "homer-ng-capture-proto", 0, 0, G_OPTION_ARG_INT,	&rtpe_config.homer_ng_capt_proto,	"'Capture protocol type' to use within the HEP protocol (default is 0x3d). Further used by the Homer capture and UI.", "UINT8"	},
-		{ "recording-dir", 0, 0, G_OPTION_ARG_STRING,	&rtpe_config.spooldir,	"Directory for storing pcap and metadata files", "FILE"	},
+		{ "recording-dir", 0, 0, G_OPTION_ARG_FILENAME,	&rtpe_config.spooldir,	"Directory for storing pcap and metadata files", "FILE"	},
 		{ "recording-method",0, 0, G_OPTION_ARG_STRING,	&rtpe_config.rec_method,	"Strategy for call recording",		"pcap|proc|all"	},
 		{ "recording-format",0, 0, G_OPTION_ARG_STRING,	&rtpe_config.rec_format,	"File format for stored pcap files",	"raw|eth"	},
 		{ "record-egress",0, 0, G_OPTION_ARG_NONE,	&rtpe_config.rec_egress,	"Recording egress media instead of ingress",	NULL	},
@@ -615,14 +651,14 @@ static void options(int *argc, char ***argv) {
 		{ "debug-srtp",0,0,	G_OPTION_ARG_NONE,	&debug_srtp,		"Log raw encryption details for SRTP",	NULL },
 		{ "reject-invalid-sdp",0,0,	G_OPTION_ARG_NONE,	&rtpe_config.reject_invalid_sdp,"Refuse to process SDP bodies with broken syntax",	NULL },
 		{ "dtls-rsa-key-size",0, 0,	G_OPTION_ARG_INT,&rtpe_config.dtls_rsa_key_size,"Size of RSA key for DTLS",	"INT"		},
-		{ "dtls-cert-cipher",0,  0,G_OPTION_ARG_STRING,	&dcc,			"Cipher to use for the DTLS certificate","RSA"	},
+		{ "dtls-cert-cipher",0,  0,G_OPTION_ARG_STRING,	&dcc,			"Cipher to use for the DTLS certificate","prime256v1|RSA"	},
 		{ "dtls-mtu",0, 0,	G_OPTION_ARG_INT,&rtpe_config.dtls_mtu,"DTLS MTU",	"INT"		},
 		{ "dtls-ciphers",0,  0,	G_OPTION_ARG_STRING,	&rtpe_config.dtls_ciphers,"List of ciphers for DTLS",		"STRING"	},
 		{ "dtls-signature",0,  0,G_OPTION_ARG_STRING,	&dtls_sig,		"Signature algorithm for DTLS",		"SHA-256|SHA-1"	},
 		{ "listen-http", 0,0,	G_OPTION_ARG_STRING_ARRAY,&rtpe_config.http_ifs,"Interface for HTTP and WS",	"[IP46|HOSTNAME:]PORT"},
 		{ "listen-https", 0,0,	G_OPTION_ARG_STRING_ARRAY,&rtpe_config.https_ifs,"Interface for HTTPS and WSS",	"[IP46|HOSTNAME:]PORT"},
-		{ "https-cert", 0,0,	G_OPTION_ARG_STRING,	&rtpe_config.https_cert,"Certificate for HTTPS and WSS","FILE"},
-		{ "https-key", 0,0,	G_OPTION_ARG_STRING,	&rtpe_config.https_key,	"Private key for HTTPS and WSS","FILE"},
+		{ "https-cert", 0,0,	G_OPTION_ARG_FILENAME,	&rtpe_config.https_cert,"Certificate for HTTPS and WSS","FILE"},
+		{ "https-key", 0,0,	G_OPTION_ARG_FILENAME,	&rtpe_config.https_key,	"Private key for HTTPS and WSS","FILE"},
 		{ "http-threads", 0,0,	G_OPTION_ARG_INT,	&rtpe_config.http_threads,"Number of worker threads for HTTP and WS","INT"},
 		{ "software-id", 0,0,	G_OPTION_ARG_STRING,	&rtpe_config.software_id,"Identification string of this software presented to external systems","STRING"},
 		{ "poller-per-thread", 0,0,	G_OPTION_ARG_NONE,	&rtpe_config.poller_per_thread,	"Use poller per thread",	NULL },
@@ -637,6 +673,19 @@ static void options(int *argc, char ***argv) {
 		{ "silence-detect",0,0,	G_OPTION_ARG_DOUBLE,	&silence_detect,	"Audio level threshold in percent for silence detection","FLOAT"},
 		{ "cn-payload",0,0,	G_OPTION_ARG_STRING_ARRAY,&cn_payload,		"Comfort noise parameters to replace silence with","INT INT INT ..."},
 		{ "player-cache",0,0,	G_OPTION_ARG_NONE,	&rtpe_config.player_cache,"Cache media files for playback in memory",NULL},
+		{ "kernel-player",0,0,	G_OPTION_ARG_INT,	&rtpe_config.kernel_player,"Max number of kernel media player streams","INT"},
+		{ "kernel-player-media",0,0,G_OPTION_ARG_INT,	&rtpe_config.kernel_player_media,"Max number of kernel media files","INT"},
+		{ "preload-media-files",0,0,G_OPTION_ARG_FILENAME_ARRAY,&rtpe_config.preload_media_files,"Preload media file(s) for playback into memory","FILE"},
+		{ "media-files-reload",0,0,G_OPTION_ARG_INT,	&rtpe_config.media_refresh,"Refresh/reload preloaded media files at a certain interval","SECONDS"},
+		{ "media-files-expire",0,0,G_OPTION_ARG_INT,	&rtpe_config.media_expire,"Maximum age of unused cached media files","SECONDS"},
+		{ "expiry-timer",0,0,G_OPTION_ARG_INT,		&rtpe_config.expiry_timer,"How often to check for expired media cache entries","SECONDS"},
+		{ "preload-db-media",0,0,G_OPTION_ARG_STRING_ARRAY,&rtpe_config.preload_db_media,"Preload media from database for playback into memory","INT"},
+		{ "db-media-reload",0,0,G_OPTION_ARG_INT,	&rtpe_config.db_refresh,"Reload preloaded media from DB at a certain interval","SECONDS"},
+		{ "db-media-expire",0,0,G_OPTION_ARG_INT,	&rtpe_config.db_expire,"Maximum age of unused cached DB media entries","SECONDS"},
+		{ "db-media-cache",0,0,	G_OPTION_ARG_FILENAME,	&rtpe_config.db_media_cache,"Directory to store media loaded from database","PATH"},
+		{ "preload-db-cache",0,0,G_OPTION_ARG_STRING_ARRAY,&rtpe_config.preload_db_cache,"Preload media from database for playback into file cache","INT"},
+		{ "db-cache-reload",0,0,G_OPTION_ARG_INT,	&rtpe_config.cache_refresh,"Refresh/reload cached media from DB at a certain interval","SECONDS"},
+		{ "db-cache-expire",0,0,G_OPTION_ARG_INT,	&rtpe_config.cache_expire,"Maximum age of unused cached DB entries in files","SECONDS"},
 		{ "audio-buffer-length",0,0,	G_OPTION_ARG_INT,&rtpe_config.audio_buffer_length,"Length in milliseconds of audio buffer","INT"},
 		{ "audio-buffer-delay",0,0,	G_OPTION_ARG_INT,&rtpe_config.audio_buffer_delay,"Initial delay in milliseconds for buffered audio","INT"},
 		{ "audio-player",0,0,	G_OPTION_ARG_STRING,	&use_audio_player,	"When to enable the internal audio player","on-demand|play-media|transcoding|always"},
@@ -649,22 +698,25 @@ static void options(int *argc, char ***argv) {
 		{ "mqtt-keepalive",0,0,	G_OPTION_ARG_INT,	&rtpe_config.mqtt_keepalive,"Seconds between mosquitto keepalives","INT"},
 		{ "mqtt-user",0,0,	G_OPTION_ARG_STRING,	&rtpe_config.mqtt_user,	"Username for mosquitto auth",		"USERNAME"},
 		{ "mqtt-pass",0,0,	G_OPTION_ARG_STRING,	&rtpe_config.mqtt_pass,	"Password for mosquitto auth",		"PASSWORD"},
-		{ "mqtt-cafile",0,0,	G_OPTION_ARG_STRING,	&rtpe_config.mqtt_cafile,"CA file for mosquitto auth",		"FILE"},
-		{ "mqtt-capath",0,0,	G_OPTION_ARG_STRING,	&rtpe_config.mqtt_capath,"CA path for mosquitto auth",		"PATH"},
-		{ "mqtt-certfile",0,0,	G_OPTION_ARG_STRING,	&rtpe_config.mqtt_certfile,"Certificate file for mosquitto auth","FILE"},
-		{ "mqtt-keyfile",0,0,	G_OPTION_ARG_STRING,	&rtpe_config.mqtt_keyfile,"Key file for mosquitto auth",	"FILE"},
+		{ "mqtt-cafile",0,0,	G_OPTION_ARG_FILENAME,	&rtpe_config.mqtt_cafile,"CA file for mosquitto auth",		"FILE"},
+		{ "mqtt-capath",0,0,	G_OPTION_ARG_FILENAME,	&rtpe_config.mqtt_capath,"CA path for mosquitto auth",		"PATH"},
+		{ "mqtt-certfile",0,0,	G_OPTION_ARG_FILENAME,	&rtpe_config.mqtt_certfile,"Certificate file for mosquitto auth","FILE"},
+		{ "mqtt-keyfile",0,0,	G_OPTION_ARG_FILENAME,	&rtpe_config.mqtt_keyfile,"Key file for mosquitto auth",	"FILE"},
 		{ "mqtt-publish-qos",0,0,G_OPTION_ARG_INT,	&rtpe_config.mqtt_publish_qos,"Mosquitto publish QoS",		"0|1|2"},
 		{ "mqtt-publish-topic",0,0,G_OPTION_ARG_STRING,	&rtpe_config.mqtt_publish_topic,"Mosquitto publish topic",	"STRING"},
 		{ "mqtt-publish-interval",0,0,G_OPTION_ARG_INT,	&rtpe_config.mqtt_publish_interval,"Publish timer interval",	"MILLISECONDS"},
 		{ "mqtt-publish-scope",0,0,G_OPTION_ARG_STRING,	&mqtt_publish_scope,	"Scope for published mosquitto messages","global|summary|call|media"},
 #endif
-		{ "mos",0,0,		G_OPTION_ARG_STRING,	&mos,		"Type of MOS calculation","CQ|LQ"},
+		{ "mos",0,0,		G_OPTION_ARG_STRING_ARRAY,&mos_options,		"MOS calculation options",		"CQ|LQ"},
 		{ "measure-rtp",0,0,	G_OPTION_ARG_NONE,	&rtpe_config.measure_rtp,"Enable measuring RTP statistics and VoIP metrics",NULL},
 #ifdef SO_INCOMING_CPU
 		{ "socket-cpu-affinity",0,0,G_OPTION_ARG_INT,	&rtpe_config.cpu_affinity,"CPU affinity for media sockets","INT"},
 #endif
 		{ "janus-secret", 0,0,	G_OPTION_ARG_STRING,	&rtpe_config.janus_secret,"Admin secret for Janus protocol","STRING"},
 		{ "rtcp-interval", 0,0,	G_OPTION_ARG_INT,	&rtpe_config.rtcp_interval,"Delay in milliseconds between RTCP packets when generate-rtcp flag is on, where random dispersion < 1 sec is added on top","INT"},
+		{ "moh-max-duration", 0,0,	G_OPTION_ARG_INT,	&rtpe_config.moh_max_duration, "Max possible duration (in milliseconds) that can be spent on playing a file. If set to 0 then will be ignored.", "INT"},
+		{ "moh-max-repeats", 0,0,	G_OPTION_ARG_INT,	&rtpe_config.moh_max_repeats, "Max possible amount of playback repeats for the music on hold. player-max-duration always takes a precedence over it.", "INT"},
+		{ "moh-attr-name", 0,0,	G_OPTION_ARG_STRING,	&rtpe_config.moh_attr_name, "Controls the value to be added to the session level of SDP whenever MoH is triggered.", "STRING"},
 		{ "max-recv-iters", 0, 0, G_OPTION_ARG_INT,    &rtpe_config.max_recv_iters,  "Maximum continuous reading cycles in UDP poller loop.", "INT"},
 		{ "vsc-start-rec",0,0,	G_OPTION_ARG_STRING,	&rtpe_config.vsc_start_rec.s,"DTMF VSC to start recording.", "STRING"},
 		{ "vsc-stop-rec",0,0,	G_OPTION_ARG_STRING,	&rtpe_config.vsc_stop_rec.s,"DTMF VSC to stop recording.", "STRING"},
@@ -676,8 +728,9 @@ static void options(int *argc, char ***argv) {
 		{ NULL, }
 	};
 
-	config_load(argc, argv, e, " - next-generation media proxy",
-			"/etc/rtpengine/rtpengine.conf", "rtpengine", &rtpe_config.common);
+	config_load_ext(argc, argv, e, " - next-generation media proxy",
+			"/etc/rtpengine/rtpengine.conf", "rtpengine", &rtpe_config.common,
+			&templates_section, templates);
 
 	// default values, if not configured
 	if (rtpe_config.rec_method == NULL)
@@ -764,19 +817,29 @@ static void options(int *argc, char ***argv) {
 
 	if (ks_a) {
 		for (iter = ks_a; *iter; iter++) {
-			str_keyspace_db.s = *iter;
-			str_keyspace_db.len = strlen(*iter);
-			uint_keyspace_db = strtoul(str_keyspace_db.s, &endptr, 10);
+			str_keyspace_db = STR(*iter);
+			int_keyspace_db = strtol(str_keyspace_db.s, &endptr, 10);
 
-			if ((errno == ERANGE && (uint_keyspace_db == ULONG_MAX)) ||
-			    (errno != 0 && uint_keyspace_db == 0)) {
-				ilog(LOG_ERR, "Fail adding keyspace '" STR_FORMAT "' to redis notifications; errono=%d\n", STR_FMT(&str_keyspace_db), errno);
+			if ((errno == ERANGE && (int_keyspace_db == ULONG_MAX)) || int_keyspace_db >= INT_MAX ||
+			    (errno != 0 && int_keyspace_db == 0)) {
+				ilog(LOG_ERR, "Fail adding keyspace '" STR_FORMAT "' to redis notifications; errno=%d\n", STR_FMT(&str_keyspace_db), errno);
 			} else if (endptr == str_keyspace_db.s) {
 				ilog(LOG_ERR, "Fail adding keyspace '" STR_FORMAT "' to redis notifications; no digits found\n", STR_FMT(&str_keyspace_db));
 			} else {
-				g_queue_push_tail(&rtpe_config.redis_subscribed_keyspaces, GUINT_TO_POINTER(uint_keyspace_db));
+				g_queue_push_tail(&rtpe_config.redis_subscribed_keyspaces, GINT_TO_POINTER(int_keyspace_db));
 			}
 		}
+	}
+
+	if (redis_format) {
+		if (!strcasecmp(redis_format, "native"))
+			rtpe_config.redis_format = 0;
+		else if (!strcasecmp(redis_format, "bencode"))
+			rtpe_config.redis_format = REDIS_FORMAT_BENCODE;
+		else if (!strcasecmp(redis_format, "JSON"))
+			rtpe_config.redis_format = REDIS_FORMAT_JSON;
+		else
+			die("Invalid --redis-format value given");
 	}
 
 	parse_listen_list(&rtpe_config.tcp_listen_ep,    listenps,     "listen-tcp");
@@ -823,6 +886,10 @@ static void options(int *argc, char ***argv) {
 	if (rtpe_config.max_recv_iters < 1)
 		die("Invalid max-recv-iters value");
 
+	/* if not set, define by default to half an hour */
+	if (rtpe_config.moh_max_duration <= 0)
+		rtpe_config.moh_max_duration = 1800000;
+
 	if (rtpe_config.timeout <= 0)
 		rtpe_config.timeout = 60;
 
@@ -838,14 +905,31 @@ static void options(int *argc, char ***argv) {
 	if (rtpe_config.rtcp_interval <= 0)
 		rtpe_config.rtcp_interval = 5000;
 
-	if (redisps)
-		if (redis_ep_parse(&rtpe_config.redis_ep, &rtpe_config.redis_db, &rtpe_config.redis_auth, "RTPENGINE_REDIS_AUTH_PW", redisps))
+	if (redisps) {
+		if (redis_ep_parse(&rtpe_config.redis_ep, &rtpe_config.redis_db, &rtpe_config.redis_hostname,
+				&rtpe_config.redis_auth, "RTPENGINE_REDIS_AUTH_PW", redisps))
+		{
 			die("Invalid Redis endpoint [IP:PORT/INT] '%s' (--redis)", redisps);
+		}
+	}
 
-	if (redisps_write)
-		if (redis_ep_parse(&rtpe_config.redis_write_ep, &rtpe_config.redis_write_db, &rtpe_config.redis_write_auth,
-					"RTPENGINE_REDIS_WRITE_AUTH_PW", redisps_write))
+	if (redisps_write) {
+		if (redis_ep_parse(&rtpe_config.redis_write_ep, &rtpe_config.redis_write_db, &rtpe_config.redis_write_hostname,
+					&rtpe_config.redis_write_auth, "RTPENGINE_REDIS_WRITE_AUTH_PW", redisps_write))
+		{
 			die("Invalid Redis endpoint [IP:PORT/INT] '%s' (--redis-write)", redisps_write);
+		}
+	}
+
+	if (redisps_subscribe)
+		if (redis_ep_parse(&rtpe_config.redis_subscribe_ep, &rtpe_config.redis_subscribe_db, &rtpe_config.redis_subscribe_hostname,
+					&rtpe_config.redis_subscribe_auth,"RTPENGINE_REDIS_SUBSCRIBE_AUTH_PW", redisps_subscribe))
+		{
+			rtpe_config.redis_subscribe_db = -1;
+			if (redis_ep_parse(&rtpe_config.redis_subscribe_ep, NULL, &rtpe_config.redis_subscribe_hostname,
+						&rtpe_config.redis_subscribe_auth,"RTPENGINE_REDIS_SUBSCRIBE_AUTH_PW", redisps_subscribe))
+				die("Invalid Redis endpoint [IP:PORT/INT] '%s' (--redis-subscribe)", redisps_subscribe);
+		}
 
 	if (rtpe_config.fmt > 2)
 		die("Invalid XMLRPC format");
@@ -947,6 +1031,8 @@ static void options(int *argc, char ***argv) {
 		However, this does not preclude link layers with an MTU smaller than this minimum MTU from conveying IP data. Internet IPv4 path MTU is 68 bytes.*/
 		die("Invalid --dtls-mtu (%i)", rtpe_config.dtls_mtu);
 
+	rtpe_config.dtls_mtu -= DTLS_MTU_OVERHEAD;
+
 	if (rtpe_config.jb_length < 0)
 		die("Invalid negative jitter buffer size");
 
@@ -1008,11 +1094,21 @@ static void options(int *argc, char ***argv) {
 			die("Invalid --mqtt-publish-scope option ('%s')", mqtt_publish_scope);
 	}
 #endif
-	if (mos) {
+	for (char **mosp = mos_options; mosp && *mosp; mosp++) {
+		char *mos = *mosp;
 		if (!strcasecmp(mos, "cq"))
 			rtpe_config.mos = MOS_CQ;
 		else if (!strcasecmp(mos, "lq"))
 			rtpe_config.mos = MOS_LQ;
+#ifdef WITH_TRANSCODING
+		else if (!strcasecmp(mos, "legacy"))
+			rtpe_config.common.mos_type = MOS_LEGACY;
+		else if (!strcasecmp(mos, "g107") || !strcasecmp(mos, "g.107"))
+			rtpe_config.common.mos_type = MOS_LEGACY;
+		else if (!strcasecmp(mos, "g1072") || !strcasecmp(mos, "g.1072")
+				|| !strcasecmp(mos, "g.107.2") || !strcasecmp(mos, "g107.2"))
+			rtpe_config.common.mos_type = MOS_FB;
+#endif
 		else
 			die("Invalid --mos option ('%s')", mos);
 	}
@@ -1065,153 +1161,101 @@ static void options(int *argc, char ***argv) {
 			die("Number of CPU cores is unknown, cannot auto-set socket CPU affinity");
 	}
 
-	rwlock_unlock_w(&rtpe_config.config_lock);
+	// everything OK, do post-processing
+
 }
 
 static void fill_initial_rtpe_cfg(struct rtpengine_config* ini_rtpe_cfg) {
 
-	GList* l;
 	struct intf_config* gptr_data;
 
-	rwlock_lock_w(&rtpe_config.config_lock);
-
-	for(l = rtpe_config.interfaces.head; l ; l=l->next) {
+	for (__auto_type l = rtpe_config.interfaces.head; l ; l=l->next) {
 		gptr_data = g_slice_alloc0(sizeof(*gptr_data));
-		memcpy(gptr_data, (struct intf_config*)(l->data), sizeof(*gptr_data));
-		str_init_dup(&gptr_data->name, ((struct intf_config*)(l->data))->name.s);
+		memcpy(gptr_data, l->data, sizeof(*gptr_data));
+		gptr_data->name = str_dup_str(&l->data->name);
+		gptr_data->alias = str_dup_str(&l->data->alias);
 
-		g_queue_push_tail(&ini_rtpe_cfg->interfaces, gptr_data);
+		t_queue_push_tail(&ini_rtpe_cfg->interfaces, gptr_data);
 	}
 
-	for(l = rtpe_config.redis_subscribed_keyspaces.head; l ; l = l->next) {
+	for (__auto_type l = rtpe_config.redis_subscribed_keyspaces.head; l ; l = l->next) {
 		// l->data has been assigned to a variable before being given into the queue structure not to get a shallow copy
-		unsigned int num = GPOINTER_TO_UINT(l->data);
+		int num = GPOINTER_TO_INT(l->data);
 		g_queue_push_tail(&ini_rtpe_cfg->redis_subscribed_keyspaces, GINT_TO_POINTER(num));
 	}
 
-	ini_rtpe_cfg->kernel_table = rtpe_config.kernel_table;
-	ini_rtpe_cfg->max_sessions = rtpe_config.max_sessions;
-	ini_rtpe_cfg->cpu_limit = rtpe_config.cpu_limit;
-	ini_rtpe_cfg->load_limit = rtpe_config.load_limit;
-	ini_rtpe_cfg->bw_limit = rtpe_config.bw_limit;
-	ini_rtpe_cfg->timeout = rtpe_config.timeout;
-	ini_rtpe_cfg->silent_timeout = rtpe_config.silent_timeout;
-	ini_rtpe_cfg->offer_timeout = rtpe_config.offer_timeout;
-	ini_rtpe_cfg->final_timeout = rtpe_config.final_timeout;
-	ini_rtpe_cfg->delete_delay = rtpe_config.delete_delay;
-	ini_rtpe_cfg->redis_expires_secs = rtpe_config.redis_expires_secs;
-	ini_rtpe_cfg->default_tos = rtpe_config.default_tos;
-	ini_rtpe_cfg->control_tos = rtpe_config.control_tos;
-	ini_rtpe_cfg->graphite_interval = rtpe_config.graphite_interval;
-	ini_rtpe_cfg->graphite_timeout= rtpe_config.graphite_timeout;
-	ini_rtpe_cfg->redis_num_threads = rtpe_config.redis_num_threads;
-	ini_rtpe_cfg->homer_protocol = rtpe_config.homer_protocol;
-	ini_rtpe_cfg->homer_id = rtpe_config.homer_id;
-	ini_rtpe_cfg->homer_ng_capt_proto = rtpe_config.homer_ng_capt_proto;
-	ini_rtpe_cfg->no_fallback = rtpe_config.no_fallback;
-	ini_rtpe_cfg->port_min = rtpe_config.port_min;
-	ini_rtpe_cfg->port_max = rtpe_config.port_max;
-	ini_rtpe_cfg->redis_db = rtpe_config.redis_db;
-	ini_rtpe_cfg->redis_write_db = rtpe_config.redis_write_db;
-	ini_rtpe_cfg->no_redis_required = rtpe_config.no_redis_required;
-	ini_rtpe_cfg->num_threads = rtpe_config.num_threads;
-	ini_rtpe_cfg->media_num_threads = rtpe_config.media_num_threads;
-	ini_rtpe_cfg->fmt = rtpe_config.fmt;
-	ini_rtpe_cfg->log_format = rtpe_config.log_format;
-	ini_rtpe_cfg->redis_allowed_errors = rtpe_config.redis_allowed_errors;
-	ini_rtpe_cfg->redis_disable_time = rtpe_config.redis_disable_time;
-	ini_rtpe_cfg->redis_cmd_timeout = rtpe_config.redis_cmd_timeout;
-	ini_rtpe_cfg->redis_connect_timeout = rtpe_config.redis_connect_timeout;
-	ini_rtpe_cfg->redis_delete_async = rtpe_config.redis_delete_async;
-	ini_rtpe_cfg->redis_delete_async_interval = rtpe_config.redis_delete_async_interval;
+#define X(s) ini_rtpe_cfg->s = rtpe_config.s;
+RTPE_CONFIG_INT_PARAMS
+RTPE_CONFIG_UINT64_PARAMS
+RTPE_CONFIG_BOOL_PARAMS
+RTPE_CONFIG_ENDPOINT_PARAMS
+RTPE_CONFIG_ENUM_PARAMS
+#undef X
+
+#define X(s) ini_rtpe_cfg->s = g_strdup(rtpe_config.s);
+RTPE_CONFIG_CHARP_PARAMS
+#undef X
+
 	memcpy(&ini_rtpe_cfg->common.log_levels, &rtpe_config.common.log_levels, sizeof(ini_rtpe_cfg->common.log_levels));
 
-	ini_rtpe_cfg->graphite_ep = rtpe_config.graphite_ep;
-	endpoint_list_dup(&ini_rtpe_cfg->tcp_listen_ep, &rtpe_config.tcp_listen_ep);
-	endpoint_list_dup(&ini_rtpe_cfg->udp_listen_ep, &rtpe_config.udp_listen_ep);
-	endpoint_list_dup(&ini_rtpe_cfg->ng_listen_ep, &rtpe_config.ng_listen_ep);
-	endpoint_list_dup(&ini_rtpe_cfg->ng_tcp_listen_ep, &rtpe_config.ng_tcp_listen_ep);
-	endpoint_list_dup(&ini_rtpe_cfg->cli_listen_ep, &rtpe_config.cli_listen_ep);
-	ini_rtpe_cfg->redis_ep = rtpe_config.redis_ep;
-	ini_rtpe_cfg->redis_write_ep = rtpe_config.redis_write_ep;
-	ini_rtpe_cfg->homer_ep = rtpe_config.homer_ep;
-	ini_rtpe_cfg->endpoint_learning = rtpe_config.endpoint_learning;
+#define X(s) endpoint_list_dup(&ini_rtpe_cfg->s, &rtpe_config.s);
+RTPE_CONFIG_ENDPOINT_QUEUE_PARAMS
+#undef X
 
-	ini_rtpe_cfg->b2b_url = g_strdup(rtpe_config.b2b_url);
-	ini_rtpe_cfg->redis_auth = g_strdup(rtpe_config.redis_auth);
-	ini_rtpe_cfg->redis_write_auth = g_strdup(rtpe_config.redis_write_auth);
-	ini_rtpe_cfg->spooldir = g_strdup(rtpe_config.spooldir);
-	ini_rtpe_cfg->iptables_chain = g_strdup(rtpe_config.iptables_chain);
-	ini_rtpe_cfg->rec_method = g_strdup(rtpe_config.rec_method);
-	ini_rtpe_cfg->rec_format = g_strdup(rtpe_config.rec_format);
-
-	ini_rtpe_cfg->jb_length = rtpe_config.jb_length;
-	ini_rtpe_cfg->jb_clock_drift = rtpe_config.jb_clock_drift;
-	ini_rtpe_cfg->rtcp_interval = rtpe_config.rtcp_interval;
-
-	ini_rtpe_cfg->max_recv_iters = rtpe_config.max_recv_iters;
-
-	rwlock_unlock_w(&rtpe_config.config_lock);
+	ini_rtpe_cfg->silence_detect_double = rtpe_config.silence_detect_double;
+	ini_rtpe_cfg->silence_detect_int = rtpe_config.silence_detect_int;
 }
 
-static void
-free_config_interfaces (gpointer data)
-{
-	struct intf_config* gptr_data = data;
-
-	str_free_dup(&gptr_data->name);
-	g_slice_free1(sizeof(*gptr_data), gptr_data);
+static void free_config_interfaces(struct intf_config *i) {
+	str_free_dup(&i->name);
+	str_free_dup(&i->alias);
+	g_slice_free1(sizeof(*i), i);
 }
 
 static void unfill_initial_rtpe_cfg(struct rtpengine_config* ini_rtpe_cfg) {
 	// clear queues
-	g_queue_clear_full(&ini_rtpe_cfg->interfaces, (GDestroyNotify)free_config_interfaces);
+	t_queue_clear_full(&ini_rtpe_cfg->interfaces, free_config_interfaces);
 	g_queue_clear(&ini_rtpe_cfg->redis_subscribed_keyspaces);
 
 	// free g_strdup
-	g_free(ini_rtpe_cfg->b2b_url);
-	g_free(ini_rtpe_cfg->redis_auth);
-	g_free(ini_rtpe_cfg->redis_write_auth);
-	g_free(ini_rtpe_cfg->spooldir);
-	g_free(ini_rtpe_cfg->iptables_chain);
-	g_free(ini_rtpe_cfg->rec_method);
-	g_free(ini_rtpe_cfg->rec_format);
+#define X(s) g_free(ini_rtpe_cfg->s);
+RTPE_CONFIG_CHARP_PARAMS
+#undef X
+
+#define X(x) g_free(ini_rtpe_cfg->x.s);
+RTPE_CONFIG_STR_PARAMS
+#undef X
+
+#define X(s) endpoint_list_free(&ini_rtpe_cfg->s);
+RTPE_CONFIG_ENDPOINT_QUEUE_PARAMS
+#undef X
+
+#define X(s) g_strfreev(ini_rtpe_cfg->s);
+RTPE_CONFIG_CHARPP_PARAMS
+#undef X
 }
 
 static void options_free(void) {
 	// clear queues
-	g_queue_clear_full(&rtpe_config.interfaces, (GDestroyNotify)free_config_interfaces);
+	t_queue_clear_full(&rtpe_config.interfaces, free_config_interfaces);
 	g_queue_clear(&rtpe_config.redis_subscribed_keyspaces);
 
 	// free config options
-	g_free(rtpe_config.b2b_url);
-	g_free(rtpe_config.spooldir);
-	g_free(rtpe_config.rec_method);
-	g_free(rtpe_config.rec_format);
-	g_free(rtpe_config.iptables_chain);
-	g_free(rtpe_config.scheduling);
-	g_free(rtpe_config.idle_scheduling);
-	g_free(rtpe_config.mysql_host);
-	g_free(rtpe_config.mysql_user);
-	g_free(rtpe_config.mysql_pass);
-	g_free(rtpe_config.mysql_query);
-	g_free(rtpe_config.dtls_ciphers);
-	g_strfreev(rtpe_config.http_ifs);
-	g_strfreev(rtpe_config.https_ifs);
-	g_free(rtpe_config.https_cert);
-	g_free(rtpe_config.https_key);
-	g_free(rtpe_config.software_id);
-	if (rtpe_config.cn_payload.s)
-		g_free(rtpe_config.cn_payload.s);
-	if (rtpe_config.dtx_cn_params.s)
-		g_free(rtpe_config.dtx_cn_params.s);
-	g_free(rtpe_config.mqtt_user);
-	g_free(rtpe_config.mqtt_pass);
-	g_free(rtpe_config.mqtt_cafile);
-	g_free(rtpe_config.mqtt_certfile);
-	g_free(rtpe_config.mqtt_keyfile);
-	g_free(rtpe_config.mqtt_publish_topic);
-	g_free(rtpe_config.janus_secret);
+#define X(s) g_free(rtpe_config.s);
+RTPE_CONFIG_CHARP_PARAMS
+#undef X
+
+#define X(x) g_free(rtpe_config.x.s);
+RTPE_CONFIG_STR_PARAMS
+#undef X
+
+#define X(s) endpoint_list_free(&rtpe_config.s);
+RTPE_CONFIG_ENDPOINT_QUEUE_PARAMS
+#undef X
+
+#define X(s) g_strfreev(rtpe_config.s);
+RTPE_CONFIG_CHARPP_PARAMS
+#undef X
 
 	// free common config options
 	config_load_free(&rtpe_config.common);
@@ -1221,7 +1265,62 @@ static void early_init(void) {
 	socket_init(); // needed for socktype_udp
 }
 
-static void init_everything(void) {
+#ifdef WITH_TRANSCODING
+static void clib_init(void) {
+	media_bufferpool = bufferpool_new(g_malloc, g_free, 64 * 65536);
+#ifdef HAVE_LIBURING
+	if (rtpe_config.common.io_uring)
+		uring_thread_init();
+#endif
+}
+static void clib_cleanup(void) {
+	bufferpool_destroy(media_bufferpool);
+#ifdef HAVE_LIBURING
+	if (rtpe_config.common.io_uring)
+		uring_thread_cleanup();
+#endif
+}
+static void clib_loop(void) {
+	uring_thread_loop();
+	append_thread_lpr_to_glob_lpr();
+}
+#endif
+
+static void kernel_setup(void) {
+	if (rtpe_config.kernel_table < 0)
+		goto fallback;
+#ifndef WITHOUT_NFTABLES
+	const char *err = nftables_setup(rtpe_config.nftables_chain, rtpe_config.nftables_base_chain,
+			(nftables_args) {.table = rtpe_config.kernel_table,
+			.append = rtpe_config.nftables_append,
+			.family = rtpe_config.nftables_family});
+	if (err) {
+		if (rtpe_config.no_fallback)
+			die("Failed to create nftables chains or rules: %s (%s)", err, strerror(errno));
+		ilog(LOG_ERR, "FAILED TO CREATE NFTABLES CHAINS OR RULES, KERNEL FORWARDING POSSIBLY WON'T WORK: "
+				"%s (%s)", err, strerror(errno));
+	}
+#endif
+	if (!kernel_setup_table(rtpe_config.kernel_table)) {
+		if (rtpe_config.no_fallback)
+			die("Userspace fallback disallowed - exiting");
+		goto fallback;
+	}
+
+	if (rtpe_config.player_cache && rtpe_config.kernel_player > 0 && rtpe_config.kernel_player_media > 0) {
+	       if (!kernel_init_player(rtpe_config.kernel_player_media, rtpe_config.kernel_player))
+		       die("Failed to initialise kernel media player");
+	}
+
+	return;
+
+fallback:
+	shm_bufferpool = bufferpool_new(g_malloc, g_free, 4096); // fallback userspace bufferpool
+}
+
+
+static void init_everything(GHashTable *templates) {
+	bufferpool_init();
 	gettimeofday(&rtpe_now, NULL);
 	log_init(rtpe_common_config_ptr->log_name);
 	log_format(rtpe_config.log_format);
@@ -1239,12 +1338,18 @@ static void init_everything(void) {
 	dtls_init();
 	ice_init();
 	crypto_init_main();
+	kernel_setup();
 	interfaces_init(&rtpe_config.interfaces);
 	iptables_init();
 	control_ng_init();
-	if (call_interfaces_init())
+	if (call_interfaces_init(templates))
 		abort();
 	statistics_init();
+#ifdef WITH_TRANSCODING
+	codeclib_thread_init = clib_init;
+	codeclib_thread_cleanup = clib_cleanup;
+	codeclib_thread_loop = clib_loop;
+#endif
 	codeclib_init(0);
 	media_player_init();
 	if (!dtmf_init())
@@ -1255,22 +1360,8 @@ static void init_everything(void) {
 		abort();
 	codecs_init();
 	janus_init();
-}
-
-
-static void kernel_setup(void) {
-	if (rtpe_config.kernel_table < 0)
-		return;
-#ifndef WITHOUT_NFTABLES
-	const char *err = nftables_setup(rtpe_config.nftables_chain, rtpe_config.nftables_base_chain,
-			(nftables_args) {.table = rtpe_config.kernel_table,
-			.append = rtpe_config.nftables_append,
-			.family = rtpe_config.nftables_family});
-	if (err)
-		die("Failed to create nftables chains or rules: %s (%s)", err, strerror(errno));
-#endif
-	if (!kernel_setup_table(rtpe_config.kernel_table) && rtpe_config.no_fallback)
-		die("Userspace fallback disallowed - exiting");
+	if (!kernel_init_table())
+		die("Kernel module version mismatch or other fatal error");
 }
 
 static void create_everything(void) {
@@ -1278,9 +1369,20 @@ static void create_everything(void) {
 
 	gettimeofday(&rtpe_now, NULL);
 
-	kernel_setup();
 
 	// either one global poller, or one per thread for media sockets plus one for control sockets
+#ifdef HAVE_LIBURING
+	if (rtpe_config.common.io_uring) {
+		rtpe_config.poller_per_thread = true;
+		rtpe_poller_add_item = uring_poller_add_item;
+		rtpe_poller_del_item = uring_poller_del_item;
+		rtpe_poller_del_item_callback = uring_poller_del_item_callback;
+		rtpe_poller_blocked = uring_poller_blocked;
+		rtpe_poller_isblocked = uring_poller_isblocked;
+		rtpe_poller_error = uring_poller_error;
+	}
+#endif
+
 	if (!rtpe_config.poller_per_thread) {
 		num_media_pollers = num_rtpe_pollers = 1;
 		num_poller_threads = rtpe_config.num_threads;
@@ -1292,7 +1394,11 @@ static void create_everything(void) {
 	}
 	rtpe_pollers = g_malloc(sizeof(*rtpe_pollers) * num_rtpe_pollers);
 	for (unsigned int i = 0; i < num_rtpe_pollers; i++) {
-		rtpe_pollers[i] = poller_new();
+		rtpe_pollers[i] = 
+#ifdef HAVE_LIBURING
+			rtpe_config.common.io_uring ? uring_poller_new() :
+#endif
+			poller_new();
 		if (!rtpe_pollers[i])
 			die("poller creation failed");
 	}
@@ -1301,7 +1407,7 @@ static void create_everything(void) {
 	if (call_init())
 		abort();
 
-        rwlock_init(&rtpe_config.config_lock);
+        rwlock_init(&rtpe_config.keyspaces_lock);
 
 	create_listeners(&rtpe_config.tcp_listen_ep,     &rtpe_tcp,            (void *(*)(const endpoint_t *)) control_tcp_new,    false, "TCP control");
 	create_listeners(&rtpe_config.udp_listen_ep,     &rtpe_udp,            (void *(*)(const endpoint_t *)) control_udp_new,    true,  "UDP control");
@@ -1311,22 +1417,59 @@ static void create_everything(void) {
 
 	if (!is_addr_unspecified(&rtpe_config.redis_write_ep.address)) {
 		rtpe_redis_write = redis_new(&rtpe_config.redis_write_ep,
-				rtpe_config.redis_write_db, rtpe_config.redis_write_auth,
-				ANY_REDIS_ROLE, rtpe_config.no_redis_required);
+				rtpe_config.redis_write_db,
+				rtpe_config.redis_write_hostname,
+				rtpe_config.redis_write_auth,
+				ANY_REDIS_ROLE,
+				rtpe_config.no_redis_required,
+				rtpe_config.redis_resolve_on_reconnect);
+
 		if (!rtpe_redis_write)
 			die("Cannot start up without running Redis %s write database! See also NO_REDIS_REQUIRED parameter.",
 				endpoint_print_buf(&rtpe_config.redis_write_ep));
 	}
 
+	if (!is_addr_unspecified(&rtpe_config.redis_subscribe_ep.address)) {
+		rtpe_redis_notify = redis_new(&rtpe_config.redis_subscribe_ep,
+				rtpe_config.redis_subscribe_db,
+				rtpe_config.redis_subscribe_hostname,
+				rtpe_config.redis_subscribe_auth,
+				ANY_REDIS_ROLE,
+				rtpe_config.no_redis_required,
+				rtpe_config.redis_resolve_on_reconnect);
+
+		if (!rtpe_redis_notify)
+			die("Cannot start up without running Redis %s subscribe database! See also NO_REDIS_REQUIRED parameter.",
+				endpoint_print_buf(&rtpe_config.redis_subscribe_ep));
+		// subscribed-kespaces takes precedence over db in notify ep
+		if (!rtpe_config.redis_subscribed_keyspaces.length) {
+			g_queue_push_tail(&rtpe_config.redis_subscribed_keyspaces, GINT_TO_POINTER(rtpe_config.redis_subscribe_db));
+		}
+	}
+
 	if (!is_addr_unspecified(&rtpe_config.redis_ep.address)) {
-		rtpe_redis = redis_new(&rtpe_config.redis_ep, rtpe_config.redis_db, rtpe_config.redis_auth, rtpe_redis_write ? ANY_REDIS_ROLE : MASTER_REDIS_ROLE, rtpe_config.no_redis_required);
+		rtpe_redis = redis_new(&rtpe_config.redis_ep,
+				rtpe_config.redis_db,
+				rtpe_config.redis_hostname,
+				rtpe_config.redis_auth,
+				(rtpe_redis_write ? ANY_REDIS_ROLE : MASTER_REDIS_ROLE),
+				rtpe_config.no_redis_required,
+				rtpe_config.redis_resolve_on_reconnect);
+
 		if (!rtpe_redis)
 			die("Cannot start up without running Redis %s database! "
 					"See also NO_REDIS_REQUIRED parameter.",
 				endpoint_print_buf(&rtpe_config.redis_ep));
 
-		if (rtpe_config.redis_subscribed_keyspaces.length) {
-			rtpe_redis_notify = redis_new(&rtpe_config.redis_ep, rtpe_config.redis_db, rtpe_config.redis_auth, rtpe_redis_write ? ANY_REDIS_ROLE : MASTER_REDIS_ROLE, rtpe_config.no_redis_required);
+		if (rtpe_config.redis_subscribed_keyspaces.length && !rtpe_redis_notify) {
+			rtpe_redis_notify = redis_new(&rtpe_config.redis_ep,
+					rtpe_config.redis_db,
+					rtpe_config.redis_hostname,
+					rtpe_config.redis_auth,
+					(rtpe_redis_write ? ANY_REDIS_ROLE : MASTER_REDIS_ROLE),
+					rtpe_config.no_redis_required,
+					rtpe_config.redis_resolve_on_reconnect);
+
 			if (!rtpe_redis_notify)
 				die("Cannot start up without running notification Redis %s database! "
 						"See also NO_REDIS_REQUIRED parameter.",
@@ -1337,11 +1480,11 @@ static void create_everything(void) {
 			rtpe_redis_write = rtpe_redis;
 	}
 
-	if (websocket_init())
-		die("Failed to init websocket listener");
-
 	daemonize();
 	wpidfile();
+
+	if (websocket_init())
+		die("Failed to init websocket listener");
 
 	homer_sender_init(&rtpe_config.homer_ep, rtpe_config.homer_protocol, rtpe_config.homer_id);
 
@@ -1352,6 +1495,21 @@ static void create_everything(void) {
 
 	timeval_from_us(&tmp_tv, (long long) rtpe_config.graphite_interval*1000000);
 	set_graphite_interval_tv(&tmp_tv);
+
+	if (!media_player_preload_files(rtpe_config.preload_media_files))
+		die("Failed to preload media files");
+
+	if (!media_player_preload_db(rtpe_config.preload_db_media))
+		die("Failed to preload media from database");
+
+	if (rtpe_config.db_media_cache) {
+		if (g_mkdir_with_parents(rtpe_config.db_media_cache, 0700))
+			die("Failed to create cache directory for media loaded from DB: %s", strerror(errno));
+
+		if (!media_player_preload_cache(rtpe_config.preload_db_cache))
+			die("Failed to preload media from database into cache");
+
+	}
 }
 
 
@@ -1376,6 +1534,8 @@ static void do_redis_restore(void) {
 
 		for (GList *l = rtpe_config.redis_subscribed_keyspaces.head; l; l = l->next) {
 			int db = GPOINTER_TO_INT(l->data);
+			if (db < 0)
+				continue;
 			if (redis_restore(r, true, db))
 				ilog(LOG_WARN, "Unable to restore calls from the active-active peer");
 		}
@@ -1397,10 +1557,38 @@ static void do_redis_restore(void) {
 }
 
 
+#ifdef HAVE_LIBURING
+static void uring_thread_waker(struct thread_waker *wk) {
+	struct poller *p = wk->arg;
+	uring_poller_wake(p);
+}
+static void uring_poller_loop(void *ptr) {
+	struct poller *p = ptr;
+
+	uring_poller_add_waker(p);
+
+	struct thread_waker wk = {.func = uring_thread_waker, .arg = p};
+	thread_waker_add_generic(&wk);
+
+	while (!rtpe_shutdown) {
+		gettimeofday(&rtpe_now, NULL);
+		uring_poller_poll(p);
+		append_thread_lpr_to_glob_lpr();
+		log_info_reset();
+	}
+	thread_waker_del(&wk);
+	uring_poller_clear(p);
+}
+#endif
+
+
 int main(int argc, char **argv) {
 	early_init();
-	options(&argc, &argv);
-	init_everything();
+	{
+		g_autoptr(GHashTable) templates = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+		options(&argc, &argv, templates);
+		init_everything(templates);
+	}
 	create_everything();
 	fill_initial_rtpe_cfg(&initial_rtpe_config);
 
@@ -1420,14 +1608,6 @@ int main(int argc, char **argv) {
 	thread_create_looper(call_rate_stats_updater, rtpe_config.idle_scheduling,
 			rtpe_config.idle_priority, "call stats", 1000000);
 
-	/* separate thread for ports iterations (stats update from the kernel) functionality */
-	thread_create_looper(kernel_stats_updater, rtpe_config.idle_scheduling,
-			rtpe_config.idle_priority, "kernel stats", 1000000);
-
-	/* separate thread for ice slow timer functionality */
-	thread_create_looper(ice_slow_timer, rtpe_config.idle_scheduling,
-			rtpe_config.idle_priority, "ICE slow", 1000000);
-
 	/* thread to close expired call */
 	thread_create_looper(call_timer, rtpe_config.idle_scheduling,
 			rtpe_config.idle_priority, "kill calls", 1000000);
@@ -1435,10 +1615,26 @@ int main(int argc, char **argv) {
 	/* thread to refresh DTLS certificate */
 	dtls_timer();
 
+	if (rtpe_config.media_refresh > 0)
+		thread_create_looper(media_player_refresh_timer, rtpe_config.idle_scheduling,
+				rtpe_config.idle_priority, "media refresh", rtpe_config.media_refresh * 1000000LL);
+
+	if (rtpe_config.db_refresh > 0)
+		thread_create_looper(media_player_refresh_db, rtpe_config.idle_scheduling,
+				rtpe_config.idle_priority, "db refresh", rtpe_config.db_refresh * 1000000LL);
+
+	if (rtpe_config.cache_refresh > 0)
+		thread_create_looper(media_player_refresh_cache, rtpe_config.idle_scheduling,
+				rtpe_config.idle_priority, "cache refresh", rtpe_config.cache_refresh * 1000000LL);
+
+	if (rtpe_config.expiry_timer > 0)
+		thread_create_looper(media_player_expire, rtpe_config.idle_scheduling,
+				rtpe_config.idle_priority, "cache expiry", rtpe_config.expiry_timer * 1000000LL);
+
 	if (!is_addr_unspecified(&rtpe_config.redis_ep.address) && initial_rtpe_config.redis_delete_async)
 		thread_create_detach(redis_delete_async_loop, NULL, "redis async");
 
-	if (!is_addr_unspecified(&rtpe_config.redis_ep.address) && rtpe_redis_notify)
+	if (rtpe_redis_notify)
 		thread_create_detach(redis_notify_loop, NULL, "redis notify");
 
 	do_redis_restore();
@@ -1458,7 +1654,12 @@ int main(int argc, char **argv) {
 	service_notify("READY=1\n");
 
 	for (unsigned int idx = 0; idx < num_poller_threads; ++idx)
-		thread_create_detach_prio(poller_loop, rtpe_pollers[idx % num_rtpe_pollers],
+		thread_create_detach_prio(
+#ifdef HAVE_LIBURING
+				rtpe_config.common.io_uring ? uring_poller_loop :
+#endif
+				poller_loop,
+				rtpe_pollers[idx % num_rtpe_pollers],
 				rtpe_config.scheduling, rtpe_config.priority,
 				idx < rtpe_config.num_threads ? "poller" : "cpoller");
 
@@ -1482,7 +1683,7 @@ int main(int argc, char **argv) {
 	if (!is_addr_unspecified(&rtpe_config.redis_ep.address) && initial_rtpe_config.redis_delete_async)
 		redis_async_event_base_action(rtpe_redis_write, EVENT_BASE_LOOPBREAK);
 
-	if (!is_addr_unspecified(&rtpe_config.redis_ep.address) && rtpe_redis_notify)
+	if (rtpe_redis_notify)
 		redis_async_event_base_action(rtpe_redis_notify, EVENT_BASE_LOOPBREAK);
 
 	threads_join_all(true);
@@ -1517,7 +1718,6 @@ int main(int argc, char **argv) {
 	redis_close(rtpe_redis_notify);
 
 	free_prefix();
-	options_free();
 	log_free();
 	janus_free();
 
@@ -1527,14 +1727,22 @@ int main(int argc, char **argv) {
 	release_listeners(&rtpe_control_ng);
 	release_listeners(&rtpe_control_ng_tcp);
 	for (unsigned int idx = 0; idx < num_rtpe_pollers; ++idx)
-		poller_free(&rtpe_pollers[idx]);
+#ifdef HAVE_LIBURING
+		if (rtpe_config.common.io_uring)
+			uring_poller_free(&rtpe_pollers[idx]);
+		else
+#endif
+			poller_free(&rtpe_pollers[idx]);
 	g_free(rtpe_pollers);
 	interfaces_free();
 #ifndef WITHOUT_NFTABLES
 	nftables_shutdown(rtpe_config.nftables_chain, rtpe_config.nftables_base_chain,
 			(nftables_args){.family = rtpe_config.nftables_family});
 #endif
+	bufferpool_destroy(shm_bufferpool);
 	kernel_shutdown_table();
+	options_free();
+	bufferpool_cleanup();
 
 	return 0;
 }

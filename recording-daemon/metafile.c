@@ -26,7 +26,6 @@ static void meta_free(void *ptr) {
 	metafile_t *mf = ptr;
 
 	dbg("freeing metafile info for %s%s%s", FMT_M(mf->name));
-	output_close(mf, mf->mix_out, NULL, mf->discard);
 	mix_destroy(mf->mix);
 	db_close_call(mf);
 	g_string_chunk_free(mf->gsc);
@@ -34,6 +33,8 @@ static void meta_free(void *ptr) {
 	g_clear_pointer(&mf->ssrc_hash, g_hash_table_destroy);
 	for (int i = 0; i < mf->streams->len; i++) {
 		stream_t *stream = g_ptr_array_index(mf->streams, i);
+		if (!stream)
+			continue;
 		stream_close(stream); // should be closed already
 		stream_free(stream);
 	}
@@ -61,6 +62,8 @@ static void meta_destroy(metafile_t *mf) {
 	// close all streams
 	for (int i = 0; i < mf->streams->len; i++) {
 		stream_t *stream = g_ptr_array_index(mf->streams, i);
+		if (!stream)
+			continue;
 		pthread_mutex_lock(&stream->lock);
 		stream_close(stream);
 		pthread_mutex_unlock(&stream->lock);
@@ -80,6 +83,8 @@ static void meta_destroy(metafile_t *mf) {
 		mf->ssrc_hash = NULL;
 	}
 	db_close_call(mf);
+	output_close(mf, mf->mix_out, NULL, mf->discard);
+	mf->mix_out = NULL;
 }
 
 
@@ -105,12 +110,14 @@ static void meta_stream_interface(metafile_t *mf, unsigned long snum, char *cont
 // mf is locked
 static void meta_stream_details(metafile_t *mf, unsigned long snum, char *content) {
 	dbg("stream %lu details %s", snum, content);
-	unsigned int tag, media, tm, cmp, media_sdp_id;
+	unsigned int tag, media, tm, cmp, media_sdp_id, media_rec_slot, media_rec_slots;
 	uint64_t flags;
-	if (sscanf_match(content, "TAG %u MEDIA %u TAG-MEDIA %u COMPONENT %u FLAGS %" PRIu64 " MEDIA-SDP-ID %i",
-				&tag, &media, &tm, &cmp, &flags, &media_sdp_id) != 6)
+	if (sscanf_match(content, "TAG %u MEDIA %u TAG-MEDIA %u COMPONENT %u FLAGS %" PRIu64 " MEDIA-SDP-ID %i MEDIA-REC-SLOT %i MEDIA-REC-SLOTS %i",
+				&tag, &media, &tm, &cmp, &flags, &media_sdp_id, &media_rec_slot, &media_rec_slots) != 8)
 		return;
-	stream_details(mf, snum, tag, media_sdp_id);
+
+	mix_set_channel_slots(mf->mix, media_rec_slots);
+	stream_details(mf, snum, tag, media_sdp_id, media_rec_slot-1);
 }
 
 
@@ -171,14 +178,14 @@ static void meta_ptime(metafile_t *mf, unsigned long mnum, int ptime)
 static void meta_metadata_parse(metafile_t *mf) {
 	// XXX offload this parsing to proxy module -> bencode list/dictionary
 	t_hash_table_remove_all(mf->metadata_parsed);
-	str all_meta = STR_INIT(mf->metadata);
+	str all_meta = STR(mf->metadata);
 	while (all_meta.len > 1) {
 		str token;
-		if (str_token_sep(&token, &all_meta, '|'))
+		if (!str_token_sep(&token, &all_meta, '|'))
 			break;
 
 		str key;
-		if (str_token(&key, &token, ':')) {
+		if (!str_token(&key, &token, ':')) {
 			// key:value separator not found, skip
 			continue;
 		}

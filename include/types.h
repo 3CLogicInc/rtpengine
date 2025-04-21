@@ -2,6 +2,8 @@
 #define __TYPES__H__
 
 #include <glib.h>
+#include <json-glib/json-glib.h>
+#include "socket.h"
 
 typedef struct sdp_ng_flags sdp_ng_flags;
 typedef struct stats_metric stats_metric;
@@ -9,12 +11,49 @@ typedef struct ng_buffer ng_buffer;
 typedef struct call call_t;
 typedef struct stream_fd stream_fd;
 typedef struct rtp_payload_type rtp_payload_type;
+typedef struct sdp_origin sdp_origin;
+
+struct network_address {
+	str network_type;
+	str address_type;
+	str address;
+	sockaddr_t parsed;
+};
+
+struct sdp_origin {
+	str username;
+	str session_id;
+	str version_str;
+	struct network_address address;
+	unsigned long long version_num;
+	size_t version_output_pos;
+	unsigned int parsed:1;
+};
+typedef struct sdp_origin sdp_origin;
 
 union sdp_attr_print_arg {
 	struct call_media *cm;
 	struct call_monologue *ml;
 } __attribute__ ((__transparent_union__));
 typedef void sdp_attr_print_f(GString *, union sdp_attr_print_arg, const sdp_ng_flags *flags);
+
+typedef struct ng_parser ng_parser_t;
+typedef struct ng_parser_ctx ng_parser_ctx_t;
+typedef struct ng_command_ctx ng_command_ctx_t;
+
+typedef struct bencode_item bencode_item_t;
+
+typedef struct {
+	str cur;
+	str remainder;
+} rtpp_pos;
+
+typedef union {
+	bencode_item_t *benc;
+	JsonNode *json;
+	rtpp_pos *rtpp;
+	void *gen;
+} parser_arg  __attribute__ ((__transparent_union__));
 
 #include "containers.h"
 
@@ -54,5 +93,8 @@ TYPED_GQUEUE(call, call_t)
 
 struct sdp_attr;
 TYPED_GQUEUE(sdp_attr, struct sdp_attr)
+
+struct intf_config;
+TYPED_GQUEUE(intf_config, struct intf_config)
 
 #endif
